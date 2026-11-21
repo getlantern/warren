@@ -590,16 +590,21 @@ own routing table, and `nodes` or `nodes6` in its replies. A query whose
   first with a 200 ms head start (happy eyeballs, `HeadStart`), and the
   first connected path wins; the other leg stops and releases its sockets.
   IPv6 peers with public addresses plan as endpoint-independent, so the
-  common case is a direct simultaneous open. Relays stay on the IPv4 leg
-  for now, and a relay-only endpoint never opens an IPv6 leg, since that
-  leg punches directly and would reveal its address.
+  common case is a direct simultaneous open. The caller's legs share one
+  claim, so only one family is ever nominated and both sides keep the same
+  path, and the provider punches a dual-stack caller's offer once though it
+  arrives through both DHTs. The endpoint negotiates relays for its IPv4 leg
+  only (an IPv6 DHT node still volunteers as a router), and a relay-only
+  endpoint never opens an IPv6 leg, since that leg punches directly and
+  would reveal its address; it refuses to start without an IPv4 socket.
 
 Loopback tests cover a provider listening on both families signaled by an
-IPv4-only and an IPv6-only caller, an offer replayed through the other
-family's DHT being accepted once, two dual-stack endpoints connecting over
+IPv4-only and an IPv6-only caller, two dual-stack endpoints connecting over
 IPv6 and running hysteria2 over uTP through it, a dual-stack caller falling
-back to IPv4 against an IPv4-only provider, and a relay-only endpoint
-keeping IPv6 out of its offers. Gaps: `Snapshot` saves only the primary
+back to IPv4 against an IPv4-only provider (with one limiter charge per
+dual-stack connect), and a relay-only endpoint keeping IPv6 out of its
+offers. Unit tests cover the driver's session table (a session admitted
+once across families) and two sessions sharing a claim in lockstep. Gaps: `Snapshot` saves only the primary
 node, so a restart rejoins the IPv6 DHT by bootstrapping; relays don't
 carry IPv6 yet; and the NAT simulation models IPv4 only.
 

@@ -273,8 +273,23 @@ func TestDualStackSignal(t *testing.T) {
 	}
 
 	provider := dual(true)
-	if _, err := provider.Bootstrap(ctx, nodes[3].Addrs()); err != nil {
+	mapped := nodes[3].Addrs()
+	mapped[0] = netip.AddrPortFrom(netip.AddrFrom16(mapped[0].Addr().As16()), mapped[0].Port()) // ::ffff:127.0.0.1
+	if _, err := provider.Bootstrap(ctx, mapped); err != nil {
 		t.Fatal(err)
+	}
+	var size4 int
+	provider.InspectEach(ctx, func(a netip.AddrPort, d *dht.Node) {
+		if a.Addr().Is4() {
+			c, m := d.RoutingSize()
+			size4 = c + m
+		}
+	})
+	if size4 == 0 {
+		t.Fatal("an IPv4-mapped seed didn't bootstrap the IPv4 node")
+	}
+	if _, err := provider.Bootstrap(ctx, nil); err != nil {
+		t.Fatalf("bootstrapping a dual node from its own tables: %v", err)
 	}
 	pk := ed25519.NewKeyFromSeed([]byte("provider-seed-provider-seed-0123"))
 	if err := provider.Listen(ctx, pk); err != nil {
@@ -365,5 +380,25 @@ func TestAnswerUnknownSessionFails(t *testing.T) {
 	defer n.Close()
 	if err := n.Answer(context.Background(), dht.SessionID{9}, []byte("x")); !errors.Is(err, ErrUnknownSession) {
 		t.Fatalf("answer to an unknown session: %v", err)
+	}
+}
+
+// An offer dropped on a full events channel isn't recorded, so its copy
+// through the other family is still delivered and answerable.
+func TestDroppedOfferStillDeliverable(t *testing.T) {
+	n := &Node{sessions: map[dht.SessionID]int{}, events: make(chan dht.Event)} // nobody reading: full
+	in := dht.Incoming{Session: dht.SessionID{7}}
+	n.deliverIncoming(0, in)
+	n.events = make(chan dht.Event, 1)
+	n.deliverIncoming(1, in)
+	if len(n.events) != 1 || n.sessions[in.Session] != 1 {
+		t.Fatalf("the copy through the other family wasn't delivered: %d queued, route %v", len(n.events), n.sessions)
+	}
+}
+
+func TestPutAcknowledgementsAddUp(t *testing.T) {
+	got := sumPuts([]dht.Event{dht.PutDone{Stored: 0}, dht.PutDone{Stored: 5, Domestic: 2}})
+	if got.Stored != 5 || got.Domestic != 2 {
+		t.Fatalf("summed acknowledgements %+v, want 5 stored, 2 domestic", got)
 	}
 }

@@ -1066,7 +1066,11 @@ func (n *Node) referrals(t *table, target krpc.NodeID, from netip.AddrPort, want
 	if s := n.sibling; s != nil {
 		st := s.main
 		if t == n.comm {
-			st = s.comm
+			st = nil
+			// Only a sibling in the same community can vouch for members.
+			if s.comm != nil && *s.cfg.Community == *n.cfg.Community {
+				st = s.comm
+			}
 		}
 		if st != nil {
 			cands = append(cands, st.closest(target, 4*n.cfg.K)...)

@@ -190,22 +190,54 @@ func TestRelayOnlyNeverUsesIPv6(t *testing.T) {
 	}
 }
 
-// An offer's secret is accepted once while a copy could still arrive, and a
-// flood of live offers sheds load instead of growing memory.
+// An offer is accepted once per caller and secret while a copy could still
+// arrive, other callers are unaffected, and a flood evicts the oldest entry
+// rather than refusing new offers.
 func TestFirstOfferDedupes(t *testing.T) {
 	e := &Endpoint{cfg: Config{GatherWait: time.Second, PunchDeadline: 6 * time.Second}}
 	now := time.Unix(1_800_000_000, 0)
 	secret := []byte("0123456789abcdef0123456789abcdef")
-	if !e.firstOffer(secret, now) || e.firstOffer(secret, now.Add(time.Second)) {
-		t.Fatal("a repeated offer secret was accepted twice")
+	alice, bob := [32]byte{1}, [32]byte{2}
+	if !e.firstOffer(alice, secret, now) || e.firstOffer(alice, secret, now.Add(time.Second)) {
+		t.Fatal("a repeated offer was accepted twice")
 	}
-	if !e.firstOffer(secret, now.Add(time.Minute)) {
-		t.Fatal("a secret was remembered long after any copy could arrive")
+	if !e.firstOffer(bob, secret, now.Add(time.Second)) {
+		t.Fatal("another caller's offer was blocked by the first caller's entry")
 	}
-	for i := range maxRecentOffers {
-		e.firstOffer([]byte{byte(i), byte(i >> 8), 1}, now)
+	if !e.firstOffer(alice, secret, now.Add(time.Minute)) {
+		t.Fatal("an offer was remembered long after any copy could arrive")
+	}
+	for i := range 2 * maxRecentOffers {
+		e.firstOffer([32]byte{3, byte(i), byte(i >> 8)}, secret, now.Add(time.Minute))
 	}
 	if len(e.offers) > maxRecentOffers {
 		t.Fatalf("offer memory grew to %d", len(e.offers))
+	}
+	if !e.firstOffer([32]byte{4}, secret, now.Add(time.Minute)) {
+		t.Fatal("a full table refused a new offer instead of evicting the oldest")
+	}
+}
+
+// A relay-only endpoint that can't bind IPv4 fails at startup: it could
+// never connect.
+func TestRelayOnlyNeedsIPv4(t *testing.T) {
+	_, err := New(Config{DHT: member(true), DHTAddr: "256.0.0.1:0", DHTAddr6: "[::1]:0", DHT6: member6(true), RelayOnly: true})
+	if err == nil {
+		t.Fatal("a relay-only endpoint started with no IPv4 socket")
+	}
+}
+
+// The limiter is charged only for candidates a leg will actually probe: an
+// IPv6-only listener isn't charged for a caller's IPv4 addresses.
+func TestProbeableFiltersByFamily(t *testing.T) {
+	cands := []netip.AddrPort{netip.MustParseAddrPort("2.10.0.1:4000"), netip.MustParseAddrPort("[2001:db8::1]:4000")}
+	if got := probeable(cands, false, true); len(got) != 1 || got[0].Addr().Is4() {
+		t.Fatalf("IPv6-only listener charged %v", got)
+	}
+	if got := probeable(cands, true, false); len(got) != 1 || !got[0].Addr().Is4() {
+		t.Fatalf("IPv4-only listener charged %v", got)
+	}
+	if got := probeable(cands, true, true); len(got) != 2 {
+		t.Fatalf("dual-stack listener charged %v", got)
 	}
 }

@@ -220,7 +220,8 @@ func (n *Node) flush(fam int, f *family) {
 		f.conn.WriteToUDPAddrPort(s.Data, s.To)
 	}
 	for _, e := range events {
-		if in, ok := e.(dht.Incoming); ok && !n.admitSession(fam, in) {
+		if in, ok := e.(dht.Incoming); ok {
+			n.deliverIncoming(fam, in)
 			continue
 		}
 		op, ok := opOf(e)
@@ -233,6 +234,22 @@ func (n *Node) flush(fam int, f *family) {
 		case n.events <- e:
 		default:
 		}
+	}
+}
+
+// deliverIncoming hands an offer to the application unless it was already
+// delivered (the same offer through the other family's DHT is a replay:
+// each node dedupes only its own). The session and its answer route are
+// recorded only once the offer is actually delivered, so one dropped on a
+// full channel can still arrive through the other family.
+func (n *Node) deliverIncoming(fam int, in dht.Incoming) {
+	if _, seen := n.sessions[in.Session]; seen {
+		return
+	}
+	select {
+	case n.events <- in:
+		n.admitSession(fam, in)
+	default:
 	}
 }
 
@@ -310,8 +327,9 @@ func anyOK(errs []error) error {
 // call starts an operation on every node that start accepts (start returns
 // skip to leave a family out) and collects completion events until all have
 // arrived or enough reports that the result is settled. It fails only if no
-// node started the operation.
-func (n *Node) call(ctx context.Context, start func(fam int, d *dht.Node, now time.Time) (op dht.OpID, skip bool, err error), enough func(dht.Event) bool) ([]dht.Event, error) {
+// node started the operation; partial reports a node that failed to start,
+// whose family the result therefore doesn't cover.
+func (n *Node) call(ctx context.Context, start func(fam int, d *dht.Node, now time.Time) (op dht.OpID, skip bool, err error), enough func(dht.Event) bool) (got []dht.Event, partial, err error) {
 	ch := make(chan dht.Event, len(n.fams))
 	type started struct {
 		count int
@@ -335,49 +353,67 @@ func (n *Node) call(ctx context.Context, start func(fam int, d *dht.Node, now ti
 		}
 		sc <- s
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s := <-sc
 	if s.count == 0 {
 		if s.err == nil {
 			s.err = errors.New("driver: no node for this operation")
 		}
-		return nil, s.err
+		return nil, nil, s.err
 	}
-	var got []dht.Event
 	for len(got) < s.count {
 		select {
 		case e := <-ch:
 			got = append(got, e)
 			if enough != nil && enough(e) {
-				return got, nil
+				return got, s.err, nil
 			}
 		case <-n.done:
-			return got, ErrClosed
+			return got, s.err, ErrClosed
 		case <-ctx.Done():
-			return got, ctx.Err()
+			return got, s.err, ctx.Err()
 		}
 	}
-	return got, nil
+	return got, s.err, nil
+}
+
+// sumPuts adds up the families' store acknowledgements.
+func sumPuts(got []dht.Event) dht.PutDone {
+	var out dht.PutDone
+	for i, e := range got {
+		p := e.(dht.PutDone)
+		if i == 0 {
+			out = p
+			continue
+		}
+		out.Stored += p.Stored
+		out.Domestic += p.Domestic
+	}
+	return out
+}
+
+func unmap(a netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
 }
 
 func (n *Node) isFamily(fam int, a netip.Addr) bool {
 	return n.fams[fam].addr.Addr().Is4() == a.Unmap().Is4()
 }
 
-// Bootstrap looks up our own ID on each node from the seeds of its family.
-// With a single node, every seed goes to it. It returns the first node's
-// result.
+// Bootstrap looks up our own ID on each node from the seeds of its family;
+// with no seeds, each node starts from its own table. With a single node,
+// every seed goes to it. It returns the first node's result.
 func (n *Node) Bootstrap(ctx context.Context, seeds []netip.AddrPort) (dht.LookupDone, error) {
-	got, err := n.call(ctx, func(fam int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+	got, _, err := n.call(ctx, func(fam int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		var mine []netip.AddrPort
 		for _, s := range seeds {
-			if len(n.fams) == 1 || n.isFamily(fam, s.Addr()) {
+			if s = unmap(s); len(n.fams) == 1 || n.isFamily(fam, s.Addr()) {
 				mine = append(mine, s)
 			}
 		}
-		if len(mine) == 0 && len(n.fams) > 1 {
-			return 0, true, nil
+		if len(mine) == 0 && len(seeds) > 0 && len(n.fams) > 1 {
+			return 0, true, nil // seeds given, none of this family
 		}
 		op, err := d.Bootstrap(now, mine)
 		return op, false, err
@@ -391,14 +427,14 @@ func (n *Node) Bootstrap(ctx context.Context, seeds []netip.AddrPort) (dht.Looku
 // Rejoin seeds each node from saved contacts of its family; see
 // dht.Node.Rejoin.
 func (n *Node) Rejoin(ctx context.Context, contacts []krpc.NodeInfo) (dht.LookupDone, error) {
-	got, err := n.call(ctx, func(fam int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+	got, _, err := n.call(ctx, func(fam int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		var mine []krpc.NodeInfo
 		for _, c := range contacts {
-			if len(n.fams) == 1 || n.isFamily(fam, c.Addr.Addr()) {
+			if c.Addr = unmap(c.Addr); len(n.fams) == 1 || n.isFamily(fam, c.Addr.Addr()) {
 				mine = append(mine, c)
 			}
 		}
-		if len(mine) == 0 && len(n.fams) > 1 {
+		if len(mine) == 0 && len(contacts) > 0 && len(n.fams) > 1 {
 			return 0, true, nil
 		}
 		op, err := d.Rejoin(now, mine)
@@ -411,67 +447,73 @@ func (n *Node) Rejoin(ctx context.Context, contacts []krpc.NodeInfo) (dht.Lookup
 }
 
 // Get returns the immutable value stored under target, or nil if not found,
-// from whichever node finds it first.
+// from whichever node finds it first. A miss while some family couldn't
+// search is an error, not a conclusive "not found".
 func (n *Node) Get(ctx context.Context, target krpc.NodeID) ([]byte, error) {
-	got, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+	got, partial, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		op, err := d.Get(now, target)
 		return op, false, err
 	}, func(e dht.Event) bool { return e.(dht.GetDone).Value != nil })
+	for _, e := range got {
+		if v := e.(dht.GetDone).Value; v != nil {
+			return v, nil // content-addressed: any hit is the answer
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range got {
-		if v := e.(dht.GetDone).Value; v != nil {
-			return v, nil
-		}
-	}
-	return nil, nil
+	return nil, partial
 }
 
-// Put stores v through every node and returns the first node's result.
+// Put stores v through every node and returns the acknowledgements summed
+// across them, including any that arrived before an error.
 func (n *Node) Put(ctx context.Context, v []byte) (krpc.NodeID, dht.PutDone, error) {
 	var target krpc.NodeID
-	got, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+	got, _, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		t, op, err := d.Put(now, v)
 		target = t
 		return op, false, err
 	}, nil)
-	if err != nil {
+	if len(got) == 0 {
 		return target, dht.PutDone{}, err
 	}
-	return target, got[0].(dht.PutDone), nil
+	// Acknowledgements add up across families, and a family that finished
+	// before an error still counts.
+	return target, sumPuts(got), err
 }
 
 // GetMutable returns the newest verified item any node found, or nil if
 // none was found.
+// A family that couldn't search, or an error, returns the best item found so
+// far together with the error: a newer one may exist there.
 func (n *Node) GetMutable(ctx context.Context, key [32]byte, salt []byte) (*dht.MutableItem, error) {
-	got, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+	got, partial, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		op, err := d.GetMutable(now, key, salt)
 		return op, false, err
 	}, nil)
-	if err != nil {
-		return nil, err
-	}
 	var best *dht.MutableItem
 	for _, e := range got {
 		if it := e.(dht.GetDone).Item; it != nil && (best == nil || it.Seq > best.Seq) {
 			best = it
 		}
 	}
-	return best, nil
+	if err != nil {
+		return best, err
+	}
+	return best, partial
 }
 
-// PutMutable stores m through every node and returns the first node's
-// result.
+// PutMutable stores m through every node and returns the acknowledgements
+// summed across them, including any that arrived before an error.
 func (n *Node) PutMutable(ctx context.Context, m dht.MutableItem, cas *int64) (dht.PutDone, error) {
-	got, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+	got, _, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		op, err := d.PutMutable(now, m, cas)
 		return op, false, err
 	}, nil)
-	if err != nil {
+	if len(got) == 0 {
 		return dht.PutDone{}, err
 	}
-	return got[0].(dht.PutDone), nil
+	return sumPuts(got), err
 }
 
 // Publish keeps an immutable value stored through every node until
@@ -544,7 +586,8 @@ func (n *Node) Answer(ctx context.Context, s dht.SessionID, payload []byte) erro
 // Signal sends payload to provider through every node and returns the first
 // answer, or the last failure if none answers.
 func (n *Node) Signal(ctx context.Context, priv ed25519.PrivateKey, provider [32]byte, payload []byte) ([]byte, error) {
-	got, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+	payload = append([]byte(nil), payload...) // a slower family reads it after we return
+	got, _, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		op, err := d.Signal(now, priv, provider, payload)
 		return op, false, err
 	}, func(e dht.Event) bool { _, ok := e.(dht.Answered); return ok })

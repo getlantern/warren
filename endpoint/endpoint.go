@@ -117,14 +117,30 @@ type Endpoint struct {
 	offers   map[[32]byte]time.Time // recent offer secrets, by hash
 }
 
+// probeable filters candidates to the families we'll run a leg for.
+func probeable(cands []netip.AddrPort, v4, v6 bool) []netip.AddrPort {
+	var out []netip.AddrPort
+	for _, c := range cands {
+		if is4 := c.Addr().Is4(); is4 && v4 || !is4 && v6 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // maxRecentOffers bounds the offer-secret memory under a flood.
 const maxRecentOffers = 4096
 
-// firstOffer reports whether an offer with this secret is new, recording
-// it. A secret is remembered for twice a punch's lifetime, longer than any
-// copy of the same offer could still arrive through another DHT.
-func (e *Endpoint) firstOffer(secret []byte, now time.Time) bool {
-	key := sha256.Sum256(secret)
+// firstOffer reports whether this caller's offer with this secret is new,
+// recording it. Entries are keyed by caller and secret, so one caller can't
+// touch another's, and remembered for twice a punch's lifetime, longer than
+// any copy of the same offer could still arrive through another DHT. When
+// full, the oldest entry makes way: a flood can't make us refuse offers.
+func (e *Endpoint) firstOffer(caller [32]byte, secret []byte, now time.Time) bool {
+	h := sha256.New()
+	h.Write(caller[:])
+	h.Write(secret)
+	key := [32]byte(h.Sum(nil))
 	ttl := 2 * (e.cfg.GatherWait + e.cfg.PunchDeadline)
 	e.offersMu.Lock()
 	defer e.offersMu.Unlock()
@@ -135,13 +151,19 @@ func (e *Endpoint) firstOffer(secret []byte, now time.Time) bool {
 		return false
 	}
 	if len(e.offers) >= maxRecentOffers {
-		for k, at := range e.offers {
-			if now.Sub(at) >= ttl {
+		var oldest [32]byte
+		var at time.Time
+		for k, t := range e.offers {
+			if now.Sub(t) >= ttl {
 				delete(e.offers, k)
+				continue
+			}
+			if at.IsZero() || t.Before(at) {
+				oldest, at = k, t
 			}
 		}
 		if len(e.offers) >= maxRecentOffers {
-			return false // still full of live offers: shed load
+			delete(e.offers, oldest)
 		}
 	}
 	e.offers[key] = now
@@ -170,6 +192,18 @@ func New(cfg Config) (*Endpoint, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if cfg.RelayOnly {
+		// Relays only run over IPv4, and a relay-only endpoint never punches
+		// IPv6 directly, so without an IPv4 socket it can't connect at all.
+		has4 := false
+		for _, a := range node.Addrs() {
+			has4 = has4 || a.Addr().Is4()
+		}
+		if !has4 {
+			_ = node.Close()
+			return nil, errors.New("endpoint: relay-only needs an IPv4 socket")
+		}
 	}
 	e := &Endpoint{cfg: cfg, node: node, accept: make(chan *Conn, cfg.MaxInbound), slots: make(chan struct{}, cfg.MaxInbound), done: make(chan struct{})}
 	e.wg.Go(e.events)
@@ -305,29 +339,44 @@ func (e *Endpoint) families() (v4, v6 bool) {
 // be prepared.
 func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV6 bool, claim *atomic.Int32) ([]*leg, error) {
 	has4, has6 := e.families()
-	var legs []*leg
-	var firstErr error
-	add := func(pc punch.Config, v6 bool, id int32) {
+	type prepared struct {
+		l   *leg
+		err error
+	}
+	// The legs gather in parallel, so a second family costs no extra time
+	// before punching starts.
+	var wg sync.WaitGroup
+	out := make([]prepared, 2)
+	add := func(i int, pc punch.Config, v6 bool, id int32) {
 		if claim != nil {
 			pc.Claim = claimer(claim, id)
 		}
-		l, err := e.prepare(ctx, pc, v6)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
+		wg.Go(func() {
+			l, err := e.prepare(ctx, pc, v6)
+			if l != nil {
+				l.id, l.claim = id, claim
 			}
-			return
-		}
-		l.id, l.claim = id, claim
-		legs = append(legs, l)
+			out[i] = prepared{l, err}
+		})
 	}
 	if has4 {
-		add(pc, false, 1)
+		add(0, pc, false, 1)
 	}
 	if has6 && wantV6 && !e.cfg.RelayOnly {
 		pc6 := pc
 		pc6.Relay, pc6.Relays = netip.AddrPort{}, nil
-		add(pc6, true, 2)
+		add(1, pc6, true, 2)
+	}
+	wg.Wait()
+	var legs []*leg
+	var firstErr error
+	for _, p := range out {
+		switch {
+		case p.l != nil:
+			legs = append(legs, p.l)
+		case p.err != nil && firstErr == nil:
+			firstErr = p.err
+		}
 	}
 	if len(legs) == 0 {
 		if firstErr == nil {
@@ -546,7 +595,7 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	if err != nil || len(offer.Secret) < 16 {
 		return
 	}
-	if !e.firstOffer(offer.Secret, time.Now()) {
+	if !e.firstOffer(in.Caller, offer.Secret, time.Now()) {
 		// A dual-stack caller signals the same offer through each family's
 		// DHT; its secret identifies it. Punch and charge for it once.
 		return
@@ -584,7 +633,13 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	if e.cfg.RelayOnly && !relay.IsValid() {
 		return // no router we trust to relay through: refuse rather than leak
 	}
-	if !e.limiter.allow(in.Caller, offer.Candidates, charged, heavy, time.Now()) {
+	// Charge only what a leg we'll run can probe.
+	has4, _ := e.families()
+	probed := probeable(offer.Candidates, has4, wantV6)
+	if !has4 {
+		charged = netip.AddrPort{} // relays only run over IPv4
+	}
+	if !e.limiter.allow(in.Caller, probed, charged, heavy, time.Now()) {
 		return
 	}
 	// The relay chosen here is final: the IPv4 session uses exactly this

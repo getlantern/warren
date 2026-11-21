@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/getlantern/warren/krpc"
+	"github.com/getlantern/warren/overlay"
 )
 
 // Mutable operations on an empty routing table finish synchronously; they
@@ -332,5 +333,33 @@ func TestSiblingAnswersForeignFamily(t *testing.T) {
 	resp = query(t, v4, addr(100), krpc.Msg{Q: "find_node", A: krpc.Args{ID: outsiderID(r), Target: &target}})
 	if len(resp.R.Nodes6) != 0 {
 		t.Fatal("a query without want got the sibling's family")
+	}
+}
+
+// A sibling in a different community doesn't answer for this one's
+// members: its contacts would lack our tag. Mainline referrals still cross.
+func TestSiblingCommunityMustMatch(t *testing.T) {
+	r := rng(79)
+	ru := overlay.NewKey("ru")
+	v4 := New(Config{ID: memberID(r, addr(1).Addr()), Community: &key, Rand: rng(80)})
+	other := ru
+	v6 := New(Config{ID: ru.Tag(outsiderID(r)), Community: &other, Rand: rng(81)})
+	v4.SetSibling(v6)
+	v6addr := func(i int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, byte(i), 15: 1}), 6881)
+	}
+	for i := 1; i <= 4; i++ {
+		a := v6addr(i)
+		v6.comm.heard(ru.Tag(krpc.SecureID(a.Addr(), outsiderID(r))), a, t0)
+		v6.main.heard(outsiderID(r), v6addr(10+i), t0)
+	}
+	target := outsiderID(r)
+	resp := query(t, v4, addr(100), krpc.Msg{Q: "find_node", A: krpc.Args{ID: memberID(r, addr(100).Addr()), Target: &target, Want: []string{"n6"}}})
+	if len(resp.R.Nodes6) != 0 {
+		t.Fatalf("a member got %d IPv6 referrals from another community's table", len(resp.R.Nodes6))
+	}
+	resp = query(t, v4, addr(100), krpc.Msg{Q: "find_node", A: krpc.Args{ID: outsiderID(r), Target: &target, Want: []string{"n6"}}})
+	if len(resp.R.Nodes6) == 0 {
+		t.Fatal("Mainline referrals stopped crossing to the sibling")
 	}
 }
