@@ -557,7 +557,7 @@ well. The client side slots into hysteria2x's dialer hook, as `pre_initial_junk`
 does today. The server needs a hysteria2x inbound that wraps its listener
 before `Service.Start`, since a stock hysteria2 server can't unwrap uTP.
 
-## IPv6 (DHT and driver built; endpoint and punching planned)
+## IPv6 (built)
 
 Large mobile networks (China Mobile above all, and increasingly carriers in
 Russia and Iran) give phones public IPv6 addresses. Two such peers usually
@@ -585,17 +585,23 @@ own routing table, and `nodes` or `nodes6` in its replies. A query whose
   each family. A caller signals over every family it has and takes the first
   answer.
 - **Endpoint and punching (`endpoint/`, `punch/`).** Each family gets its own
-  data socket and punch session. Offers carry candidates of both families.
-  The caller races the families, IPv6 first with a short head start
-  (happy eyeballs), and the first connected path wins. IPv6 peers with public
-  addresses plan as endpoint-independent, so the common case is a direct
-  simultaneous open. Relays work over either family.
+  data socket and punch session (a leg). Offers carry candidates of both
+  families plus an IPv6 profile (`p6`). The caller races the legs, IPv6
+  first with a 200 ms head start (happy eyeballs, `HeadStart`), and the
+  first connected path wins; the other leg stops and releases its sockets.
+  IPv6 peers with public addresses plan as endpoint-independent, so the
+  common case is a direct simultaneous open. Relays stay on the IPv4 leg
+  for now, and a relay-only endpoint never opens an IPv6 leg, since that
+  leg punches directly and would reveal its address.
 
-Built in two steps. The first is done: `dht.Node.SetSibling` and
-`driver.ListenDual`, with a loopback test where a provider listening on both
-families is signaled by an IPv4-only and an IPv6-only caller. `Snapshot`
-still saves only the primary node, so a restart rejoins the IPv6 DHT by
-bootstrapping. The second step is dual-stack endpoint and punching.
+Loopback tests cover a provider listening on both families signaled by an
+IPv4-only and an IPv6-only caller, an offer replayed through the other
+family's DHT being accepted once, two dual-stack endpoints connecting over
+IPv6 and running hysteria2 over uTP through it, a dual-stack caller falling
+back to IPv4 against an IPv4-only provider, and a relay-only endpoint
+keeping IPv6 out of its offers. Gaps: `Snapshot` saves only the primary
+node, so a restart rejoins the IPv6 DHT by bootstrapping; relays don't
+carry IPv6 yet; and the NAT simulation models IPv4 only.
 
 ## Phase 0: measure first (`natprobe/`, built)
 
@@ -652,5 +658,5 @@ and carrier allocator. The design therefore splits measurement in two:
 | 4c | Relay fallback | Router relays via `announce_peer` binding and blind forwarding with volunteer limits, plus relay-only privacy mode. Every simulated NAT pairing connects |
 | 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
-| 5b | IPv6 | DHT and driver built: sibling nodes per family as libtorrent runs them, `driver.ListenDual`. Next: dual-stack endpoint and punching with happy eyeballs, and snapshots for both families |
+| 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
 | 6 | iOS integration, memory budget, network-change rebind | |
