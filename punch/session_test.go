@@ -329,3 +329,38 @@ func TestRelayEvictedBindingRebuilt(t *testing.T) {
 		t.Fatalf("responder: %+v", evB)
 	}
 }
+
+// A late reply to a retried get_peers must not mark the relay bound: only
+// the announce's reply does.
+func TestRelayBoundOnlyByAnnounceReply(t *testing.T) {
+	router := netip.MustParseAddrPort("2.176.0.9:6881")
+	s := New(Config{RelayOnly: true, Relay: router, Rand: rand.New(rand.NewPCG(6, 6))})
+	now := time.Unix(1_800_000_000, 0)
+	s.Start(now, Offer{Secret: []byte("0123456789abcdef0123456789abcdef")})
+	getPeers := func() [][]byte {
+		sends, _ := s.Drain()
+		var tids [][]byte
+		for _, snd := range sends {
+			var m krpc.Msg
+			if krpc.Unmarshal(snd.Data, &m) == nil && m.Q == "get_peers" {
+				tids = append(tids, m.T)
+			}
+		}
+		return tids
+	}
+	first := getPeers()
+	s.Tick(now.Add(600 * time.Millisecond)) // retry
+	retry := getPeers()
+	if len(first) != 1 || len(retry) != 1 {
+		t.Fatalf("get_peers sent %d then %d", len(first), len(retry))
+	}
+	reply := func(tid []byte) {
+		r := krpc.Msg{T: tid, Y: krpc.Response, R: krpc.Return{Token: []byte("tokn")}}
+		s.HandlePacket(now.Add(700*time.Millisecond), 0, router, krpc.AppendMarshal(nil, &r))
+	}
+	reply(first[0])
+	reply(retry[0])
+	if s.relayBound {
+		t.Fatal("a get_peers reply marked the relay bound")
+	}
+}

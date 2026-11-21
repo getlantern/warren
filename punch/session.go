@@ -153,7 +153,7 @@ type Session struct {
 	relayInfo  krpc.NodeID
 	relayToken []byte
 	relayBound bool
-	relayT     map[uint16]bool
+	relayT     map[uint16]relayQuery
 	nextRelay  time.Time // next bind step or probe
 	relayFrom  time.Time // when probing starts
 	relayProbe []byte
@@ -169,7 +169,7 @@ type Session struct {
 
 func New(cfg Config) *Session {
 	cfg.defaults()
-	s := &Session{cfg: cfg, sockets: 1, reflectT: map[uint16]bool{}, sprayed: map[uint16]bool{}, sentTo: map[uint16]pair{}, nomTids: map[uint16]bool{}, relayT: map[uint16]bool{}}
+	s := &Session{cfg: cfg, sockets: 1, reflectT: map[uint16]bool{}, sprayed: map[uint16]bool{}, sentTo: map[uint16]pair{}, nomTids: map[uint16]bool{}, relayT: map[uint16]relayQuery{}}
 	binary.LittleEndian.PutUint64(s.gatherID[:], cfg.Rand.Uint64())
 	binary.LittleEndian.PutUint64(s.gatherID[8:], cfg.Rand.Uint64())
 	return s
@@ -485,9 +485,9 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 			return
 		}
 		t := binary.BigEndian.Uint16(m.T)
-		if socket == 0 && s.relayT[t] {
+		if q := s.relayT[t]; socket == 0 && q != 0 {
 			delete(s.relayT, t)
-			s.relayReply(now, &m)
+			s.relayReply(now, &m, q)
 			return
 		}
 		if socket == 0 && s.reflectT[t] && m.IP.IsValid() {

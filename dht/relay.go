@@ -98,8 +98,11 @@ func (r *relay) count(src netip.Prefix) (pending, self int) {
 // holding the most, the least recently active one, never one younger than
 // evictGrace since it was created (so a pair has time to complete, and
 // refreshes don't extend that), ties broken by info-hash for
-// determinism. It reports whether it found one.
-func (r *relay) evictPending(now time.Time) bool {
+// determinism. If every pair is within its grace, a fast flood would
+// otherwise lock new sessions out, so it evicts the youngest pair of the
+// heaviest source instead, provided that source holds more half-formed
+// pairs than the announcer's. It reports whether it found one.
+func (r *relay) evictPending(now time.Time, announcer netip.Prefix) bool {
 	perSource := map[netip.Prefix]int{}
 	for _, q := range r.pairs {
 		if q.n == 1 {
@@ -122,6 +125,31 @@ func (r *relay) evictPending(now time.Time) bool {
 	}
 	for k, q := range r.pairs {
 		if q.n == 1 && now.Sub(q.created) >= evictGrace && better(k, q) {
+			victim, best = k, q
+		}
+	}
+	if best == nil {
+		for k, q := range r.pairs {
+			if q.n != 1 {
+				continue
+			}
+			c := perSource[relaySource(q.peers[0])]
+			if c <= perSource[announcer] {
+				continue
+			}
+			switch {
+			case best == nil:
+			case c != perSource[relaySource(best.peers[0])]:
+				if c < perSource[relaySource(best.peers[0])] {
+					continue
+				}
+			case !q.created.Equal(best.created):
+				if q.created.Before(best.created) {
+					continue
+				}
+			case bytes.Compare(k[:], victim[:]) >= 0:
+				continue
+			}
 			victim, best = k, q
 		}
 	}
@@ -156,7 +184,7 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 		if pending, _ := r.count(relaySource(from)); pending >= maxPendingPerSource {
 			return
 		}
-		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs && !r.evictPending(now) {
+		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs && !r.evictPending(now, relaySource(from)) {
 			return
 		}
 		p = &relayPair{created: now, active: now, refilled: now, tokens: float64(n.cfg.RelayRate)}

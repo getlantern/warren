@@ -311,3 +311,19 @@ func TestRelayReannounceKeepsRefill(t *testing.T) {
 		t.Fatalf("a refilled budget was lost to a re-announce: forwarded %d", len(s))
 	}
 }
+
+// A flood fast enough that every half-formed pair is within its grace must
+// still not lock out a new session: the heaviest source gives way.
+func TestRelayFastFloodStillAdmits(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(82)), Rand: rng(83)})
+	for i := range 4 * r.cfg.MaxRelayPairs { // 16 sources, 4 each, all fresh
+		src := netip.AddrFrom4([4]byte{9, 9, byte(i % 16), 1})
+		announce(t, r, netip.AddrPortFrom(src, uint16(2000+i)), krpc.NodeID{27, byte(i)})
+	}
+	at := t0.Add(evictGrace / 2)
+	announceAt(t, r, at, addr(2), krpc.NodeID{28})
+	announceAt(t, r, at, addr(3), krpc.NodeID{28})
+	if r.RelayPairs() != 1 {
+		t.Fatal("a fresh flood locked a real session out")
+	}
+}

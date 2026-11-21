@@ -445,7 +445,8 @@ infrastructure.
   most 30 seconds however often it is re-announced. A full table evicts a
   half-formed pair rather than refusing new ones: from the source holding
   the most, least recently active first, never one created less than two
-  seconds ago.
+  seconds ago, unless every pair is that young, in which case the heaviest
+  source gives up its youngest to a lighter newcomer.
   So a flood churns its own entries instead of locking the table. Clients
   re-announce every second until they hear their peer through the relay, so
   a pair evicted anyway is rebuilt. Tighter per-source limits would hit CGNAT users and relay-only

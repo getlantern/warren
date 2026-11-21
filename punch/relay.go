@@ -71,11 +71,11 @@ func (s *Session) tickRelay(now time.Time) {
 	switch {
 	case s.relayToken == nil:
 		info := s.relayInfo
-		s.relayT[s.query0("get_peers", krpc.Args{InfoHash: &info})] = true
+		s.relayT[s.query0("get_peers", krpc.Args{InfoHash: &info})] = relayGetPeers
 		s.nextRelay = now.Add(relayRetry)
 	case !s.relayBound:
 		info := s.relayInfo
-		s.relayT[s.query0("announce_peer", krpc.Args{InfoHash: &info, Token: s.relayToken, Port: 6881, ImpliedPort: true})] = true
+		s.relayT[s.query0("announce_peer", krpc.Args{InfoHash: &info, Token: s.relayToken, Port: 6881, ImpliedPort: true})] = relayAnnounce
 		s.nextRelay = now.Add(relayRetry)
 	case now.Before(s.relayFrom):
 		s.nextRelay = s.relayFrom
@@ -103,13 +103,20 @@ func (s *Session) query0(q string, a krpc.Args) uint16 {
 	return s.queryArgs(0, s.relay, q, a)
 }
 
-func (s *Session) relayReply(now time.Time, m *krpc.Msg) {
+type relayQuery uint8
+
+const (
+	relayGetPeers relayQuery = iota + 1
+	relayAnnounce
+)
+
+func (s *Session) relayReply(now time.Time, m *krpc.Msg, q relayQuery) {
 	switch {
 	case m.Y != krpc.Response:
-	case s.relayToken == nil && len(m.R.Token) > 0:
+	case q == relayGetPeers && s.relayToken == nil && len(m.R.Token) > 0:
 		s.relayToken = append([]byte(nil), m.R.Token...)
 		s.nextRelay = now
-	case s.relayToken != nil:
+	case q == relayAnnounce:
 		if !s.relayBound {
 			s.nextAnnounce = now.Add(relayReannounce)
 		}
@@ -134,7 +141,7 @@ func (s *Session) relayData(socket int, from netip.AddrPort, b []byte) {
 	case s.cfg.Initiator && !s.done && hmac.Equal(b, s.peerAck):
 		s.connectRelayed()
 	case s.cfg.Initiator && hmac.Equal(b, s.peerProbe):
-		s.relayProven = true // the pair exists: stop re-announcing
+		s.relayProven = true
 	}
 }
 
