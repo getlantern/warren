@@ -317,29 +317,37 @@ func TestRelayFastFloodStillAdmits(t *testing.T) {
 	}
 }
 
-// Under a sustained flood of single-pair sources, an initiator's pair
-// waits out its peer's later arrival: older flood entries go first, so a
-// pair survives one full table turnover (64 slots at 10 announces a second
-// is about 6s, longer than the peer's 3s).
+// Under a sustained flood of single-pair sources that keeps every pair
+// within its grace, eviction is first in, first out: an initiator's pair
+// survives a full table turnover (64 evictable slots at 10 announces a
+// second is about 6s, longer than its peer's 3s), and two sessions behind
+// one shared address don't evict each other.
 func TestRelayPairSurvivesFloodUntilPeerArrives(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(84)), Rand: rng(85)})
 	src := 0
-	flood := func(at time.Time, n int) {
-		for range n {
-			a := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(src >> 8), byte(src), 1}), 6881)
-			announceAt(t, r, at, a, krpc.NodeID{29, byte(src >> 8), byte(src)})
-			src++
-		}
+	next := func(at time.Time) {
+		a := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(src >> 8), byte(src), 1}), 6881)
+		announceAt(t, r, at, a, krpc.NodeID{29, byte(src >> 8), byte(src)})
+		src++
 	}
-	flood(t0, 4*r.cfg.MaxRelayPairs)
-	start := t0.Add(20 * time.Second)
-	announceAt(t, r, start, addr(2), krpc.NodeID{30})
-	for s := 1; s <= 3; s++ {
-		flood(start.Add(time.Duration(s)*time.Second), 10)
+	tick := 100 * time.Millisecond // 10 announces a second
+	at := t0
+	for range 4 * r.cfg.MaxRelayPairs {
+		next(at)
+		at = at.Add(tick)
 	}
-	announceAt(t, r, start.Add(3*time.Second), addr(3), krpc.NodeID{30})
-	if r.RelayPairs() != 1 {
-		t.Fatal("the flood evicted the initiator's pair before its peer arrived")
+	shared := netip.MustParseAddr("100.64.0.1")
+	announceAt(t, r, at, netip.AddrPortFrom(shared, 1), krpc.NodeID{30})
+	announceAt(t, r, at, netip.AddrPortFrom(shared, 2), krpc.NodeID{35})
+	start := at
+	for at.Before(start.Add(3 * time.Second)) {
+		at = at.Add(tick)
+		next(at)
+	}
+	announceAt(t, r, at, addr(3), krpc.NodeID{30})
+	announceAt(t, r, at, addr(4), krpc.NodeID{35})
+	if r.RelayPairs() != 2 {
+		t.Fatalf("the flood evicted sessions before their peers arrived: %d of 2 paired", r.RelayPairs())
 	}
 }
 

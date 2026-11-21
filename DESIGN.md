@@ -445,19 +445,19 @@ infrastructure.
   half-formed pair rather than refusing new ones: from the source holding
   the most, oldest created first, never one created less than ten seconds
   ago (long enough for its peer to arrive), unless every pair is that
-  young, in which case the heaviest source gives up its oldest to a lighter
-  newcomer. At its cap, a source's own oldest stale pair makes way, so one
+  young, in which case the oldest pair of any source no lighter than the
+  newcomer's goes. At its cap, a source's own oldest stale pair makes way, so one
   subscriber behind a shared address can't pin its budget. Creation time,
   not activity, decides, so refreshing can't protect a pair. Under a flood
   from many single-pair sources the router can't tell newcomers from
   attackers, so the guarantee is first in, first out: a pair survives one
-  full table turnover (64 slots divided by the flood rate, about 6 seconds
-  at 10 announces a second, enough for its peer to arrive). A faster flood
-  from that many addresses can deny relaying through that router, and
-  sessions then fall back at their deadline.
-  So a flood churns its own entries instead of locking the table. Clients
-  re-announce every second until they hear their peer through the relay, so
-  a pair evicted anyway is rebuilt. Tighter per-source limits would hit CGNAT users and relay-only
+  full table turnover: the evictable slots (4×`MaxRelayPairs` less the
+  complete pairs, at most 64) divided by the flood rate, at most about 6
+  seconds at 10 announces a second, enough for its peer to arrive. A faster
+  flood from that many addresses can deny relaying through that router, and
+  sessions then fall back at their deadline. Clients re-announce every
+  second until they hear their peer through the relay, so an evicted pair
+  is rebuilt. Tighter per-source limits would hit CGNAT users and relay-only
   listeners as hard as attackers. So pairs between different sources are
   bounded only by the pair cap, the byte budget and idle expiry, the
   open-relay limit every volunteer relay shares.

@@ -169,6 +169,20 @@ type Session struct {
 
 func New(cfg Config) *Session {
 	cfg.defaults()
+	// Addresses arrive unmapped (from the socket and the wire), so compare
+	// like with like.
+	unmap := func(a netip.AddrPort) netip.AddrPort {
+		if !a.IsValid() {
+			return a
+		}
+		return netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
+	}
+	cfg.Relay = unmap(cfg.Relay)
+	relays := make([]netip.AddrPort, len(cfg.Relays))
+	for i, r := range cfg.Relays {
+		relays[i] = unmap(r)
+	}
+	cfg.Relays = relays
 	s := &Session{cfg: cfg, sockets: 1, reflectT: map[uint16]bool{}, sprayed: map[uint16]bool{}, sentTo: map[uint16]pair{}, nomTids: map[uint16]bool{}, relayT: map[uint16]relayQuery{}}
 	binary.LittleEndian.PutUint64(s.gatherID[:], cfg.Rand.Uint64())
 	binary.LittleEndian.PutUint64(s.gatherID[8:], cfg.Rand.Uint64())

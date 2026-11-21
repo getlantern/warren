@@ -45,8 +45,8 @@ const relayIdle = time.Minute
 //     refused: from the source holding the most, oldest created first,
 //     never one created less than evictGrace ago (long enough for the peer
 //     to arrive). Creation time, not activity, decides both, so refreshing
-//     can't protect a pair or pin a slot. A flood churns its own entries,
-//     and clients re-announce until paired, so an evicted pair is rebuilt.
+//     can't protect a pair or pin a slot. Clients re-announce until
+//     paired, so an evicted pair is rebuilt.
 //   - A source pairs with itself at most maxSelfPairs times; only
 //     subscribers sharing one CGNAT IP need that at all.
 //
@@ -99,9 +99,9 @@ func (r *relay) count(src netip.Prefix) (pending, self int) {
 // evictGrace since it was created (so a pair has time to complete, and
 // refreshes don't extend that), ties broken by info-hash for
 // determinism. If every pair is within its grace, a fast flood would
-// otherwise lock new sessions out, so it evicts the oldest pair of the
-// heaviest source instead, provided that source holds more half-formed
-// pairs than the announcer's: a newcomer's fresh pair is the last to go.
+// otherwise lock new sessions out, so it evicts the oldest pair of any
+// source holding at least as many half-formed pairs as the announcer's:
+// first in, first out, so a fresh pair survives a full table turnover.
 // It reports whether it found one.
 func (r *relay) evictPending(now time.Time, announcer netip.Prefix) bool {
 	perSource := map[netip.Prefix]int{}
@@ -130,28 +130,17 @@ func (r *relay) evictPending(now time.Time, announcer netip.Prefix) bool {
 		}
 	}
 	if best == nil {
+		// Every pair is young: take the oldest pair of any source no
+		// lighter than the announcer's, first in, first out regardless of
+		// how many that source holds, so a heavy source can't push out a
+		// lighter one's pairs.
 		for k, q := range r.pairs {
-			if q.n != 1 {
+			if q.n != 1 || perSource[relaySource(q.peers[0])] < perSource[announcer] {
 				continue
 			}
-			c := perSource[relaySource(q.peers[0])]
-			if c <= perSource[announcer] {
-				continue
+			if best == nil || q.created.Before(best.created) || q.created.Equal(best.created) && bytes.Compare(k[:], victim[:]) < 0 {
+				victim, best = k, q
 			}
-			switch {
-			case best == nil:
-			case c != perSource[relaySource(best.peers[0])]:
-				if c < perSource[relaySource(best.peers[0])] {
-					continue
-				}
-			case !q.created.Equal(best.created):
-				if !q.created.Before(best.created) {
-					continue
-				}
-			case bytes.Compare(k[:], victim[:]) >= 0:
-				continue
-			}
-			victim, best = k, q
 		}
 	}
 	if best == nil {
