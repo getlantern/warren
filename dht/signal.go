@@ -345,7 +345,17 @@ type session struct {
 	// answer is kept after Answer: if it is lost, the caller retries the same
 	// offer through another holder, and we resend rather than drop it.
 	answer *MutableItem
+	// relays are further addresses that relayed this offer, which also get
+	// the answer. A retry never replaces via: offers are replayable, so a
+	// later source may be anyone, and redirecting to it would let a replayer
+	// swallow the answer.
+	relays []netip.AddrPort
+	// tokens are write tokens fetched from relays we never adopted, kept per
+	// session so they are bounded and expire with it.
+	tokens map[netip.AddrPort][]byte
 }
+
+const maxSessionRelays = 4
 
 type listener struct {
 	priv     ed25519.PrivateKey
@@ -357,8 +367,6 @@ type listener struct {
 	sessions map[SessionID]*session
 	seen     map[string]time.Time
 	retry    time.Duration // publication backoff while nothing stores our record
-	// tokens are write tokens fetched from replicas we didn't adopt.
-	tokens map[netip.AddrPort][]byte
 }
 
 // Listen publishes a signaling record for priv's key and keeps it reachable.
@@ -373,7 +381,6 @@ func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
 	n.lst = &listener{
 		priv: priv, pub: [32]byte(priv.Public().(ed25519.PublicKey)), x: x,
 		records: map[int64]krpc.NodeID{}, sessions: map[SessionID]*session{}, seen: map[string]time.Time{},
-		tokens: map[netip.AddrPort][]byte{},
 	}
 	n.ensureRecords(now)
 	n.maintain(now)
@@ -569,11 +576,10 @@ func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) b
 		return matched
 	}
 	if _, dup := l.seen[string(m.Salt)]; dup {
-		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil {
+		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil && from != s.via && !slices.Contains(s.relays, from) && len(s.relays) < maxSessionRelays {
+			s.relays = append(s.relays, from)
 			if s.answer != nil {
-				n.sendAnswer(now, from, s.answer)
-			} else {
-				s.via = from // not answered yet: reply through the holder that just proved alive
+				n.sendAnswer(now, s, from)
 			}
 		}
 		return true
@@ -622,7 +628,9 @@ func (n *Node) Answer(now time.Time, id SessionID, payload []byte) error {
 		return err
 	}
 	s.answer = &m
-	n.sendAnswer(now, s.via, &m)
+	for _, via := range append([]netip.AddrPort{s.via}, s.relays...) {
+		n.sendAnswer(now, s, via)
+	}
 	return nil
 }
 
@@ -630,38 +638,41 @@ func (n *Node) Answer(now time.Time, id SessionID, payload []byte) error {
 // replica of our record can relay one, including one whose put
 // acknowledgement we lost and so never adopted; without a write token for it
 // we fetch one with a get first.
-func (n *Node) sendAnswer(now time.Time, via netip.AddrPort, m *MutableItem) {
-	if tok := n.lst.tokenFor(via); tok != nil {
-		a := m.args()
+func (n *Node) sendAnswer(now time.Time, s *session, via netip.AddrPort) {
+	if tok := n.lst.tokenFor(s, via); tok != nil {
+		a := s.answer.args()
 		a.Token = tok
 		n.send(now, via, "put", a, &txn{kind: txPing})
 		return
 	}
 	for _, target := range n.lst.records {
 		t := target
-		n.send(now, via, "get", krpc.Args{Target: &t}, &txn{kind: txAnswerToken, answer: m})
+		n.send(now, via, "get", krpc.Args{Target: &t}, &txn{kind: txAnswerToken, session: s})
 		return
 	}
 }
 
-// answerToken completes sendAnswer once a holder hands us a write token.
-func (n *Node) answerToken(now time.Time, via netip.AddrPort, m *krpc.Msg, answer *MutableItem) {
-	if n.lst == nil || m.Y != krpc.Response || len(m.R.Token) == 0 {
+// answerToken completes sendAnswer once a relay hands us a write token.
+func (n *Node) answerToken(now time.Time, via netip.AddrPort, m *krpc.Msg, s *session) {
+	if n.lst == nil || s == nil || s.answer == nil || m.Y != krpc.Response || len(m.R.Token) == 0 {
 		return
 	}
-	n.lst.tokens[via] = slices.Clone(m.R.Token)
-	a := answer.args()
+	if s.tokens == nil {
+		s.tokens = map[netip.AddrPort][]byte{}
+	}
+	s.tokens[via] = slices.Clone(m.R.Token)
+	a := s.answer.args()
 	a.Token = m.R.Token
 	n.send(now, via, "put", a, &txn{kind: txPing})
 }
 
-func (l *listener) tokenFor(via netip.AddrPort) []byte {
+func (l *listener) tokenFor(s *session, via netip.AddrPort) []byte {
 	for _, h := range l.holders {
 		if h.addr == via && h.token != nil {
 			return h.token
 		}
 	}
-	return l.tokens[via]
+	return s.tokens[via]
 }
 
 // ---- caller ----

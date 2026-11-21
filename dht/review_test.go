@@ -170,3 +170,51 @@ func TestListenReplacesIdentity(t *testing.T) {
 		t.Fatalf("%d owned records, want 1", len(n.owned))
 	}
 }
+
+// buildOffer makes a caller's offer for n's current record.
+func buildOffer(t *testing.T, n *Node) *MutableItem {
+	t.Helper()
+	var target krpc.NodeID
+	for _, tg := range n.lst.records {
+		target = tg
+	}
+	e, _ := ecdhX25519(n.randBytes(32))
+	shared, _ := e.ECDH(n.lst.x.PublicKey())
+	offerKey, _, _ := signalKeys(shared, e.PublicKey().Bytes(), n.lst.x.PublicKey().Bytes())
+	sealed := append(e.PublicKey().Bytes(), n.seal(offerKey, []byte("hi"))...)
+	m, _ := NewMutable(ed25519.NewKeyFromSeed(append(make([]byte, 31), 1)), offerSalt(n.randBytes(16), target), t0.Unix(), bencodeBytes(sealed))
+	return &m
+}
+
+// A replayed copy of an offer from another address must not divert the
+// answer from the relay the offer first came through.
+func TestReplayedOfferDoesNotHijackAnswer(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(84)), Rand: rng(85)})
+	n.Listen(t0, ed25519.NewKeyFromSeed(make([]byte, 32)))
+	n.Drain()
+	m := buildOffer(t, n)
+	relay, attacker := addr(50), addr(66)
+	n.acceptOffer(t0, relay, m)
+	_, events := n.Drain()
+	in := events[0].(Incoming)
+	for i := range 10 {
+		n.acceptOffer(t0, netip.AddrPortFrom(attacker.Addr(), uint16(1000+i)), m) // replays
+	}
+	if err := n.Answer(t0, in.Session, []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	sends, _ := n.Drain()
+	toRelay, total := false, 0
+	for _, s := range sends {
+		total++
+		if s.To == relay {
+			toRelay = true
+		}
+	}
+	if !toRelay {
+		t.Fatal("answer was diverted away from the original relay")
+	}
+	if total > 1+maxSessionRelays {
+		t.Fatalf("answer sent to %d addresses; replays must be capped at %d extra", total, maxSessionRelays)
+	}
+}
