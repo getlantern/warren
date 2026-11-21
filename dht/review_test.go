@@ -278,3 +278,29 @@ func TestRelistenAdvancesSequence(t *testing.T) {
 		t.Fatalf("re-listen reused seq %d (was %d) with a different value", s2, s1)
 	}
 }
+
+// Pruning the sequence table must never forget a live record's number that
+// is still ahead of the clock.
+func TestRecordSeqPruneKeepsLiveEntries(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(90)), Rand: rng(91)})
+	n.Listen(t0, ed25519.NewKeyFromSeed(make([]byte, 32)))
+	var target krpc.NodeID
+	var epoch int64
+	for e, tg := range n.lst.records {
+		epoch, target = e, tg
+	}
+	for range 5 {
+		n.signRecord(t0, epoch) // several re-signs in one second: seq runs ahead of the clock
+	}
+	ahead := n.recordSeq[target]
+	for i := range 2 * maxRecordSeqs { // fill the table with stale entries
+		n.recordSeq[krpc.NodeID{byte(i), byte(i >> 8), 0xee}] = t0.Unix() - 100
+	}
+	n.signRecord(t0, epoch)
+	if got := n.recordSeq[target]; got <= ahead {
+		t.Fatalf("re-sign after pruning gave seq %d, not above the live %d", got, ahead)
+	}
+	if len(n.recordSeq) > maxRecordSeqs {
+		t.Fatalf("table not pruned: %d entries", len(n.recordSeq))
+	}
+}

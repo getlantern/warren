@@ -425,8 +425,19 @@ func (n *Node) signRecord(now time.Time, epoch int64) krpc.NodeID {
 	seq := max(now.Unix(), n.recordSeq[target]+1)
 	m, _ := NewMutable(l.priv, salt, seq, encodeRecord([32]byte(l.x.PublicKey().Bytes())))
 	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now}
-	if n.recordSeq == nil || len(n.recordSeq) >= maxRecordSeqs {
-		n.recordSeq = map[krpc.NodeID]int64{} // only same-second reuse is at risk
+	if n.recordSeq == nil {
+		n.recordSeq = map[krpc.NodeID]int64{}
+	}
+	if len(n.recordSeq) >= maxRecordSeqs {
+		// Forget only entries the clock has passed: for those max(now, seq+1)
+		// already exceeds them. An entry still ahead of the clock (several
+		// re-signs within a second) must be kept, or the next re-sign would
+		// go backwards and be rejected.
+		for k, v := range n.recordSeq {
+			if v < now.Unix() {
+				delete(n.recordSeq, k)
+			}
+		}
 	}
 	n.recordSeq[target] = seq
 	return target
