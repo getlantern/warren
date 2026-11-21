@@ -70,8 +70,8 @@ func TestLimiterPerCallerBeforeGlobal(t *testing.T) {
 			t.Fatal("caller exceeded its own budget")
 		}
 	}
-	if len(l.sprays) != perCallerMax {
-		t.Fatalf("refused attempts charged the global budget: %d", len(l.sprays))
+	if len(l.heavy) != perCallerMax {
+		t.Fatalf("refused attempts charged the global budget: %d", len(l.heavy))
 	}
 	if !l.allow(caller(8), ap("192.0.2.77:1"), netip.AddrPort{}, true, now) {
 		t.Fatal("another caller was locked out")
@@ -80,7 +80,7 @@ func TestLimiterPerCallerBeforeGlobal(t *testing.T) {
 
 func TestLimiterGlobalSprayBudget(t *testing.T) {
 	var l inboundLimiter
-	for i := range globalMax {
+	for i := range heavyMax {
 		l.allow(caller(byte(i)), ap(netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, byte(i), 1}), 1).String()), netip.AddrPort{}, true, now)
 	}
 	if l.allow(caller(200), ap("192.0.2.1:1"), netip.AddrPort{}, true, now) {
@@ -88,5 +88,32 @@ func TestLimiterGlobalSprayBudget(t *testing.T) {
 	}
 	if !l.allow(caller(201), ap("192.0.2.2:1"), netip.AddrPort{}, false, now) {
 		t.Fatal("a direct-only punch was refused by the spray budget")
+	}
+}
+
+func TestLimiterGlobalAllBudget(t *testing.T) {
+	var l inboundLimiter
+	for i := range allMax {
+		l.allow(caller(byte(i)), ap(netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, byte(18 + i/200), byte(i), 1}), 1).String()), netip.AddrPort{}, false, now)
+	}
+	if l.allow(caller(250), ap("192.0.2.9:1"), netip.AddrPort{}, false, now) {
+		t.Fatal("direct punches have no global budget")
+	}
+}
+
+// Refused attempts from ever-new keys and addresses must not grow the tables.
+func TestLimiterRefusalsDoNotGrow(t *testing.T) {
+	var l inboundLimiter
+	for i := range heavyMax {
+		l.allow(caller(byte(i)), ap(netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, byte(i), 1}), 1).String()), netip.AddrPort{}, true, now)
+	}
+	before := len(l.callers) + len(l.nets)
+	for i := range 5000 {
+		var k [32]byte
+		k[0], k[1] = byte(i), byte(i>>8)
+		l.allow(k, ap(netip.AddrPortFrom(netip.AddrFrom4([4]byte{100, byte(i >> 8), byte(i), 1}), 1).String()), netip.AddrPort{}, true, now)
+	}
+	if after := len(l.callers) + len(l.nets); after != before {
+		t.Fatalf("refused attempts grew the tables from %d to %d entries", before, after)
 	}
 }

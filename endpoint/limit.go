@@ -15,8 +15,9 @@ import (
 //   - per caller key, so one key cannot use up the shared budgets;
 //   - per probed network: public candidates by /24 (/48 for IPv6), non-public
 //     ones and the relay by exact address;
-//   - a global budget, charged only for punches that may spray (a peer behind
-//     dependent mapping), since direct probing costs a handful of packets.
+//   - global budgets: a tight one for punches whose planned strategy sends
+//     many probes (spraying, opening many sockets, double birthday) and a
+//     looser one for all punches, since even direct probing sends packets.
 //
 // Keys are free, so a determined attacker can still exhaust the global spray
 // budget and delay legitimate hard-NAT callers; Config.Authorize is the
@@ -25,15 +26,19 @@ type inboundLimiter struct {
 	mu      sync.Mutex
 	callers map[[32]byte][]time.Time
 	nets    map[netip.Prefix][]time.Time
-	sprays  []time.Time
+	all     []time.Time
+	heavy   []time.Time
 }
 
 const (
 	limitWindow   = time.Minute
 	perCallerMax  = 3
 	perNetworkMax = 3
-	globalMax     = 30
-	maxTracked    = 4096
+	// Global budgets: punches that may send many probes (spraying or opening
+	// many sockets), and all punches including direct ones.
+	heavyMax   = 30
+	allMax     = 120
+	maxTracked = 4096
 )
 
 func networkOf(a netip.Addr) netip.Prefix {
@@ -58,19 +63,28 @@ func prune(ts []time.Time, now time.Time) []time.Time {
 }
 
 // allow reports whether to punch now for caller toward cands (and through
-// relay), recording the punch if so. spray says the punch may spray.
-func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay netip.AddrPort, spray bool, now time.Time) bool {
+// relay), recording the punch if so. heavy says the planned strategy sends
+// many probes. Checks read into locals and nothing is written unless the
+// punch is allowed, so refused attempts cannot grow the tables.
+func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay netip.AddrPort, heavy bool, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.callers == nil {
 		l.callers, l.nets = map[[32]byte][]time.Time{}, map[netip.Prefix][]time.Time{}
 	}
-	l.callers[caller] = prune(l.callers[caller], now)
-	if len(l.callers[caller]) >= perCallerMax {
+	if len(l.callers)+len(l.nets) > maxTracked {
+		l.sweep(now)
+		if len(l.callers)+len(l.nets) > maxTracked {
+			return false // still full of live entries: refuse rather than grow
+		}
+	}
+	callerTs := prune(l.callers[caller], now)
+	if len(callerTs) >= perCallerMax {
 		return false
 	}
 	seen := map[netip.Prefix]bool{}
 	var nets []netip.Prefix
+	var netTs [][]time.Time
 	targets := append([]netip.AddrPort(nil), cands...)
 	if relay.IsValid() {
 		targets = append(targets, relay)
@@ -81,26 +95,26 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 			continue
 		}
 		seen[p] = true
-		l.nets[p] = prune(l.nets[p], now)
-		if len(l.nets[p]) >= perNetworkMax {
+		ts := prune(l.nets[p], now)
+		if len(ts) >= perNetworkMax {
 			return false
 		}
-		nets = append(nets, p)
+		nets, netTs = append(nets, p), append(netTs, ts)
 	}
-	l.sprays = prune(l.sprays, now)
-	if spray && len(l.sprays) >= globalMax {
+	all, heavyTs := prune(l.all, now), prune(l.heavy, now)
+	if len(all) >= allMax || (heavy && len(heavyTs) >= heavyMax) {
 		return false
 	}
 
-	l.callers[caller] = append(l.callers[caller], now)
-	for _, p := range nets {
-		l.nets[p] = append(l.nets[p], now)
+	l.callers[caller] = append(callerTs, now)
+	for i, p := range nets {
+		l.nets[p] = append(netTs[i], now)
 	}
-	if spray {
-		l.sprays = append(l.sprays, now)
-	}
-	if len(l.callers)+len(l.nets) > maxTracked {
-		l.sweep(now)
+	l.all = append(all, now)
+	if heavy {
+		l.heavy = append(heavyTs, now)
+	} else {
+		l.heavy = heavyTs
 	}
 	return true
 }

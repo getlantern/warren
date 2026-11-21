@@ -275,7 +275,12 @@ naming a victim can't turn a listener into a probe reflector:
 - per caller key, checked first so one key can't spend the shared budgets;
 - per probed network: public candidates by /24 (or /48), non-public ones and
   the relay by exact address;
-- a global budget, charged only for punches that may spray.
+- global budgets, charged by the planner's actual strategy: a tight one for
+  probe-heavy punches (spray, open sockets, double birthday) and a looser one
+  for all punches.
+
+Checks never write on refusal, so attempts from ever-new keys can't grow the
+tables.
 
 A responder also never sprays a non-public address. Doing so would port-scan
 its own LAN or localhost on a stranger's request. LAN candidates get only

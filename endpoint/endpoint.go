@@ -242,8 +242,13 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.
-	spray := offer.Profile.Mapping == punch.MappingDependent
-	if !e.limiter.allow(in.Caller, offer.Candidates, offer.Relay, spray, time.Now()) {
+	var refl []dht.Reflection
+	if err := e.node.Inspect(ctx, func(d *dht.Node) { refl = d.Reflections() }); err != nil {
+		return
+	}
+	strategy, _, _ := punch.Plan(e.profile(refl), offer.Profile, offer.Candidates, true)
+	heavy := strategy == punch.Spray || strategy == punch.Open || strategy == punch.DoubleBirthday
+	if !e.limiter.allow(in.Caller, offer.Candidates, offer.Relay, heavy, time.Now()) {
 		return
 	}
 	if e.cfg.RelayOnly && offer.Relay.IsValid() {
