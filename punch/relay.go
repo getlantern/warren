@@ -1,0 +1,151 @@
+package punch
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"net/netip"
+	"time"
+
+	"github.com/getlantern/warren/krpc"
+)
+
+// Relay fallback: both sides bind socket 0 to the agreed DHT
+// router with get_peers then announce_peer on a secret-derived info-hash.
+// The initiator offers candidate routers and the responder picks one (a
+// relay-only responder only ever picks a router it already knows).
+// The router pairs the two announcers and forwards non-KRPC datagrams
+// between them. Probes through it are 20-byte datagrams shaped like a uTP
+// ST_SYN (and ST_STATE for the reply) whose remaining bytes are a MAC, so
+// the router forwards them like any uTP traffic and only the peer can
+// produce them.
+
+const (
+	relayRetry = 500 * time.Millisecond
+	// relayReannounce: until the peer is heard through the relay, keep
+	// announcing, so a half-formed pair the router evicted is rebuilt.
+	relayReannounce = time.Second
+	relayProbeEvery = 100 * time.Millisecond
+	relayProbeLen   = 20
+)
+
+func relayMAC(secret []byte, label string, typ byte) []byte {
+	m := hmac.New(sha256.New, secret)
+	m.Write([]byte("warren/punch/v1 relay " + label))
+	out := make([]byte, relayProbeLen)
+	out[0] = typ<<4 | 1 // uTP version 1
+	copy(out[2:], m.Sum(nil))
+	return out
+}
+
+func (s *Session) startRelay(now time.Time, secret []byte, me, peer string) {
+	h := sha256.Sum256(append([]byte("warren/punch/v1 relay info-hash "), secret...))
+	s.relayInfo = krpc.NodeID(h[:20])
+	s.relayProbe, s.relayAck = relayMAC(secret, "probe "+me, 4), relayMAC(secret, "ack "+me, 2)
+	s.peerProbe, s.peerAck = relayMAC(secret, "probe "+peer, 4), relayMAC(secret, "ack "+peer, 2)
+	s.relayFrom = now
+	if s.strategy != Relay {
+		// A direct path wins if one exists; fall back halfway to the deadline.
+		s.relayFrom = now.Add(s.cfg.Deadline / 2)
+	}
+	s.nextRelay = now
+}
+
+func (s *Session) reannouncing() bool {
+	return s.relay.IsValid() && s.relayBound && !s.relayProven && !s.done
+}
+
+func (s *Session) tickRelay(now time.Time) {
+	if !s.relay.IsValid() || s.nominating {
+		return
+	}
+	if s.reannouncing() && !now.Before(s.nextAnnounce) {
+		// Untracked: the reply changes nothing, and tracking it would
+		// reset the probe timer.
+		info := s.relayInfo
+		s.query0("announce_peer", krpc.Args{InfoHash: &info, Token: s.relayToken, Port: 6881, ImpliedPort: true})
+		s.nextAnnounce = now.Add(relayReannounce)
+	}
+	if now.Before(s.nextRelay) {
+		return
+	}
+	switch {
+	case s.relayToken == nil:
+		info := s.relayInfo
+		s.relayT[s.query0("get_peers", krpc.Args{InfoHash: &info})] = relayGetPeers
+		s.nextRelay = now.Add(relayRetry)
+	case !s.relayBound:
+		info := s.relayInfo
+		s.relayT[s.query0("announce_peer", krpc.Args{InfoHash: &info, Token: s.relayToken, Port: 6881, ImpliedPort: true})] = relayAnnounce
+		s.nextRelay = now.Add(relayRetry)
+	case now.Before(s.relayFrom):
+		s.nextRelay = s.relayFrom
+	case s.cfg.Initiator && s.relayProven && s.relayUnanswered >= nominateAttempts:
+		// The responder's probe reached us through the relay, so it is
+		// bound and paired; repeated silence means its acks were lost after
+		// it handed the socket to the application, which can no longer
+		// answer. A wrong guess fails loudly in the authenticated handshake
+		// that follows.
+		s.connectRelayed()
+	default:
+		// Both sides probe: the initiator's probe is what the responder
+		// acks, and the responder's tells the initiator the path works.
+		s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayProbe})
+		if s.cfg.Initiator && s.relayProven {
+			s.relayUnanswered++
+		}
+		s.nextRelay = now.Add(relayProbeEvery)
+	}
+}
+
+// query0 sends a KRPC query from socket 0 with the gathering node ID.
+func (s *Session) query0(q string, a krpc.Args) uint16 {
+	a.ID = s.gatherID
+	return s.queryArgs(0, s.relay, q, a)
+}
+
+type relayQuery uint8
+
+const (
+	relayGetPeers relayQuery = iota + 1
+	relayAnnounce
+)
+
+func (s *Session) relayReply(now time.Time, m *krpc.Msg, q relayQuery) {
+	switch {
+	case m.Y != krpc.Response:
+	case q == relayGetPeers && s.relayToken == nil && len(m.R.Token) > 0:
+		s.relayToken = append([]byte(nil), m.R.Token...)
+		clear(s.relayT) // earlier retries are moot
+		s.nextRelay = now
+	case q == relayAnnounce && !s.relayBound:
+		s.relayBound = true
+		clear(s.relayT)
+		s.nextAnnounce = now.Add(relayReannounce)
+		s.nextRelay = now
+	}
+}
+
+// relayData handles non-KRPC datagrams arriving on socket 0 from the relay.
+func (s *Session) relayData(socket int, from netip.AddrPort, b []byte) {
+	if !s.started || socket != 0 || from != s.relay || len(b) != relayProbeLen {
+		return
+	}
+	switch {
+	case !s.cfg.Initiator && hmac.Equal(b, s.peerProbe):
+		for range finalAckCopies { // the socket is handed off after this
+			s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayAck})
+		}
+		if !s.done {
+			s.connectRelayed()
+		}
+	case s.cfg.Initiator && !s.done && hmac.Equal(b, s.peerAck):
+		s.connectRelayed()
+	case s.cfg.Initiator && hmac.Equal(b, s.peerProbe):
+		s.relayProven = true
+	}
+}
+
+func (s *Session) connectRelayed() {
+	s.done, s.selected = true, pair{0, s.relay}
+	s.events = append(s.events, Connected{Socket: 0, Remote: s.relay, Strategy: Relay, Probes: s.probes, Relayed: true})
+}
