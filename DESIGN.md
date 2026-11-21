@@ -437,9 +437,11 @@ infrastructure.
   out), with at most 16 pairs at once (`MaxRelayPairs`) and 512 KB/s per pair
   (`RelayRate`, a token bucket; packets over budget are dropped, so end-to-end
   congestion control backs off). An address relays one pair, one source (an IPv4
-  address, or an IPv6 /64 and its /48) can hold at most 4 half-formed and 8
-  complete pairs (announce tokens are per IP, so this stops one host filling
-  the table or every active slot, while leaving a busy client its fallback),
+  address, or an IPv6 /64 and its /48) can hold at most 4 half-formed pairs, one
+  pair with itself, and complete pairs with other sources up to half of
+  `MaxRelayPairs` (announce tokens are per IP, so this stops one host filling
+  the table or holding more than half the active slots, while leaving a busy
+  client its fallback),
   pairs that never forward anything expire after 20 seconds, pairs are fixed
   once formed so a third announcer can't join or hijack them, idle pairs expire
   after a minute, and read-only phones never relay.

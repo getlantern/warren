@@ -39,37 +39,40 @@ const (
 // Per-source limits. Announce tokens are per IP, so without them one host
 // could fill the table from many ports, or pair with itself to hold every
 // active slot. A source is an IPv4 address, or an IPv6 /64 and, more
-// loosely, the /48 a single customer is often delegated. The limits aren't
-// 1 because subscribers behind one CGNAT IP share it, and complete pairs
-// get more room than half-formed ones so a busy client (every dial binds a
-// relay) keeps its fallback.
-type sourceLimit struct {
-	bits              int
-	pending, complete int
-}
+// loosely, the /48 a single customer is often delegated. A source may hold
+// a few half-formed pairs, a single self-pair (both members from it: only
+// subscribers sharing one CGNAT IP need that), and complete pairs with
+// other sources up to half of MaxRelayPairs, since a busy client binds a
+// relay on every dial and should keep its fallback. Even a dual-stack host
+// pairing its two families with each other holds at most half the slots.
+type sourceLimit struct{ bits, pending int }
 
 var (
-	v4Limits = []sourceLimit{{32, 4, 8}}
-	v6Limits = []sourceLimit{{64, 4, 8}, {48, 8, 8}}
+	v4Limits = []sourceLimit{{32, 4}}
+	v6Limits = []sourceLimit{{64, 4}, {48, 8}}
 )
+
+const maxSelfPairs = 1
 
 // relayNorm drops the IPv4-mapped form and any zone: Prefix.Contains never
 // matches a zoned address, so a link-local sender with a zone would
 // otherwise escape the per-source count.
 func relayNorm(ip netip.Addr) netip.Addr { return ip.Unmap().WithZone("") }
 
-func (p *relayPair) from(src netip.Prefix) bool {
+func (p *relayPair) members(src netip.Prefix) int {
+	c := 0
 	for i := range p.n {
 		if src.Contains(relayNorm(p.peers[i].Addr())) {
-			return true
+			c++
 		}
 	}
-	return false
+	return c
 }
 
-// admits reports whether from may open a new half-formed pair (joining is
-// false) or complete p (joining is true) within its source limits.
-func (r *relay) admits(from netip.AddrPort, p *relayPair, joining bool) bool {
+// admits reports whether from's source may take on p: a new half-formed
+// pair when p is nil, otherwise completing p with other as the second
+// member. completeCap bounds its complete pairs.
+func (r *relay) admits(from, other netip.AddrPort, p *relayPair, completeCap int) bool {
 	ip := relayNorm(from.Addr())
 	limits := v4Limits
 	if !ip.Is4() {
@@ -77,18 +80,32 @@ func (r *relay) admits(from netip.AddrPort, p *relayPair, joining bool) bool {
 	}
 	for _, l := range limits {
 		src, _ := ip.Prefix(l.bits)
-		pending, complete := 0, 0
+		pending, complete, self := 0, 0, 0
 		for _, q := range r.pairs {
-			if q == p || !q.from(src) {
+			m := q.members(src)
+			if q == p || m == 0 {
 				continue
 			}
-			if q.n == 2 {
-				complete++
-			} else {
+			switch {
+			case q.n < 2:
 				pending++
+			case m == 2:
+				self++
+				complete++
+			default:
+				complete++
 			}
 		}
-		if joining && complete >= l.complete || !joining && pending >= l.pending {
+		if p == nil {
+			if pending >= l.pending {
+				return false
+			}
+			continue
+		}
+		if complete >= completeCap {
+			return false
+		}
+		if src.Contains(relayNorm(other.Addr())) && self >= maxSelfPairs {
 			return false
 		}
 	}
@@ -115,7 +132,7 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 		return
 	}
 	if p == nil {
-		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs || !r.admits(from, nil, false) {
+		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs || !r.admits(from, netip.AddrPort{}, nil, 0) {
 			return
 		}
 		p = &relayPair{created: now, active: now, tokens: float64(n.cfg.RelayRate)}
@@ -133,7 +150,8 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 	if p.n == 1 && n.activePairs() >= n.cfg.MaxRelayPairs {
 		return
 	}
-	if p.n == 1 && (!r.admits(from, p, true) || !r.admits(p.peers[0], p, true)) {
+	completeCap := max(n.cfg.MaxRelayPairs/2, 1)
+	if p.n == 1 && (!r.admits(from, p.peers[0], p, completeCap) || !r.admits(p.peers[0], from, p, completeCap)) {
 		return // a complete pair counts against both members' sources
 	}
 	p.peers[p.n] = from

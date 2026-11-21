@@ -146,8 +146,8 @@ func TestRelaySourceCannotHoldActiveSlots(t *testing.T) {
 	for i := range r.cfg.MaxRelayPairs {
 		selfPair(r, netip.AddrPortFrom(v4, uint16(20000+2*i)), netip.AddrPortFrom(v4, uint16(20001+2*i)), 13, i)
 	}
-	if got, want := r.RelayPairs(), v4Limits[0].complete; got != want {
-		t.Fatalf("one IPv4 host self-paired %d times, want the cap %d", got, want)
+	if got := r.RelayPairs(); got != maxSelfPairs {
+		t.Fatalf("one IPv4 host self-paired %d times, want the cap %d", got, maxSelfPairs)
 	}
 
 	r = New(Config{ID: outsiderID(rng(66)), Rand: rng(67)})
@@ -156,8 +156,19 @@ func TestRelaySourceCannotHoldActiveSlots(t *testing.T) {
 		b := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, byte(i), 15: 2})
 		selfPair(r, netip.AddrPortFrom(a, 6881), netip.AddrPortFrom(b, 6881), 14, i)
 	}
-	if got, want := r.RelayPairs(), v6Limits[1].complete; got != want {
-		t.Fatalf("one IPv6 /48 holds %d pairs, want the cap %d", got, want)
+	if got := r.RelayPairs(); got != maxSelfPairs {
+		t.Fatalf("one IPv6 /48 self-paired %d times, want the cap %d", got, maxSelfPairs)
+	}
+
+	// A dual-stack host pairing its IPv4 side with its IPv6 side: these
+	// are pairs between two sources, capped at half the active slots.
+	r = New(Config{ID: outsiderID(rng(72)), Rand: rng(73)})
+	for i := range r.cfg.MaxRelayPairs {
+		v6 := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 15: byte(i + 1)})
+		selfPair(r, netip.AddrPortFrom(v4, uint16(20000+i)), netip.AddrPortFrom(v6, 6881), 19, i)
+	}
+	if got, want := r.RelayPairs(), r.cfg.MaxRelayPairs/2; got != want {
+		t.Fatalf("a dual-stack host holds %d pairs, want at most half the slots (%d)", got, want)
 	}
 }
 
