@@ -1,0 +1,212 @@
+package dht
+
+import (
+	"net/netip"
+	"slices"
+	"time"
+
+	"github.com/getlantern/warren/krpc"
+)
+
+type OpID uint32
+
+type lookupKind uint8
+
+const (
+	findNode lookupKind = iota
+	getItem
+	putItem
+)
+
+type candState uint8
+
+const (
+	unqueried candState = iota
+	inflight
+	responded
+	failed
+)
+
+type cand struct {
+	id       krpc.NodeID
+	idKnown  bool
+	addr     netip.AddrPort
+	dist     krpc.NodeID
+	state    candState
+	slow     bool
+	domestic bool
+	token    []byte
+}
+
+// lookup is an iterative Kademlia traversal. It tracks two frontiers: the K
+// closest live nodes overall and, when domestic copies are on, the K closest
+// live domestic nodes, so a single traversal finds both replica sets.
+type lookup struct {
+	op       OpID
+	kind     lookupKind
+	internal bool
+	target   krpc.NodeID
+	t        *table
+	deadline time.Time
+	domestic bool
+
+	cands []*cand
+	ips   map[netip.AddrPort]bool
+	pfx   map[ipPrefix]int
+
+	rec   record // put payload
+	cas   *int64
+	value []byte // immutable get result
+	// Mutable gets: the expected key and salt, and the best verified item.
+	key        *[32]byte
+	salt       []byte
+	best       *MutableItem
+	finished   bool
+	queried    int
+	failures   int
+	putPending int
+	putAcks    int
+	putDomAcks int
+
+	// onDone, if set, replaces the completion event for internal lookups.
+	onDone func(now time.Time, l *lookup)
+	// holders are candidates that returned the best mutable item.
+	holders []*cand
+	// acked are replicas that acknowledged a put, in distance order.
+	acked []ackedReplica
+}
+
+type ackedReplica struct {
+	addr     netip.AddrPort
+	token    []byte
+	domestic bool
+	dist     krpc.NodeID
+}
+
+const maxLookupPerPrefix = 8
+
+func (l *lookup) add(n *Node, id krpc.NodeID, idKnown bool, addr netip.AddrPort) {
+	ip := addr.Addr().Unmap()
+	k := l.t.key(addr)
+	if !ip.IsValid() || addr.Port() == 0 || l.ips[k] || (idKnown && id == n.cfg.ID) {
+		return
+	}
+	if idKnown && !l.t.accept(id, ip) {
+		return
+	}
+	p := prefixOf(ip)
+	if !l.t.unrestricted && l.pfx[p] >= maxLookupPerPrefix {
+		return
+	}
+	c := &cand{id: id, idKnown: idKnown, addr: addr, domestic: n.isDomestic(ip)}
+	if n.iso.isolated && !c.domestic {
+		return // known unreachable; the isolation probe watches for recovery
+	}
+	if idKnown {
+		c.dist = distance(id, l.target)
+	} else {
+		for i := range c.dist {
+			c.dist[i] = 0xff
+		}
+	}
+	if len(l.cands) >= n.cfg.MaxCandidates {
+		last := l.cands[len(l.cands)-1]
+		if last.state != unqueried || compareID(c.dist, last.dist) >= 0 {
+			return
+		}
+		l.cands = l.cands[:len(l.cands)-1]
+		delete(l.ips, l.t.key(last.addr))
+		l.pfx[prefixOf(last.addr.Addr())]--
+	}
+	l.ips[k] = true
+	l.pfx[p]++
+	l.insert(c)
+}
+
+func (l *lookup) insert(c *cand) {
+	i, _ := slices.BinarySearchFunc(l.cands, c, func(a, b *cand) int { return compareID(a.dist, b.dist) })
+	l.cands = slices.Insert(l.cands, i, c)
+}
+
+// identify fixes a seed's distance once its ID is known.
+func (l *lookup) identify(c *cand, id krpc.NodeID) {
+	i := slices.Index(l.cands, c)
+	l.cands = slices.Delete(l.cands, i, i+1)
+	c.id, c.idKnown, c.dist = id, true, distance(id, l.target)
+	l.insert(c)
+}
+
+// next returns the closest unqueried candidate inside either frontier.
+func (l *lookup) next(k int) *cand {
+	overall, dom := 0, 0
+	for _, c := range l.cands {
+		if c.state == failed {
+			continue
+		}
+		inOverall := overall < k
+		inDom := l.domestic && c.domestic && dom < k
+		overall++
+		if c.domestic {
+			dom++
+		}
+		if c.state == unqueried && (inOverall || inDom) {
+			return c
+		}
+		if overall >= k && (!l.domestic || dom >= k) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (l *lookup) inflight() (active, total int) {
+	for _, c := range l.cands {
+		if c.state == inflight {
+			total++
+			if !c.slow {
+				active++
+			}
+		}
+	}
+	return
+}
+
+func (l *lookup) byAddr(addr netip.AddrPort) *cand {
+	for _, c := range l.cands {
+		if c.addr == addr {
+			return c
+		}
+	}
+	return nil
+}
+
+// replicas returns the responded nodes a put should go to: the K closest,
+// plus the K closest domestic ones when domestic copies are on.
+func (l *lookup) replicas(k int) []*cand {
+	var out []*cand
+	overall, dom := 0, 0
+	for _, c := range l.cands {
+		if c.state != responded || c.token == nil {
+			continue
+		}
+		take := overall < k || (l.domestic && c.domestic && dom < k)
+		overall++
+		if c.domestic {
+			dom++
+		}
+		if take {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (l *lookup) closestResponded(k int) []krpc.NodeInfo {
+	var out []krpc.NodeInfo
+	for _, c := range l.cands {
+		if c.state == responded && c.idKnown && len(out) < k {
+			out = append(out, krpc.NodeInfo{ID: c.id, Addr: c.addr})
+		}
+	}
+	return out
+}

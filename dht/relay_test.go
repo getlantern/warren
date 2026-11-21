@@ -1,0 +1,95 @@
+package dht
+
+import (
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/getlantern/warren/krpc"
+)
+
+// announce sends get_peers then announce_peer from 'from', as a relay
+// binding does.
+func announce(t *testing.T, n *Node, from netip.AddrPort, info krpc.NodeID) {
+	t.Helper()
+	r := query(t, n, from, krpc.Msg{Q: "get_peers", A: krpc.Args{ID: outsiderID(rng(50)), InfoHash: &info}})
+	ok := query(t, n, from, krpc.Msg{Q: "announce_peer", A: krpc.Args{ID: outsiderID(rng(51)), InfoHash: &info, Token: r.R.Token, Port: 6881, ImpliedPort: true}})
+	if ok == nil || ok.Y != krpc.Response {
+		t.Fatalf("announce rejected: %+v", ok)
+	}
+}
+
+func relayed(n *Node, from netip.AddrPort, b []byte) []Send {
+	n.HandlePacket(t0, from, b)
+	s, _ := n.Drain()
+	return s
+}
+
+var utpLike = append([]byte{0x01, 0}, make([]byte, 100)...) // ST_DATA, version 1
+
+func TestRelayPairsAndForwards(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(52)), Rand: rng(53)})
+	a, b, c := addr(1), addr(2), addr(3)
+	info := krpc.NodeID{7}
+
+	if s := relayed(r, a, utpLike); len(s) != 0 {
+		t.Fatal("forwarded for an unpaired address")
+	}
+	announce(t, r, a, info)
+	if s := relayed(r, a, utpLike); len(s) != 0 {
+		t.Fatal("forwarded before the pair formed")
+	}
+	announce(t, r, b, info)
+	if r.RelayPairs() != 1 {
+		t.Fatalf("pairs = %d", r.RelayPairs())
+	}
+	if s := relayed(r, a, utpLike); len(s) != 1 || s[0].To != b {
+		t.Fatalf("a→b: %+v", s)
+	}
+	if s := relayed(r, b, utpLike); len(s) != 1 || s[0].To != a {
+		t.Fatalf("b→a: %+v", s)
+	}
+	// A third announcer cannot join or hijack the pair.
+	announce(t, r, c, info)
+	if s := relayed(r, c, utpLike); len(s) != 0 {
+		t.Fatal("third party relayed through an existing pair")
+	}
+}
+
+func TestRelayByteBudget(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(54)), Rand: rng(55), RelayRate: 10_000})
+	a, b := addr(1), addr(2)
+	announce(t, r, a, krpc.NodeID{8})
+	announce(t, r, b, krpc.NodeID{8})
+	pkt := append([]byte{0x01, 0}, make([]byte, 998)...)
+	sent := 0
+	for range 100 {
+		sent += len(relayed(r, a, pkt)) // all within one instant
+	}
+	if sent > 11 {
+		t.Fatalf("forwarded %d KB in an instant with a 10 KB/s budget", sent)
+	}
+}
+
+func TestReadOnlyAndOptOutDoNotRelay(t *testing.T) {
+	for _, cfg := range []Config{{ReadOnly: true}, {DisableRelay: true}} {
+		cfg.ID, cfg.Rand = outsiderID(rng(56)), rng(57)
+		r := New(cfg)
+		if r.relaying() {
+			t.Fatalf("%+v relays", cfg)
+		}
+	}
+}
+
+func TestRelayPairLimit(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(58)), Rand: rng(59), MaxRelayPairs: 2})
+	for i := range 4 {
+		info := krpc.NodeID{byte(i + 1)}
+		announce(t, r, addr(10+2*i), info)
+		announce(t, r, addr(11+2*i), info)
+	}
+	if got := r.RelayPairs(); got != 2 {
+		t.Fatalf("relaying %d pairs, limit 2", got)
+	}
+	_ = time.Second
+}
