@@ -293,3 +293,30 @@ func TestWantFamilies(t *testing.T) {
 		}
 	}
 }
+
+// A provider that can run no leg for an offer answers at once with an empty
+// offer, so the caller fails fast instead of waiting out signaling.
+func TestNoCommonFamilyFailsFast(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed) // both IPv4-only
+	pk := key("v6only-provider")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// Offer only an IPv6 candidate, as an IPv6-only caller would.
+	secret := make([]byte, 32)
+	crand.Read(secret)
+	offer := punch.Offer{Secret: secret, Candidates: []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::1]:4000")}}
+	start := time.Now()
+	payload, err := caller.DHT().Signal(ctx, key("v6only-caller"), pub(pk), offer.Marshal())
+	if err != nil {
+		t.Fatalf("no answer: %v", err)
+	}
+	answer, err := punch.UnmarshalOffer(payload)
+	if err != nil || len(answer.Candidates) != 0 {
+		t.Fatalf("answer %+v, %v; want an empty offer", answer, err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("the empty answer took %v", took)
+	}
+}

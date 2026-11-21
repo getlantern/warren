@@ -515,13 +515,21 @@ func TestDeferRelayHoldsProbes(t *testing.T) {
 	s.Start(now, Offer{Relay: router})
 	s.relayToken, s.relayBound = []byte("tokn"), true // bound at once
 	probe := relayMAC([]byte("0123456789abcdef0123456789abcdef"), "probe initiator", 4)
-	for t2 := now; t2.Before(now.Add(s.cfg.Deadline/2 - 10*time.Millisecond)); t2 = t2.Add(10 * time.Millisecond) {
+	probed := false
+	for t2 := now; t2.Before(now.Add(s.cfg.Deadline/2 + 200*time.Millisecond)); t2 = t2.Add(10 * time.Millisecond) {
 		s.Tick(t2)
 		sends, _ := s.Drain()
 		for _, snd := range sends {
-			if bytes.Equal(snd.Data, probe) {
+			if !bytes.Equal(snd.Data, probe) {
+				continue
+			}
+			if t2.Before(now.Add(s.cfg.Deadline / 2)) {
 				t.Fatalf("relay probe sent %v after start, before half the deadline", t2.Sub(now))
 			}
+			probed = true
 		}
+	}
+	if !probed {
+		t.Fatal("a deferred relay session never probed once half the deadline passed")
 	}
 }

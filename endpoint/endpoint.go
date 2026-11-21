@@ -43,7 +43,7 @@ type Config struct {
 	DHTAddr6 string
 	DHT6     dht.Config
 	DataIP6  net.IP
-	// HeadStart is how long a caller gives an IPv6 path before also
+	// HeadStart is how long both sides give an IPv6 path before also
 	// punching IPv4 (happy eyeballs); the first connected path wins.
 	HeadStart time.Duration
 	// Profile overrides the NAT profile otherwise inferred from the DHT
@@ -342,9 +342,10 @@ func (e *Endpoint) families() (v4, v6 bool) {
 	return v4, v6
 }
 
-// legs prepares a leg per family: IPv4 when we have it, and IPv6 when we
-// have it, wantV6 is set, and we aren't relay-only (an IPv6 leg punches
-// directly, revealing our address). A caller passes claim, which its legs
+// legs prepares a leg per family: IPv4 when we have it and wantV4 is set,
+// and IPv6 when we have it, wantV6 is set, we aren't relay-only (an IPv6
+// leg punches directly, revealing our address), and the IPv6 DHT node has
+// contacts. A caller passes claim, which its legs
 // share so that only one commits to a path. It fails only if no leg could
 // be prepared.
 func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV4, wantV6 bool, claim *atomic.Int32) ([]*leg, error) {
@@ -621,6 +622,13 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	// we will probe a network on a stranger's word.
 	has4, has6 := e.families()
 	want4, wantV6 := wantFamilies(offer, has4, has6, e.cfg.RelayOnly)
+	if !want4 && !wantV6 {
+		// No family in common: an empty answer lets the caller fail at once
+		// instead of waiting out signaling.
+		empty := punch.Offer{}
+		_ = e.node.Answer(ctx, in.Session, empty.Marshal())
+		return
+	}
 	heavy := false
 	if err := e.node.InspectEach(ctx, func(addr netip.AddrPort, d *dht.Node) {
 		v6 := !addr.Addr().Is4()

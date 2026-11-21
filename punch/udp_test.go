@@ -169,3 +169,18 @@ func TestExtraSocketsOnDualStackBaseReachIPv4(t *testing.T) {
 		}
 	}
 }
+
+// Gather with no reflectors has nothing to wait for and returns at once.
+func TestGatherWithoutReflectorsReturnsAtOnce(t *testing.T) {
+	c := loopbackConn(t)
+	defer c.Close()
+	r := NewRunner(New(Config{Rand: rand.New(rand.NewPCG(12, 12))}), c)
+	defer r.Abort()
+	start := time.Now()
+	if err := r.Gather(context.Background(), nil, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Gather with no reflectors took %v", took)
+	}
+}

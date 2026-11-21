@@ -595,8 +595,8 @@ own routing table, and `nodes` or `nodes6` in its replies. A query whose
   claim, so only one family is ever nominated and both sides keep the same
   path, and the provider punches a dual-stack caller's offer once though it
   arrives through both DHTs. While IPv6 races, the IPv4 leg on both sides
-  waits out the head start, and the caller holds IPv4 relay probes until
-  halfway to the deadline, since a relay probe commits the responder. The
+  waits out the head start and holds IPv4 relay probes until halfway to the
+  deadline, since the caller's relay probe commits the responder. The
   provider runs an IPv4 leg only for an offer with IPv4 candidates or
   relays. The endpoint negotiates relays for its IPv4 leg
   only (an IPv6 DHT node still volunteers as a router), and a relay-only
