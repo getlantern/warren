@@ -26,14 +26,19 @@ type inboundLimiter struct {
 	mu      sync.Mutex
 	callers map[[32]byte][]time.Time
 	nets    map[netip.Prefix][]time.Time
-	all     []time.Time
-	heavy   []time.Time
+	// relayNets budgets the networks relays sit in, separately and more
+	// loosely than candidate networks: routers sharing a /24 are independent
+	// volunteers, but a victim network still has a ceiling.
+	relayNets map[netip.Prefix][]time.Time
+	all       []time.Time
+	heavy     []time.Time
 }
 
 const (
 	limitWindow   = time.Minute
 	perCallerMax  = 3
 	perNetworkMax = 3
+	relayNetMax   = 3 * perNetworkMax
 	// Global budgets: punches that may send many probes (spraying or opening
 	// many sockets), and all punches including direct ones.
 	heavyMax   = 30
@@ -70,11 +75,11 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.callers == nil {
-		l.callers, l.nets = map[[32]byte][]time.Time{}, map[netip.Prefix][]time.Time{}
+		l.callers, l.nets, l.relayNets = map[[32]byte][]time.Time{}, map[netip.Prefix][]time.Time{}, map[netip.Prefix][]time.Time{}
 	}
-	if len(l.callers)+len(l.nets) > maxTracked {
+	if l.tracked() > maxTracked {
 		l.sweep(now)
-		if len(l.callers)+len(l.nets) > maxTracked {
+		if l.tracked() > maxTracked {
 			return false // still full of live entries: refuse rather than grow
 		}
 	}
@@ -89,12 +94,19 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 	for _, c := range cands {
 		keys = append(keys, networkOf(c.Addr()))
 	}
+	var relayNet netip.Prefix
+	var relayNetTs []time.Time
 	if relay.IsValid() {
-		// A relay is one router, budgeted by exact address: routers sharing
-		// a /24 are independent volunteers.
+		// A relay is budgeted twice: by exact address like any probed host,
+		// and by its network in the looser relay bucket.
 		a := relay.Addr().Unmap()
 		p, _ := a.Prefix(a.BitLen())
 		keys = append(keys, p)
+		relayNet = networkOf(a)
+		relayNetTs = prune(l.relayNets[relayNet], now)
+		if len(relayNetTs) >= relayNetMax {
+			return false
+		}
 	}
 	for _, p := range keys {
 		if !p.IsValid() || seen[p] {
@@ -116,6 +128,9 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 	for i, p := range nets {
 		l.nets[p] = append(netTs[i], now)
 	}
+	if relayNet.IsValid() {
+		l.relayNets[relayNet] = append(relayNetTs, now)
+	}
 	l.all = append(all, now)
 	if heavy {
 		l.heavy = append(heavyTs, now)
@@ -125,7 +140,14 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 	return true
 }
 
+func (l *inboundLimiter) tracked() int { return len(l.callers) + len(l.nets) + len(l.relayNets) }
+
 func (l *inboundLimiter) sweep(now time.Time) {
+	for k, ts := range l.relayNets {
+		if len(prune(ts, now)) == 0 {
+			delete(l.relayNets, k)
+		}
+	}
 	for k, ts := range l.callers {
 		if len(prune(ts, now)) == 0 {
 			delete(l.callers, k)

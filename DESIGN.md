@@ -280,8 +280,11 @@ key and derives its password from the secret.
 **Inbound punches are rate-limited** (`endpoint/limit.go`), so a forged offer
 naming a victim can't turn a listener into a probe reflector:
 - per caller key, checked first so one key can't spend the shared budgets;
-- per probed network: public candidates by /24 (or /48), non-public ones and
-  the relay by exact address;
+- per probed network: public candidates by /24 (or /48), non-public ones by
+  exact address;
+- relays twice: by exact address, and by network in a separate, looser bucket,
+  so routers sharing a /24 don't lock each other out but a victim network is
+  still capped;
 - global budgets, charged by the planner's actual strategy: a tight one for
   probe-heavy punches (spray, open sockets, double birthday) and a looser one
   for all punches.

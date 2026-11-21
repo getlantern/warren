@@ -118,15 +118,30 @@ func TestLimiterRefusalsDoNotGrow(t *testing.T) {
 	}
 }
 
-// Relays are budgeted by exact address: independent routers in one /24
-// don't share a quota.
-func TestLimiterRelayExactAddress(t *testing.T) {
+// Relays are budgeted by exact address, so independent routers in one /24
+// don't lock each other out, and by network in a looser bucket, so naming
+// relays across a victim /24 is still capped.
+func TestLimiterRelayBudgets(t *testing.T) {
 	var l inboundLimiter
 	r1 := netip.MustParseAddrPort("2.176.0.9:6881")
 	for i := range perNetworkMax {
 		l.allow(caller(byte(i)), ap(fmtAddr(i)), r1, false, now)
 	}
+	if l.allow(caller(69), ap("198.18.4.1:1"), r1, false, now) {
+		t.Fatal("one relay address exceeded its own budget")
+	}
 	if !l.allow(caller(70), ap("198.18.5.1:1"), netip.MustParseAddrPort("2.176.0.10:6881"), false, now) {
 		t.Fatal("a different router in the same /24 was refused")
+	}
+	var v inboundLimiter
+	allowed := 0
+	for i := range 2 * relayNetMax {
+		relay := netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, byte(i + 1)}), 6881)
+		if v.allow(caller(byte(i)), ap(fmtAddr(i)), relay, false, now) {
+			allowed++
+		}
+	}
+	if allowed != relayNetMax {
+		t.Fatalf("relays across one /24 allowed %d punches, want the network cap %d", allowed, relayNetMax)
 	}
 }
