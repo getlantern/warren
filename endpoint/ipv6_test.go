@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	crand "crypto/rand"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -113,8 +115,12 @@ func TestDualStackConnectPrefersIPv6(t *testing.T) {
 	roundTrip(t, in, out, "and back")
 	hysteria2Echo(t, out, in, key("dual"))
 	// The caller signaled through both families' DHTs; the provider punched
-	// and charged its limiter once.
-	time.Sleep(300 * time.Millisecond) // let the second copy arrive
+	// and charged its limiter once. Wait until the second copy has arrived.
+	for deadline := time.Now().Add(5 * time.Second); provider.dupes.Load() == 0; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the offer's second copy never reached the provider")
+		}
+	}
 	if n := provider.limiter.chargesFor(pub(key("caller-dual"))); n != 1 {
 		t.Fatalf("one dual-stack connect was charged %d times", n)
 	}
@@ -191,29 +197,46 @@ func TestRelayOnlyNeverUsesIPv6(t *testing.T) {
 }
 
 // An offer is accepted once per caller and secret while a copy could still
-// arrive, other callers are unaffected, and a flood evicts the oldest entry
-// rather than refusing new offers.
+// arrive, its copies share the first copy's answer, other callers are
+// unaffected, and a flood evicts the oldest entry rather than refusing new
+// offers.
 func TestFirstOfferDedupes(t *testing.T) {
 	e := &Endpoint{cfg: Config{GatherWait: time.Second, PunchDeadline: 6 * time.Second}}
 	now := time.Unix(1_800_000_000, 0)
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	alice, bob := [32]byte{1}, [32]byte{2}
-	if !e.firstOffer(alice, secret, now) || e.firstOffer(alice, secret, now.Add(time.Second)) {
-		t.Fatal("a repeated offer was accepted twice")
+	first := func(c [32]byte, at time.Time) bool { _, ok := e.firstOffer(c, secret, at); return ok }
+	entry, ok := e.firstOffer(alice, secret, now)
+	if !ok {
+		t.Fatal("a new offer was treated as a copy")
 	}
-	if !e.firstOffer(bob, secret, now.Add(time.Second)) {
+	copyEntry, ok := e.firstOffer(alice, secret, now.Add(time.Second))
+	if ok || copyEntry != entry {
+		t.Fatal("a repeated offer was accepted twice, or didn't share the first copy's entry")
+	}
+	entry.publish([]byte("answer"))
+	entry.publish(nil) // later publishes don't change it
+	select {
+	case <-copyEntry.done:
+		if string(copyEntry.answer) != "answer" {
+			t.Fatalf("the copy got answer %q", copyEntry.answer)
+		}
+	default:
+		t.Fatal("the copy wasn't released by the first copy's answer")
+	}
+	if !first(bob, now.Add(time.Second)) {
 		t.Fatal("another caller's offer was blocked by the first caller's entry")
 	}
-	if !e.firstOffer(alice, secret, now.Add(time.Minute)) {
+	if !first(alice, now.Add(time.Minute)) {
 		t.Fatal("an offer was remembered long after any copy could arrive")
 	}
 	for i := range 2 * maxRecentOffers {
-		e.firstOffer([32]byte{3, byte(i), byte(i >> 8)}, secret, now.Add(time.Minute))
+		first([32]byte{3, byte(i), byte(i >> 8)}, now.Add(time.Minute))
 	}
 	if len(e.offers) > maxRecentOffers {
 		t.Fatalf("offer memory grew to %d", len(e.offers))
 	}
-	if !e.firstOffer([32]byte{4}, secret, now.Add(time.Minute)) {
+	if !first([32]byte{4}, now.Add(time.Minute)) {
 		t.Fatal("a full table refused a new offer instead of evicting the oldest")
 	}
 }
@@ -221,9 +244,14 @@ func TestFirstOfferDedupes(t *testing.T) {
 // A relay-only endpoint that can't bind IPv4 fails at startup: it could
 // never connect.
 func TestRelayOnlyNeedsIPv4(t *testing.T) {
-	_, err := New(Config{DHT: member(true), DHTAddr: "256.0.0.1:0", DHTAddr6: "[::1]:0", DHT6: member6(true), RelayOnly: true})
-	if err == nil {
-		t.Fatal("a relay-only endpoint started with no IPv4 socket")
+	probe, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	probe.Close()
+	_, err = New(Config{DHT: member(true), DHTAddr: "256.0.0.1:0", DHTAddr6: "[::1]:0", DHT6: member6(true), RelayOnly: true})
+	if err == nil || !strings.Contains(err.Error(), "relay-only needs an IPv4 socket") {
+		t.Fatalf("relay-only with only IPv6 bound: %v, want the IPv4 prerequisite error", err)
 	}
 }
 
@@ -253,6 +281,9 @@ func TestEmptyIPv6TableSkipsLeg(t *testing.T) {
 		}
 	}
 	e := dualPhone(t, seeds4, true)
+	if has4, has6 := e.families(); !has4 || !has6 {
+		t.Fatalf("the endpoint bound v4=%v v6=%v; the test needs an IPv6 node with an empty table", has4, has6)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -318,5 +349,24 @@ func TestNoCommonFamilyFailsFast(t *testing.T) {
 	}
 	if took := time.Since(start); took > 2*time.Second {
 		t.Fatalf("the empty answer took %v", took)
+	}
+}
+
+// A leg that already nominated keeps the shared claim when it fails: the
+// responder may have connected on its path, so the other family mustn't
+// nominate too. One that never committed gives the claim up.
+func TestCommittedLegKeepsClaim(t *testing.T) {
+	owner := new(atomic.Int32)
+	mk := func(id int32) *leg {
+		s := punch.New(punch.Config{Initiator: true, Secret: make([]byte, 32), Claim: claimer(owner, id), Rand: rand.New(rand.NewPCG(1, uint64(id)))})
+		return &leg{sess: s, id: id, claim: owner}
+	}
+	l := mk(1)
+	if !claimer(owner, 1)() {
+		t.Fatal("first claim refused")
+	}
+	l.release()
+	if owner.Load() != 0 {
+		t.Fatal("an uncommitted leg kept the claim after failing")
 	}
 }

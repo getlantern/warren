@@ -95,6 +95,9 @@ func (s *Session) tickRelay(now time.Time) {
 		// Both sides probe: the initiator's probe is what the responder
 		// acks, and the responder's tells the initiator the path works.
 		s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayProbe})
+		if s.cfg.Initiator {
+			s.committed = true // the responder connects on this probe
+		}
 		if s.cfg.Initiator && s.relayProven {
 			s.relayUnanswered++
 		}

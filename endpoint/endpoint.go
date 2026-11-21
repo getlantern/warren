@@ -114,7 +114,21 @@ type Endpoint struct {
 	closed  bool // guards wg.Add for outbound Connects against Close's Wait
 
 	offersMu sync.Mutex
-	offers   map[[32]byte]time.Time // recent offer secrets, by hash
+	offers   map[[32]byte]*offerEntry // recent offers, by caller and secret
+	dupes    atomic.Int64             // repeat copies seen, for tests
+}
+
+// offerEntry is one offer being answered. Copies of it through another DHT
+// wait for its answer and send the same one through their own session.
+type offerEntry struct {
+	at     time.Time
+	done   chan struct{} // closed once answer is set
+	answer []byte        // nil when there is no answer
+	once   sync.Once
+}
+
+func (o *offerEntry) publish(answer []byte) {
+	o.once.Do(func() { o.answer = answer; close(o.done) })
 }
 
 // wantFamilies decides which legs a provider runs for an offer: IPv4 when
@@ -141,12 +155,13 @@ func probeable(cands []netip.AddrPort, v4, v6 bool) []netip.AddrPort {
 // maxRecentOffers bounds the offer-secret memory under a flood.
 const maxRecentOffers = 4096
 
-// firstOffer reports whether this caller's offer with this secret is new,
-// recording it. Entries are keyed by caller and secret, so one caller can't
-// touch another's, and remembered for twice a punch's lifetime, longer than
-// any copy of the same offer could still arrive through another DHT. When
-// full, the oldest entry makes way: a flood can't make us refuse offers.
-func (e *Endpoint) firstOffer(caller [32]byte, secret []byte, now time.Time) bool {
+// firstOffer returns the entry for this caller's offer with this secret,
+// reporting whether it is new. Entries are keyed by caller and secret, so
+// one caller can't touch another's, and remembered for twice a punch's
+// lifetime, longer than any copy of the same offer could still arrive
+// through another DHT. When full, the oldest entry makes way: a flood can't
+// make us refuse offers.
+func (e *Endpoint) firstOffer(caller [32]byte, secret []byte, now time.Time) (*offerEntry, bool) {
 	h := sha256.New()
 	h.Write(caller[:])
 	h.Write(secret)
@@ -155,29 +170,31 @@ func (e *Endpoint) firstOffer(caller [32]byte, secret []byte, now time.Time) boo
 	e.offersMu.Lock()
 	defer e.offersMu.Unlock()
 	if e.offers == nil {
-		e.offers = map[[32]byte]time.Time{}
+		e.offers = map[[32]byte]*offerEntry{}
 	}
-	if at, ok := e.offers[key]; ok && now.Sub(at) < ttl {
-		return false
+	if o, ok := e.offers[key]; ok && now.Sub(o.at) < ttl {
+		e.dupes.Add(1)
+		return o, false
 	}
 	if len(e.offers) >= maxRecentOffers {
 		var oldest [32]byte
 		var at time.Time
-		for k, t := range e.offers {
-			if now.Sub(t) >= ttl {
+		for k, o := range e.offers {
+			if now.Sub(o.at) >= ttl {
 				delete(e.offers, k)
 				continue
 			}
-			if at.IsZero() || t.Before(at) {
-				oldest, at = k, t
+			if at.IsZero() || o.at.Before(at) {
+				oldest, at = k, o.at
 			}
 		}
 		if len(e.offers) >= maxRecentOffers {
 			delete(e.offers, oldest)
 		}
 	}
-	e.offers[key] = now
-	return true
+	o := &offerEntry{at: now, done: make(chan struct{})}
+	e.offers[key] = o
+	return o, true
 }
 
 func New(cfg Config) (*Endpoint, error) {
@@ -311,9 +328,10 @@ type leg struct {
 	claim *atomic.Int32 // shared by a caller's legs; nil for a responder
 }
 
-// release gives up this leg's claim, so another family can commit.
+// release gives up this leg's claim, so another family can commit, unless
+// this leg already committed: the responder may have connected on it.
 func (l *leg) release() {
-	if l.claim != nil {
+	if l.claim != nil && !l.sess.Committed() {
 		l.claim.CompareAndSwap(l.id, 0)
 	}
 }
@@ -441,8 +459,8 @@ func (e *Endpoint) race(ctx context.Context, legs []*leg, remote punch.Offer, pe
 	running := 0
 	for _, l := range legs {
 		fr := remote.Family(l.v6)
-		if l.v6 && len(fr.Candidates) == 0 {
-			l.abort() // the peer offered no IPv6 path
+		if len(fr.Candidates) == 0 && !fr.Relay.IsValid() && len(fr.Relays) == 0 {
+			l.abort() // the peer offered no path of this family
 			continue
 		}
 		var delay time.Duration
@@ -613,11 +631,22 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	if err != nil || len(offer.Secret) < 16 {
 		return
 	}
-	if !e.firstOffer(in.Caller, offer.Secret, time.Now()) {
+	entry, first := e.firstOffer(in.Caller, offer.Secret, time.Now())
+	if !first {
 		// A dual-stack caller signals the same offer through each family's
-		// DHT; its secret identifies it. Punch and charge for it once.
+		// DHT; its secret identifies it. Punch and charge for it once, but
+		// answer this copy too, with the same answer, in case the other
+		// copy's answer is lost.
+		select {
+		case <-entry.done:
+			if entry.answer != nil {
+				_ = e.node.Answer(ctx, in.Session, entry.answer)
+			}
+		case <-ctx.Done():
+		}
 		return
 	}
+	defer entry.publish(nil) // any early return leaves copies unanswered
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.
 	has4, has6 := e.families()
@@ -626,7 +655,9 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		// No family in common: an empty answer lets the caller fail at once
 		// instead of waiting out signaling.
 		empty := punch.Offer{}
-		_ = e.node.Answer(ctx, in.Session, empty.Marshal())
+		b := empty.Marshal()
+		entry.publish(b)
+		_ = e.node.Answer(ctx, in.Session, b)
 		return
 	}
 	heavy := false
@@ -673,7 +704,9 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		return
 	}
 	answer := offerOf(legs)
-	if err := e.node.Answer(ctx, in.Session, answer.Marshal()); err != nil {
+	ab := answer.Marshal()
+	entry.publish(ab)
+	if err := e.node.Answer(ctx, in.Session, ab); err != nil {
 		abortAll(legs)
 		return
 	}

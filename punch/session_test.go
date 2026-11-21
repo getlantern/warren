@@ -533,3 +533,22 @@ func TestDeferRelayHoldsProbes(t *testing.T) {
 		t.Fatal("a deferred relay session never probed once half the deadline passed")
 	}
 }
+
+// An initiator is committed once it nominates: before that it may give up
+// a shared claim, after it may not.
+func TestCommittedAfterNomination(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	open := Profile{Mapping: MappingIndependent}
+	a := New(Config{Initiator: true, Secret: secret, Local: open, Rand: rand.New(rand.NewPCG(13, 1))})
+	b := New(Config{Local: open, Rand: rand.New(rand.NewPCG(13, 2))})
+	now := time.Unix(1_800_000_000, 0)
+	b.Start(now, Offer{Secret: secret, Candidates: []netip.AddrPort{netip.MustParseAddrPort("198.51.100.1:40000")}, Profile: open})
+	a.Start(now, Offer{Candidates: []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:40000")}, Profile: open})
+	if a.Committed() {
+		t.Fatal("committed before any nomination")
+	}
+	runPair(t, a, b, now, func(Send) bool { return false })
+	if !a.Committed() {
+		t.Fatal("not committed after connecting through a nomination")
+	}
+}

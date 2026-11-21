@@ -330,8 +330,9 @@ cost of more traffic.
 
 In this standalone matrix the zeros have no relay. The full stack sends them
 through a router relay (see *Relay fallback*). Filtering measurements would let
-the planner skip doomed double birthdays, and IPv6 and port mapping (PCP/UPnP)
-would avoid the relay for some of them; neither is built yet.
+the planner skip doomed double birthdays, and port mapping (PCP/UPnP) would
+avoid the relay for some of them; neither is built yet. IPv6 (see *IPv6*)
+avoids it for peers with public IPv6 addresses.
 
 Times to connect in the model: 0.24–0.5 s for direct and spray, 1.6 s for
 cone ↔ random, 0.28 s for the double birthday. The real-UDP runner is tested on
@@ -346,7 +347,7 @@ pair (so the path is known to work both ways). A few stray control datagrams
 can reach the application afterwards; layers above drop them, and
 `endpoint.Conn.Recv` skips them.
 
-**Still to come:** IPv6 candidates; PCP/NAT-PMP/UPnP (Tailscale's `portmapper` is
+**Still to come:** PCP/NAT-PMP/UPnP (Tailscale's `portmapper` is
 a candidate); low-TTL priming; filtering-aware planning. Check the iOS
 `RLIMIT_NOFILE` soft limit before relying on 64-socket fans.
 
@@ -663,7 +664,7 @@ and carrier allocator. The design therefore splits measurement in two:
 | 2b | UDP driver | `driver/` built: one goroutine owns the node, or an IPv4 and IPv6 pair. Loopback tests cover put/get, mutable, a read-only phone, restart from snapshot with no bootstrap server, Close unblocking callers, and dual-stack signaling. Race-clean |
 | 2c | libtorrent wire matching | `cmd/ltfingerprint` built; 0 shape differences against 2.1.1. Next: timing comparison, and `announce_peer`'s `seed` flag once we announce |
 | 3 | Signaling over BEP 44 | `dht/signal.go` built: provider records on hourly blinded salts, holder binding and forwarding, encrypted offer and answer, ack-based failover; exposed through `driver`. Simulation tests cover phone to phone, a dead holder, a shutdown, and an unknown provider. Mapping-timeout probe built. Next: keepalive-answer delivery as an option, and a store-and-poll fallback |
-| 4 | Punch engine | `punch/` built: sans-IO session, planner, real-UDP runner, `sim/nat.go` RFC 4787 model. Success matrix above, with a port-quota budget. Next: IPv6, port mapping, filtering-aware planning |
+| 4 | Punch engine | `punch/` built: sans-IO session, planner, real-UDP runner, `sim/nat.go` RFC 4787 model. Success matrix above, with a port-quota budget. Next: port mapping, filtering-aware planning |
 | 4b | Connect by public key | `endpoint/` built: signaling plus punch, a passive NAT profile, authorization, and bounded inbound. Full-stack simulation through modeled NATs passes |
 | 4c | Relay fallback | Router relays via `announce_peer` binding and blind forwarding with volunteer limits, plus relay-only privacy mode. Every simulated NAT pairing connects |
 | 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |

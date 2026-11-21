@@ -167,10 +167,13 @@ type Session struct {
 	// relayDeferred holds relay probing until halfway to the deadline even
 	// when this session has no direct strategy (see DeferRelay).
 	relayDeferred bool
-	relayProbe    []byte
-	relayAck      []byte
-	peerProbe     []byte
-	peerAck       []byte
+	// committed: as initiator, we nominated a pair or probed a relay, so
+	// the responder may already have connected on this session's path.
+	committed  bool
+	relayProbe []byte
+	relayAck   []byte
+	peerProbe  []byte
+	peerAck    []byte
 	// relayProven: the responder's probe reached the initiator through the
 	// relay. relayUnanswered counts the initiator's probes since then.
 	relayProven     bool
@@ -588,8 +591,13 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 	}
 }
 
+// Committed reports whether this initiator nominated a pair or probed its
+// relay: from then on the responder may hand off on this path, so a shared
+// Claim must stay with this session even if it fails.
+func (s *Session) Committed() bool { return s.committed }
+
 func (s *Session) nominate(now time.Time, p pair) {
-	s.nominating, s.nominated = true, p
+	s.nominating, s.nominated, s.committed = true, p, true
 	s.nomTids[s.query(p.socket, p.addr, s.nomID)] = true
 	s.nomSent = 1
 	s.nextNom = now.Add(nominateTick)
