@@ -150,13 +150,13 @@ func TestChooseRelay(t *testing.T) {
 	a, b, own := netip.MustParseAddrPort("2.176.0.1:6881"), netip.MustParseAddrPort("2.176.0.2:6881"), netip.MustParseAddrPort("2.176.0.9:6881")
 	knowsB := func(r netip.AddrPort) bool { return r == b }
 	none := func(netip.AddrPort) bool { return false }
-	if got := chooseRelay(false, []netip.AddrPort{a, b}, []netip.AddrPort{own}, none); got != a {
+	if got, _ := chooseRelay(false, []netip.AddrPort{a, b}, []netip.AddrPort{own}, none); got != a {
 		t.Errorf("not relay-only: got %v, want the caller's first", got)
 	}
-	if got := chooseRelay(true, []netip.AddrPort{a, b}, []netip.AddrPort{own}, knowsB); got != b {
+	if got, _ := chooseRelay(true, []netip.AddrPort{a, b}, []netip.AddrPort{own}, knowsB); got != b {
 		t.Errorf("relay-only: got %v, want the first offered relay we know", got)
 	}
-	if got := chooseRelay(true, []netip.AddrPort{a}, []netip.AddrPort{own}, none); got != own {
+	if got, _ := chooseRelay(true, []netip.AddrPort{a}, []netip.AddrPort{own}, none); got != own {
 		t.Errorf("relay-only, none known: got %v, want our own contact", got)
 	}
 }
@@ -170,12 +170,15 @@ func TestRelayOnlyFallbackNotLockedOut(t *testing.T) {
 	unknown := []netip.AddrPort{netip.MustParseAddrPort("6.6.6.6:6881")}
 	none := func(netip.AddrPort) bool { return false }
 	for i := range 2 * perNetworkMax {
-		relay := chooseRelay(true, unknown, []netip.AddrPort{own}, none)
-		if !l.allow(caller(byte(i)), ap(fmtAddr(i)), chargedRelay(true, relay), false, now) {
+		relay, charge := chooseRelay(true, unknown, []netip.AddrPort{own}, none)
+		if relay != own {
+			t.Fatalf("relay-only fallback chose %v, want our own %v", relay, own)
+		}
+		if !l.allow(caller(byte(i)), ap(fmtAddr(i)), charge, false, now) {
 			t.Fatalf("caller %d refused: the listener's own fallback relay was rate limited", i)
 		}
 	}
-	if chargedRelay(false, own) != own {
+	if _, charge := chooseRelay(false, unknown, nil, none); charge != unknown[0] {
 		t.Fatal("a relay taken on the caller's word must still be budgeted")
 	}
 }

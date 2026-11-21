@@ -309,20 +309,20 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	if len(offered) == 0 && offer.Relay.IsValid() {
 		offered = []netip.AddrPort{offer.Relay}
 	}
-	var relay netip.AddrPort
+	var relay, charged netip.AddrPort
 	if err := e.node.Inspect(ctx, func(d *dht.Node) {
 		var own []netip.AddrPort
 		for _, c := range d.Contacts(maxRelayCandidates) {
 			own = append(own, c.Addr)
 		}
-		relay = chooseRelay(e.cfg.RelayOnly, offered, own, d.Knows)
+		relay, charged = chooseRelay(e.cfg.RelayOnly, offered, own, d.Knows)
 	}); err != nil {
 		return
 	}
 	if e.cfg.RelayOnly && !relay.IsValid() {
 		return // no router we trust to relay through: refuse rather than leak
 	}
-	if !e.limiter.allow(in.Caller, offer.Candidates, chargedRelay(e.cfg.RelayOnly, relay), heavy, time.Now()) {
+	if !e.limiter.allow(in.Caller, offer.Candidates, charged, heavy, time.Now()) {
 		return
 	}
 	// The relay chosen here is final: the session uses exactly this one (or
@@ -398,38 +398,32 @@ func locals(c *net.UDPConn) []netip.AddrPort {
 
 const maxRelayCandidates = 8
 
-// chargedRelay is the relay address the inbound limiter budgets. A relay
-// taken on the caller's word is a third party we would contact for a
-// stranger, so it is budgeted like any probed host. A relay-only listener
-// relays only through routers it already knows, which a caller cannot aim
-// at anyone; budgeting those by address would let three offers a minute
-// lock out every caller that falls back to our own closest router.
-func chargedRelay(relayOnly bool, relay netip.AddrPort) netip.AddrPort {
-	if relayOnly {
-		return netip.AddrPort{}
-	}
-	return relay
-}
-
 // chooseRelay picks, as the listener, the relay both sides will use. A relay
 // learns both addresses, so a relay-only listener uses only a router it
 // authenticated itself: the first offered one it knows, or else its own
 // closest contact, which a caller that doesn't keep its address private will
 // follow. Otherwise the caller's first choice stands.
-func chooseRelay(relayOnly bool, offered, own []netip.AddrPort, knows func(netip.AddrPort) bool) netip.AddrPort {
+//
+// charge is the address the inbound limiter budgets for the relay. A relay
+// taken on the caller's word is a third party we would contact for a
+// stranger, so it is budgeted like any probed host. A relay-only listener
+// relays only through routers it already knows, which a caller cannot aim
+// at anyone; budgeting those by address would let three offers a minute
+// lock out every caller that falls back to our own closest router.
+func chooseRelay(relayOnly bool, offered, own []netip.AddrPort, knows func(netip.AddrPort) bool) (relay, charge netip.AddrPort) {
 	if !relayOnly {
 		if len(offered) > 0 {
-			return offered[0]
+			return offered[0], offered[0]
 		}
-		return netip.AddrPort{}
+		return netip.AddrPort{}, netip.AddrPort{}
 	}
 	for _, r := range offered {
 		if knows(r) {
-			return r
+			return r, netip.AddrPort{}
 		}
 	}
 	if len(own) > 0 {
-		return own[0]
+		return own[0], netip.AddrPort{}
 	}
-	return netip.AddrPort{}
+	return netip.AddrPort{}, netip.AddrPort{}
 }

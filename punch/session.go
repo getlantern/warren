@@ -35,8 +35,9 @@ type Config struct {
 	// Relays, for the initiator, are DHT routers to fall back to when no
 	// direct path is found, in preference order; Relay alone means one.
 	// For the responder, Relay is its choice among the initiator's (or of
-	// its own, when it keeps its address private), echoed in its answer;
-	// left unset, it takes the initiator's first.
+	// its own, when it keeps its address private), echoed in its answer.
+	// Left unset, a responder takes the initiator's first, unless it is
+	// RelayOnly, in which case it uses no relay at all.
 	Relays []netip.AddrPort
 	Relay  netip.AddrPort
 	// RelayOnly keeps our addresses from the peer: the offer carries no
