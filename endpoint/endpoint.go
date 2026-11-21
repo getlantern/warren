@@ -171,11 +171,23 @@ func (o *offerEntry) publish(answer []byte) []dht.SessionID {
 	return p
 }
 
-// publishOffer sets an offer's answer and sends it to queued copies.
-func (e *Endpoint) publishOffer(ctx context.Context, o *offerEntry, answer []byte) {
+// publishOffer sets an offer's answer and sends it to queued copies,
+// returning how many it delivered.
+func (e *Endpoint) publishOffer(ctx context.Context, o *offerEntry, answer []byte) int {
+	delivered := 0
 	for _, s := range o.publish(answer) {
-		_ = e.node.Answer(ctx, s, answer)
+		if e.node.Answer(ctx, s, answer) == nil {
+			delivered++
+		}
 	}
+	return delivered
+}
+
+// revoke withdraws the answer: copies arriving later get nothing.
+func (o *offerEntry) revoke() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.answer = nil
 }
 
 // wantFamilies decides which legs a provider runs for an offer: IPv4 when
@@ -748,8 +760,12 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	answer := offerOf(legs)
 	ab := answer.Marshal()
-	e.publishOffer(ctx, entry, ab)
-	if err := e.node.Answer(ctx, in.Session, ab); err != nil {
+	// Answer our own session first, then the queued copy. Keep the legs if
+	// either delivery worked; if none did, revoke the answer so a later
+	// copy can't send the caller toward legs we're closing.
+	ownErr := e.node.Answer(ctx, in.Session, ab)
+	if delivered := e.publishOffer(ctx, entry, ab); ownErr != nil && delivered == 0 {
+		entry.revoke()
 		abortAll(legs)
 		return
 	}

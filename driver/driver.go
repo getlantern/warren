@@ -401,9 +401,11 @@ func (n *Node) isFamily(fam int, a netip.Addr) bool {
 	return n.fams[fam].addr.Addr().Is4() == a.Unmap().Is4()
 }
 
-// Bootstrap looks up our own ID on each node from the seeds of its family;
-// with no seeds, each node starts from its own table. With a single node,
-// every seed goes to it. It returns the first node's result.
+// Bootstrap looks up our own ID on each node from the seeds of its family
+// (a socket can't reach the other family's); with no seeds, each node
+// starts from its own table. It fails if no seed is of a family we run, and
+// returns the first node's result, with an error if some family couldn't
+// start.
 func (n *Node) Bootstrap(ctx context.Context, seeds []netip.AddrPort) (dht.LookupDone, error) {
 	got, partial, err := n.call(ctx, func(fam int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		var mine []netip.AddrPort

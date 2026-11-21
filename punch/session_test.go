@@ -532,6 +532,9 @@ func TestDeferRelayHoldsProbes(t *testing.T) {
 	if !probed {
 		t.Fatal("a deferred relay session never probed once half the deadline passed")
 	}
+	if !s.Committed() {
+		t.Fatal("an initiator's relay probe didn't commit it: the responder connects on that probe")
+	}
 }
 
 // An initiator is committed once it nominates: before that it may give up

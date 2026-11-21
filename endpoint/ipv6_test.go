@@ -373,17 +373,61 @@ func TestNoCommonFamilyFailsFast(t *testing.T) {
 // responder may have connected on its path, so the other family mustn't
 // nominate too. One that never committed gives the claim up.
 func TestCommittedLegKeepsClaim(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	open := punch.Profile{Mapping: punch.MappingIndependent}
 	owner := new(atomic.Int32)
 	mk := func(id int32) *leg {
-		s := punch.New(punch.Config{Initiator: true, Secret: make([]byte, 32), Claim: claimer(owner, id), Rand: rand.New(rand.NewPCG(1, uint64(id)))})
+		s := punch.New(punch.Config{Initiator: true, Secret: secret, Local: open, Claim: claimer(owner, id), Rand: rand.New(rand.NewPCG(1, uint64(id)))})
 		return &leg{sess: s, id: id, claim: owner}
 	}
-	l := mk(1)
+
+	idle := mk(1)
 	if !claimer(owner, 1)() {
 		t.Fatal("first claim refused")
 	}
-	l.release()
+	idle.release()
 	if owner.Load() != 0 {
 		t.Fatal("an uncommitted leg kept the claim after failing")
+	}
+
+	// Drive a real nomination between an initiator leg and a responder.
+	l := mk(2)
+	resp := punch.New(punch.Config{Local: open, Rand: rand.New(rand.NewPCG(2, 2))})
+	addrL, addrR := netip.MustParseAddrPort("198.51.100.1:40000"), netip.MustParseAddrPort("203.0.113.1:40000")
+	now := time.Unix(1_800_000_000, 0)
+	resp.Start(now, punch.Offer{Secret: secret, Candidates: []netip.AddrPort{addrL}, Profile: open})
+	l.sess.Start(now, punch.Offer{Candidates: []netip.AddrPort{addrR}, Profile: open})
+	for range 100 {
+		now = now.Add(10 * time.Millisecond)
+		l.sess.Tick(now)
+		resp.Tick(now)
+		sl, _ := l.sess.Drain()
+		sr, _ := resp.Drain()
+		for _, s := range sl {
+			resp.HandlePacket(now, 0, addrL, s.Data)
+		}
+		for _, s := range sr {
+			l.sess.HandlePacket(now, 0, addrR, s.Data)
+		}
+		if l.sess.Committed() {
+			break
+		}
+	}
+	if !l.sess.Committed() || owner.Load() != 2 {
+		t.Fatalf("the leg never nominated (committed=%v, owner=%d)", l.sess.Committed(), owner.Load())
+	}
+	l.release()
+	if owner.Load() != 2 {
+		t.Fatal("a leg that nominated gave up the claim, so the other family could nominate too")
+	}
+}
+
+// A revoked answer isn't handed to later copies.
+func TestRevokedAnswerNotSentToCopies(t *testing.T) {
+	o := &offerEntry{done: make(chan struct{})}
+	o.publish([]byte("answer"))
+	o.revoke()
+	if _, now := o.copyOf(dht.SessionID{1}); now {
+		t.Fatal("a copy got an answer that was revoked")
 	}
 }
