@@ -505,7 +505,7 @@ but never loosen them.
 | Prelude datagrams / bytes per flow | 64 / 64 KiB | stops a bad spec from becoming a flood |
 | Blocking `gap_ms` per write, total | 200 ms | it stalls quic-go's send loop |
 | `periodic_ms` minimum | 1000 ms | battery and radio (§10) |
-| Framing overhead (header bytes + tags) | 64 (warn above 32) | IPv6 minimum MTU (§6) |
+| Framing overhead (header bytes + tags) | 32 for QUIC transports (warren's `hy2` refuses more) | IPv6 minimum MTU (§6) |
 | Padding ceiling plus framing overhead | 1232 unless DF-verified PMTUD | IPv6 minimum MTU (§6) |
 | Wire datagram | 2048 | matches sing-quic `geckoMaxOnWireSize` |
 | Fragments per packet | 8 | Gecko's limit |
@@ -672,8 +672,11 @@ A path at the IPv6 minimum MTU carries 1280 − 40 − 8 = **1232** bytes of UDP
 payload. QUIC requires client Initials to be at least **1200** bytes. A framing
 spec adds overhead O to every datagram, the Initial included, so it is safe at
 the IPv6 minimum only if O ≤ 32. utpshape (20), Salamander (8) and the WebRTC
-spec (15) fit. Injection adds no overhead to QUIC datagrams. Fragmentation
-splits the Initial, so it isn't bound by this.
+spec (15) fit, and warren's `hy2.Shaper` adapter refuses anything larger.
+Injection adds no overhead to QUIC datagrams. Fragmentation splits the
+Initial and so could in principle exceed 32, but `hy2.Shaper` has no way to
+declare fragmentation today; supporting it would need that declaration and a
+matching exemption in `hy2`'s validation.
 
 `Program.QUICHints()` sets the sing-quic `QUICOptions`:
 

@@ -249,3 +249,32 @@ func TestReplaysCannotCrowdOutHolder(t *testing.T) {
 	}
 	t.Fatal("the holder's retry was crowded out by replays")
 }
+
+// Re-listening with the same key in the same second must not re-sign the
+// record at the same sequence number with a new value: storage nodes reject
+// that (BEP 44 error 302) and keep the stale key.
+func TestRelistenAdvancesSequence(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(88)), Rand: rng(89)})
+	k := ed25519.NewKeyFromSeed(make([]byte, 32))
+	seqOf := func() (krpc.NodeID, int64, string) {
+		for _, tg := range n.lst.records {
+			o := n.owned[tg]
+			return tg, o.rec.mut.Seq, string(o.rec.mut.V)
+		}
+		t.Fatal("no record")
+		return krpc.NodeID{}, 0, ""
+	}
+	n.Listen(t0, k)
+	t1, s1, v1 := seqOf()
+	n.Listen(t0, k)
+	t2, s2, v2 := seqOf()
+	if t1 != t2 {
+		t.Fatal("same key and epoch should give the same record target")
+	}
+	if v1 == v2 {
+		t.Fatal("expected a fresh signaling key in the second record")
+	}
+	if s2 <= s1 {
+		t.Fatalf("re-listen reused seq %d (was %d) with a different value", s2, s1)
+	}
+}

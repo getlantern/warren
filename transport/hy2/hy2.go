@@ -119,8 +119,6 @@ func (o *Options) logger() logger.ContextLogger {
 	return logger.NOP()
 }
 
-// shape returns the socket hysteria2 should use, plus a Salamander password
-// when hysteria2 should scramble it itself.
 // maxShaperOverhead is the most a shaper may add: QUIC's Initial packets are
 // at least 1200 bytes, and 1200 plus the overhead must fit the 1232-byte
 // IPv6 minimum path MTU.
@@ -145,6 +143,8 @@ func (o *Options) shaper() Shaper {
 	return nil
 }
 
+// shape returns the socket hysteria2 should use, plus a Salamander password
+// when hysteria2 should scramble it itself.
 func (o *Options) shape(pc net.PacketConn) (net.PacketConn, string) {
 	if s := o.shaper(); s != nil {
 		return s.Wrap(pc, o.ObfsKey), ""

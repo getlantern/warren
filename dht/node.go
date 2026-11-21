@@ -149,10 +149,13 @@ type Node struct {
 	sends  []Send
 	events []Event
 
-	lst     *listener
-	signals []*signalOp
-	fwd     forwarder
-	rel     relay
+	lst *listener
+	// recordSeq is the last sequence number signed per record target. It
+	// outlives the listener, so re-listening never reuses a number.
+	recordSeq map[krpc.NodeID]int64
+	signals   []*signalOp
+	fwd       forwarder
+	rel       relay
 }
 
 func New(cfg Config) *Node {

@@ -419,14 +419,20 @@ func (n *Node) signRecord(now time.Time, epoch int64) krpc.NodeID {
 	l := n.lst
 	salt := RecordSalt(l.pub, epoch)
 	target := MutableTarget(l.pub, salt)
-	seq := now.Unix()
-	if o := n.owned[target]; o != nil && o.rec.mut != nil {
-		seq = max(seq, o.rec.mut.Seq+1)
-	}
+	// Never reuse a sequence number for a different value, even across
+	// Unlisten and Listen (which re-keys): storage nodes reject an equal seq
+	// with a new value (BEP 44 error 302), stranding the stale record.
+	seq := max(now.Unix(), n.recordSeq[target]+1)
 	m, _ := NewMutable(l.priv, salt, seq, encodeRecord([32]byte(l.x.PublicKey().Bytes())))
 	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now}
+	if n.recordSeq == nil || len(n.recordSeq) >= maxRecordSeqs {
+		n.recordSeq = map[krpc.NodeID]int64{} // only same-second reuse is at risk
+	}
+	n.recordSeq[target] = seq
 	return target
 }
+
+const maxRecordSeqs = 64
 
 // resign republishes every record with a newer sequence number, rebinding
 // holders to our current address after a NAT mapping change.
