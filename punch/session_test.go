@@ -420,3 +420,86 @@ func TestUnmarshalOfferCanonicalAddresses(t *testing.T) {
 		t.Fatalf("a port-0 relay %v was accepted", o.Relay)
 	}
 }
+
+// Two initiator sessions sharing a claim (one per address family) punch two
+// responders in lockstep: only one responder is ever nominated, and it is
+// the path the initiator keeps.
+func TestSharedClaimCommitsOnePath(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	open := Profile{Mapping: MappingIndependent}
+	owner := 0
+	claim := func(id int) func() bool {
+		return func() bool {
+			if owner == 0 {
+				owner = id
+			}
+			return owner == id
+		}
+	}
+	type pairT struct {
+		a, b         *Session
+		addrA, addrB netip.AddrPort
+		evA, evB     Event
+	}
+	mk := func(id int, addrA, addrB string) *pairT {
+		p := &pairT{
+			a:     New(Config{Initiator: true, Secret: secret, Local: open, Claim: claim(id), Rand: rand.New(rand.NewPCG(uint64(id), 1))}),
+			b:     New(Config{Local: open, Rand: rand.New(rand.NewPCG(uint64(id), 2))}),
+			addrA: netip.MustParseAddrPort(addrA), addrB: netip.MustParseAddrPort(addrB),
+		}
+		now := time.Unix(1_800_000_000, 0)
+		p.b.Start(now, Offer{Secret: secret, Candidates: []netip.AddrPort{p.addrA}, Profile: open})
+		p.a.Start(now, Offer{Candidates: []netip.AddrPort{p.addrB}, Profile: open})
+		return p
+	}
+	pairs := []*pairT{mk(1, "198.51.100.1:40000", "203.0.113.1:40000"), mk(2, "[2001:db8::a]:40000", "[2001:db8::b]:40000")}
+	now := time.Unix(1_800_000_000, 0)
+	for range 400 {
+		now = now.Add(10 * time.Millisecond)
+		for _, p := range pairs {
+			p.a.Tick(now)
+			p.b.Tick(now)
+		}
+		for range 3 {
+			for _, p := range pairs { // both families exchange in the same instant
+				sa, ea := p.a.Drain()
+				sb, eb := p.b.Drain()
+				for _, e := range ea {
+					if _, ok := e.(Connected); ok {
+						p.evA = e
+					}
+				}
+				for _, e := range eb {
+					if _, ok := e.(Connected); ok {
+						p.evB = e
+					}
+				}
+				for _, s := range sa {
+					if s.To == p.addrB {
+						p.b.HandlePacket(now, 0, p.addrA, s.Data)
+					}
+				}
+				for _, s := range sb {
+					if s.To == p.addrA {
+						p.a.HandlePacket(now, 0, p.addrB, s.Data)
+					}
+				}
+			}
+		}
+	}
+	responders, kept := 0, -1
+	for i, p := range pairs {
+		if p.evB != nil {
+			responders++
+		}
+		if p.evA != nil {
+			kept = i
+		}
+	}
+	if responders != 1 {
+		t.Fatalf("%d responders were nominated, want exactly one", responders)
+	}
+	if kept < 0 || pairs[kept].evB == nil {
+		t.Fatalf("the initiator kept pair %d, which its responder never connected on", kept)
+	}
+}

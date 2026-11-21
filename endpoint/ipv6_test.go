@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,13 +104,20 @@ func connectPair(t *testing.T, provider, caller *Endpoint, pkSeed string) (out, 
 func TestDualStackConnectPrefersIPv6(t *testing.T) {
 	seeds := dualNetwork(t, 10)
 
-	out, in := connectPair(t, dualPhone(t, seeds, true), dualPhone(t, seeds, true), "dual")
+	provider := dualPhone(t, seeds, true)
+	out, in := connectPair(t, provider, dualPhone(t, seeds, true), "dual")
 	if out.Remote.Addr().Is4() || in.Remote.Addr().Is4() {
 		t.Fatalf("dual-stack peers connected over %v / %v, want IPv6", out.Remote, in.Remote)
 	}
 	roundTrip(t, out, in, "over v6")
 	roundTrip(t, in, out, "and back")
 	hysteria2Echo(t, out, in, key("dual"))
+	// The caller signaled through both families' DHTs; the provider punched
+	// and charged its limiter once.
+	time.Sleep(300 * time.Millisecond) // let the second copy arrive
+	if n := provider.limiter.chargesFor(pub(key("caller-dual"))); n != 1 {
+		t.Fatalf("one dual-stack connect was charged %d times", n)
+	}
 
 	out, in = connectPair(t, dualPhone(t, seeds, false), dualPhone(t, seeds, true), "v4only")
 	if !out.Remote.Addr().Is4() || !in.Remote.Addr().Is4() {
@@ -165,7 +173,7 @@ func TestRelayOnlyNeverUsesIPv6(t *testing.T) {
 	if _, err := e.DHT().Bootstrap(ctx, seeds); err != nil {
 		t.Fatal(err)
 	}
-	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: make([]byte, 32)}, true)
+	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: make([]byte, 32)}, true, new(atomic.Int32))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,5 +187,25 @@ func TestRelayOnlyNeverUsesIPv6(t *testing.T) {
 		if !c.Addr().Is4() {
 			t.Fatalf("a relay-only offer carries IPv6 candidate %v", c)
 		}
+	}
+}
+
+// An offer's secret is accepted once while a copy could still arrive, and a
+// flood of live offers sheds load instead of growing memory.
+func TestFirstOfferDedupes(t *testing.T) {
+	e := &Endpoint{cfg: Config{GatherWait: time.Second, PunchDeadline: 6 * time.Second}}
+	now := time.Unix(1_800_000_000, 0)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	if !e.firstOffer(secret, now) || e.firstOffer(secret, now.Add(time.Second)) {
+		t.Fatal("a repeated offer secret was accepted twice")
+	}
+	if !e.firstOffer(secret, now.Add(time.Minute)) {
+		t.Fatal("a secret was remembered long after any copy could arrive")
+	}
+	for i := range maxRecentOffers {
+		e.firstOffer([]byte{byte(i), byte(i >> 8), 1}, now)
+	}
+	if len(e.offers) > maxRecentOffers {
+		t.Fatalf("offer memory grew to %d", len(e.offers))
 	}
 }

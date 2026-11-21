@@ -44,7 +44,15 @@ type Config struct {
 	// candidates and we never probe the peer directly, so it only ever sees
 	// the relay router. It requires a relay.
 	RelayOnly bool
+	// Claim, if set, is asked by an initiator before it commits to a path
+	// (a nomination or a relay probe), and it commits only if Claim
+	// reports true. An initiator punching several sessions at once (one
+	// per address family) shares one claim among them, so the responder
+	// is only ever nominated on one and both sides keep the same path.
+	Claim func() bool
 }
+
+func (s *Session) claim() bool { return s.cfg.Claim == nil || s.cfg.Claim() }
 
 func (c *Config) defaults() {
 	if c.Deadline == 0 {
@@ -535,7 +543,7 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 			if sent, ok := s.sentTo[t]; ok && sent.socket == s.nominated.socket {
 				s.proven = true
 			}
-		case s.cfg.Initiator && !s.nominating:
+		case s.cfg.Initiator && !s.nominating && s.claim():
 			p := pair{socket, from}
 			if sent, ok := s.sentTo[t]; ok && sent.socket == socket {
 				p = sent
@@ -551,7 +559,7 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 		switch m.A.ID {
 		case s.peerID:
 			s.reply(socket, from, &m)
-			if s.cfg.Initiator && !s.nominating && !s.done {
+			if s.cfg.Initiator && !s.nominating && !s.done && s.claim() {
 				s.nominate(now, p)
 			}
 		case s.nomID:

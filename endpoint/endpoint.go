@@ -13,11 +13,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/warren/dht"
@@ -110,6 +112,40 @@ type Endpoint struct {
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	closed  bool // guards wg.Add for outbound Connects against Close's Wait
+
+	offersMu sync.Mutex
+	offers   map[[32]byte]time.Time // recent offer secrets, by hash
+}
+
+// maxRecentOffers bounds the offer-secret memory under a flood.
+const maxRecentOffers = 4096
+
+// firstOffer reports whether an offer with this secret is new, recording
+// it. A secret is remembered for twice a punch's lifetime, longer than any
+// copy of the same offer could still arrive through another DHT.
+func (e *Endpoint) firstOffer(secret []byte, now time.Time) bool {
+	key := sha256.Sum256(secret)
+	ttl := 2 * (e.cfg.GatherWait + e.cfg.PunchDeadline)
+	e.offersMu.Lock()
+	defer e.offersMu.Unlock()
+	if e.offers == nil {
+		e.offers = map[[32]byte]time.Time{}
+	}
+	if at, ok := e.offers[key]; ok && now.Sub(at) < ttl {
+		return false
+	}
+	if len(e.offers) >= maxRecentOffers {
+		for k, at := range e.offers {
+			if now.Sub(at) >= ttl {
+				delete(e.offers, k)
+			}
+		}
+		if len(e.offers) >= maxRecentOffers {
+			return false // still full of live offers: shed load
+		}
+	}
+	e.offers[key] = now
+	return true
 }
 
 func New(cfg Config) (*Endpoint, error) {
@@ -201,7 +237,9 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	}()
 	secret := make([]byte, 32)
 	crand.Read(secret)
-	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: secret}, true)
+	// The legs share one claim, so only one family is ever nominated and
+	// both sides keep the same path.
+	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: secret}, true, new(atomic.Int32))
 	if err != nil {
 		return nil, err
 	}
@@ -221,10 +259,23 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 
 // leg is one address family's data socket and punch session.
 type leg struct {
-	v6   bool
-	sess *punch.Session
-	r    *punch.Runner
-	conn *net.UDPConn
+	v6    bool
+	sess  *punch.Session
+	r     *punch.Runner
+	conn  *net.UDPConn
+	id    int32         // this leg's claim token, when claim is set
+	claim *atomic.Int32 // shared by a caller's legs; nil for a responder
+}
+
+// release gives up this leg's claim, so another family can commit.
+func (l *leg) release() {
+	if l.claim != nil {
+		l.claim.CompareAndSwap(l.id, 0)
+	}
+}
+
+func claimer(owner *atomic.Int32, id int32) func() bool {
+	return func() bool { return owner.CompareAndSwap(0, id) || owner.Load() == id }
 }
 
 func (l *leg) abort() { l.r.Abort(); l.conn.Close() }
@@ -249,29 +300,34 @@ func (e *Endpoint) families() (v4, v6 bool) {
 
 // legs prepares a leg per family: IPv4 when we have it, and IPv6 when we
 // have it, wantV6 is set, and we aren't relay-only (an IPv6 leg punches
-// directly, revealing our address). It fails only if no leg could be
-// prepared.
-func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV6 bool) ([]*leg, error) {
+// directly, revealing our address). A caller passes claim, which its legs
+// share so that only one commits to a path. It fails only if no leg could
+// be prepared.
+func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV6 bool, claim *atomic.Int32) ([]*leg, error) {
 	has4, has6 := e.families()
 	var legs []*leg
 	var firstErr error
-	if has4 {
-		l, err := e.prepare(ctx, pc, false)
-		if err == nil {
-			legs = append(legs, l)
-		} else {
-			firstErr = err
+	add := func(pc punch.Config, v6 bool, id int32) {
+		if claim != nil {
+			pc.Claim = claimer(claim, id)
 		}
+		l, err := e.prepare(ctx, pc, v6)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return
+		}
+		l.id, l.claim = id, claim
+		legs = append(legs, l)
+	}
+	if has4 {
+		add(pc, false, 1)
 	}
 	if has6 && wantV6 && !e.cfg.RelayOnly {
 		pc6 := pc
 		pc6.Relay, pc6.Relays = netip.AddrPort{}, nil
-		l, err := e.prepare(ctx, pc6, true)
-		if err == nil {
-			legs = append(legs, l)
-		} else if firstErr == nil {
-			firstErr = err
-		}
+		add(pc6, true, 2)
 	}
 	if len(legs) == 0 {
 		if firstErr == nil {
@@ -345,6 +401,9 @@ func (e *Endpoint) race(ctx context.Context, legs []*leg, remote punch.Offer, pe
 				}
 			}
 			c, err := e.finish(ctx, l.r, l.conn, fr, peer, secret)
+			if err != nil {
+				l.release() // a failed leg mustn't block the other family
+			}
 			results <- result{l.v6, c, err}
 		}()
 	}
@@ -487,6 +546,11 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	if err != nil || len(offer.Secret) < 16 {
 		return
 	}
+	if !e.firstOffer(offer.Secret, time.Now()) {
+		// A dual-stack caller signals the same offer through each family's
+		// DHT; its secret identifies it. Punch and charge for it once.
+		return
+	}
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.
 	_, has6 := e.families()
@@ -525,7 +589,7 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	// The relay chosen here is final: the IPv4 session uses exactly this
 	// one (or none).
-	legs, err := e.legs(ctx, punch.Config{Relay: relay}, wantV6)
+	legs, err := e.legs(ctx, punch.Config{Relay: relay}, wantV6, nil)
 	if err != nil {
 		return
 	}

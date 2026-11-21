@@ -86,6 +86,10 @@ func (s *Session) tickRelay(now time.Time) {
 		// answer. A wrong guess fails loudly in the authenticated handshake
 		// that follows.
 		s.connectRelayed()
+	case s.cfg.Initiator && !s.claim():
+		// Another session holds the claim. The responder connects on our
+		// first probe, so probing would commit it to this path.
+		s.nextRelay = now.Add(relayProbeEvery)
 	default:
 		// Both sides probe: the initiator's probe is what the responder
 		// acks, and the responder's tells the initiator the path works.
