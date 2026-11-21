@@ -48,10 +48,15 @@ type Offer struct {
 	Secret     []byte
 	Candidates []netip.AddrPort
 	Profile    Profile
-	// Relay is a DHT router both sides bind to as a fallback, chosen by the
-	// initiator.
+	// Relays are the initiator's relay candidates, in preference order.
+	Relays []netip.AddrPort
+	// Relay, in the responder's answer, is the relay it chose (one of Relays,
+	// or a router of its own when it keeps its address private); both sides
+	// bind to it.
 	Relay netip.AddrPort
 }
+
+const maxRelays = 8
 
 const maxCandidates = 8
 
@@ -74,6 +79,14 @@ func (o *Offer) Marshal() []byte {
 	if o.Relay.IsValid() {
 		b = bencode.AppendString(b, "r")
 		b = bencode.AppendBytes(b, krpc.AppendCompactAddr(nil, o.Relay))
+	}
+	if len(o.Relays) > 0 {
+		b = bencode.AppendString(b, "rs")
+		b = append(b, 'l')
+		for _, r := range o.Relays[:min(len(o.Relays), maxRelays)] {
+			b = bencode.AppendBytes(b, krpc.AppendCompactAddr(nil, r))
+		}
+		b = append(b, 'e')
 	}
 	if len(o.Secret) > 0 {
 		b = bencode.AppendString(b, "s")
@@ -107,6 +120,13 @@ func UnmarshalOffer(b []byte) (Offer, error) {
 	}
 	if r, ok := v.Get("r"); ok && r.Kind == bencode.String {
 		o.Relay, _ = krpc.ParseCompactAddr(r.Str)
+	}
+	if rs, ok := v.Get("rs"); ok && rs.Kind == bencode.List {
+		for _, item := range rs.List[:min(len(rs.List), maxRelays)] {
+			if a, ok := krpc.ParseCompactAddr(item.Str); ok && a.Port() != 0 {
+				o.Relays = append(o.Relays, a)
+			}
+		}
 	}
 	if sec, ok := v.Get("s"); ok && sec.Kind == bencode.String {
 		o.Secret = append([]byte(nil), sec.Str...)

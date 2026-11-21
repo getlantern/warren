@@ -145,3 +145,18 @@ func TestLimiterRelayBudgets(t *testing.T) {
 		t.Fatalf("relays across one /24 allowed %d punches, want the network cap %d", allowed, relayNetMax)
 	}
 }
+
+func TestChooseRelay(t *testing.T) {
+	a, b, own := netip.MustParseAddrPort("2.176.0.1:6881"), netip.MustParseAddrPort("2.176.0.2:6881"), netip.MustParseAddrPort("2.176.0.9:6881")
+	knowsB := func(r netip.AddrPort) bool { return r == b }
+	none := func(netip.AddrPort) bool { return false }
+	if got := chooseRelay(false, []netip.AddrPort{a, b}, []netip.AddrPort{own}, none); got != a {
+		t.Errorf("not relay-only: got %v, want the caller's first", got)
+	}
+	if got := chooseRelay(true, []netip.AddrPort{a, b}, []netip.AddrPort{own}, knowsB); got != b {
+		t.Errorf("relay-only: got %v, want the first offered relay we know", got)
+	}
+	if got := chooseRelay(true, []netip.AddrPort{a}, []netip.AddrPort{own}, none); got != own {
+		t.Errorf("relay-only, none known: got %v, want our own contact", got)
+	}
+}

@@ -424,8 +424,9 @@ infrastructure.
   addresses. The payload is end-to-end encrypted hysteria2. To an observer,
   each peer announced a torrent to a DHT node and then talked uTP with it,
   which libtorrent does on the same socket.
-- **The caller picks the relay** (its closest DHT contact) and names it in the
-  offer. Both sides bind in parallel with punching, so falling back is instant.
+- **The relay is negotiated.** The caller offers up to eight of its DHT
+  contacts as candidates. The listener picks one and names it in its answer,
+  and both sides bind it in parallel with punching, so falling back is instant.
   Relay probes are authenticated datagrams shaped like uTP `SYN`/`STATE`. Probing
   starts immediately when the plan has no direct strategy, and otherwise
   halfway to the punch deadline, so a direct path always wins.
@@ -435,10 +436,11 @@ infrastructure.
   congestion control backs off). An address relays one pair, pairs are fixed
   once formed so a third announcer can't join or hijack them, idle pairs expire
   after a minute, and read-only phones never relay.
-- **A relay-only listener accepts only a relay it already knows.** The
-  caller picks the relay, and a relay learns both addresses, so a relay-only
-  listener uses the caller's choice only if it is an authenticated contact in
-  its own routing table.
+- **Each relay-only side trusts only routers it knows.** A relay learns both
+  addresses. A relay-only listener picks the first offered candidate it has
+  authenticated itself, or else its own closest contact. A relay-only caller
+  accepts the listener's pick only if it was one of its own candidates. Two
+  relay-only peers that share no known router can't connect.
 - **Relay-only privacy mode** (`endpoint.Config.RelayOnly`, `punch.Config.RelayOnly`).
   The offer carries no candidates and the peer is never probed directly, so a
   peer sees only the relay, never your IP. The relay router still sees both

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/getlantern/warren/dht"
@@ -31,9 +32,13 @@ type Config struct {
 	NoDoubleBirthday bool
 	SprayPerTick     int
 	MaxProbes        int
-	// Relay, set by the initiator, is a DHT router to fall back to when no
-	// direct path is found. The responder takes it from the initiator's offer.
-	Relay netip.AddrPort
+	// Relays, for the initiator, are DHT routers to fall back to when no
+	// direct path is found, in preference order; Relay alone means one.
+	// For the responder, Relay is its choice among the initiator's (or of
+	// its own, when it keeps its address private), echoed in its answer;
+	// left unset, it takes the initiator's first.
+	Relays []netip.AddrPort
+	Relay  netip.AddrPort
 	// RelayOnly keeps our addresses from the peer: the offer carries no
 	// candidates and we never probe the peer directly, so it only ever sees
 	// the relay router. It requires a relay.
@@ -210,9 +215,44 @@ func (s *Session) Offer(locals []netip.AddrPort) Offer {
 	}
 	if s.cfg.Initiator {
 		o.Secret = s.cfg.Secret
+		o.Relays = s.relayCandidates()
+	} else {
 		o.Relay = s.cfg.Relay
 	}
 	return o
+}
+
+func (s *Session) relayCandidates() []netip.AddrPort {
+	if len(s.cfg.Relays) > 0 {
+		return s.cfg.Relays
+	}
+	if s.cfg.Relay.IsValid() {
+		return []netip.AddrPort{s.cfg.Relay}
+	}
+	return nil
+}
+
+// chooseRelay settles which relay both sides bind to. The responder decides
+// and names its choice in the answer; the initiator follows it, unless it
+// keeps its own address private and the choice is not one it offered.
+func (s *Session) chooseRelay(remote Offer) netip.AddrPort {
+	if !s.cfg.Initiator {
+		if s.cfg.Relay.IsValid() {
+			return s.cfg.Relay
+		}
+		if len(remote.Relays) > 0 {
+			return remote.Relays[0]
+		}
+		return remote.Relay
+	}
+	cands := s.relayCandidates()
+	switch {
+	case remote.Relay.IsValid() && (slices.Contains(cands, remote.Relay) || !s.cfg.RelayOnly):
+		return remote.Relay
+	case !remote.Relay.IsValid() && len(cands) > 0:
+		return cands[0] // the responder didn't choose, so it took our first
+	}
+	return netip.AddrPort{}
 }
 
 func probeID(secret []byte, label string) krpc.NodeID {
@@ -249,10 +289,7 @@ func (s *Session) Start(now time.Time, remote Offer) {
 	}
 	var extra int
 	s.strategy, s.target, extra = Plan(s.cfg.Local, remote.Profile, remote.Candidates, !s.cfg.NoDoubleBirthday)
-	s.relay = s.cfg.Relay
-	if !s.cfg.Initiator {
-		s.relay = remote.Relay
-	}
+	s.relay = s.chooseRelay(remote)
 	sprays := s.strategy == Spray || s.strategy == DoubleBirthday
 	// A responder sprays only a public address. The initiator chose to call
 	// this peer; a responder acts on a stranger's offer, and spraying a

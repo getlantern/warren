@@ -209,19 +209,21 @@ func (e *Endpoint) prepare(ctx context.Context, pc punch.Config) (*punch.Session
 		return nil, nil, nil, err
 	}
 	var reflections []dht.Reflection
-	var reflectors []netip.AddrPort
+	var contacts []netip.AddrPort
 	if err := e.node.Inspect(ctx, func(d *dht.Node) {
 		reflections = d.Reflections()
-		for _, c := range d.Contacts(3) {
-			reflectors = append(reflectors, c.Addr)
+		for _, c := range d.Contacts(maxRelayCandidates) {
+			contacts = append(contacts, c.Addr)
 		}
 	}); err != nil {
 		conn.Close()
 		return nil, nil, nil, err
 	}
-	if pc.Initiator && len(reflectors) > 0 {
-		// Routers relay by default; our closest contact is the fallback.
-		pc.Relay = reflectors[0]
+	reflectors := contacts[:min(3, len(contacts))]
+	if pc.Initiator {
+		// Routers relay by default. Offer several, so a provider that only
+		// trusts routers it knows can likely find one among them.
+		pc.Relays = contacts
 	}
 	pc.Local = e.profile(reflections)
 	pc.RelayOnly = e.cfg.RelayOnly
@@ -303,19 +305,24 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	strategy, _, _ := punch.Plan(e.profile(refl), offer.Profile, offer.Candidates, true)
 	heavy := strategy == punch.Spray || strategy == punch.Open || strategy == punch.DoubleBirthday
-	if !e.limiter.allow(in.Caller, offer.Candidates, offer.Relay, heavy, time.Now()) {
+	offered := offer.Relays
+	if len(offered) == 0 && offer.Relay.IsValid() {
+		offered = []netip.AddrPort{offer.Relay}
+	}
+	var relay netip.AddrPort
+	if err := e.node.Inspect(ctx, func(d *dht.Node) {
+		var own []netip.AddrPort
+		for _, c := range d.Contacts(maxRelayCandidates) {
+			own = append(own, c.Addr)
+		}
+		relay = chooseRelay(e.cfg.RelayOnly, offered, own, d.Knows)
+	}); err != nil {
 		return
 	}
-	if e.cfg.RelayOnly && offer.Relay.IsValid() {
-		// The caller picks the relay, and a relay learns our address. Keeping
-		// that address from the caller means accepting only a router we
-		// already authenticated ourselves.
-		known := false
-		if err := e.node.Inspect(ctx, func(d *dht.Node) { known = d.Knows(offer.Relay) }); err != nil || !known {
-			offer.Relay = netip.AddrPort{}
-		}
+	if !e.limiter.allow(in.Caller, offer.Candidates, relay, heavy, time.Now()) {
+		return
 	}
-	sess, r, conn, err := e.prepare(ctx, punch.Config{})
+	sess, r, conn, err := e.prepare(ctx, punch.Config{Relay: relay})
 	if err != nil {
 		return
 	}
@@ -382,4 +389,29 @@ func locals(c *net.UDPConn) []netip.AddrPort {
 		probe.Close()
 	}
 	return []netip.AddrPort{netip.AddrPortFrom(ip.Unmap(), a.Port())}
+}
+
+const maxRelayCandidates = 8
+
+// chooseRelay picks, as the listener, the relay both sides will use. A relay
+// learns both addresses, so a relay-only listener uses only a router it
+// authenticated itself: the first offered one it knows, or else its own
+// closest contact, which a caller that doesn't keep its address private will
+// follow. Otherwise the caller's first choice stands.
+func chooseRelay(relayOnly bool, offered, own []netip.AddrPort, knows func(netip.AddrPort) bool) netip.AddrPort {
+	if !relayOnly {
+		if len(offered) > 0 {
+			return offered[0]
+		}
+		return netip.AddrPort{}
+	}
+	for _, r := range offered {
+		if knows(r) {
+			return r
+		}
+	}
+	if len(own) > 0 {
+		return own[0]
+	}
+	return netip.AddrPort{}
 }

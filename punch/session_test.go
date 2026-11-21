@@ -142,3 +142,38 @@ func TestRelayOnlyHidesAddresses(t *testing.T) {
 		}
 	}
 }
+
+// Both sides must bind the same relay: the responder's choice, which a
+// relay-only initiator accepts only from among its own candidates.
+func TestRelayAgreement(t *testing.T) {
+	a, b, theirs := netip.MustParseAddrPort("2.176.0.1:6881"), netip.MustParseAddrPort("2.176.0.2:6881"), netip.MustParseAddrPort("9.9.9.9:6881")
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	init := func(relayOnly bool) *Session {
+		return New(Config{Initiator: true, Secret: secret, Relays: []netip.AddrPort{a, b}, RelayOnly: relayOnly, Rand: rand.New(rand.NewPCG(5, 5))})
+	}
+	if o := init(false).Offer(nil); len(o.Relays) != 2 || o.Relays[0] != a {
+		t.Fatalf("initiator offer relays %v", o.Relays)
+	}
+	resp := New(Config{Relay: b, Rand: rand.New(rand.NewPCG(6, 6))})
+	if o := resp.Offer(nil); o.Relay != b {
+		t.Fatalf("responder answer relay %v, want its choice", o.Relay)
+	}
+	for _, tc := range []struct {
+		relayOnly bool
+		answer    netip.AddrPort
+		want      netip.AddrPort
+	}{
+		{false, b, b},                    // follow the responder's pick
+		{true, b, b},                     // relay-only: one we offered, accept
+		{true, theirs, netip.AddrPort{}}, // relay-only: not ours, refuse
+		{false, theirs, theirs},          // not private: trust the responder
+		{false, netip.AddrPort{}, a},     // responder didn't choose: it took our first
+	} {
+		if got := init(tc.relayOnly).chooseRelay(Offer{Relay: tc.answer}); got != tc.want {
+			t.Errorf("relayOnly=%v answer=%v: got %v, want %v", tc.relayOnly, tc.answer, got, tc.want)
+		}
+	}
+	if got := New(Config{Rand: rand.New(rand.NewPCG(7, 7))}).chooseRelay(Offer{Relays: []netip.AddrPort{a, b}}); got != a {
+		t.Errorf("responder without a choice: got %v, want the initiator's first", got)
+	}
+}
