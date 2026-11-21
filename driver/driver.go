@@ -59,7 +59,10 @@ type Node struct {
 	// delivered.
 	waiters  map[waitKey]chan dht.Event
 	sessions map[dht.SessionID]int // which family delivered each offer
+	order    []dht.SessionID       // sessions oldest first, for eviction
 }
+
+var ErrUnknownSession = errors.New("driver: unknown signaling session")
 
 // Listen binds an IPv4 UDP socket (e.g. ":6881" or "127.0.0.1:0") and starts
 // one node on it.
@@ -217,11 +220,8 @@ func (n *Node) flush(fam int, f *family) {
 		f.conn.WriteToUDPAddrPort(s.Data, s.To)
 	}
 	for _, e := range events {
-		if in, ok := e.(dht.Incoming); ok {
-			if len(n.sessions) >= maxSessions {
-				clear(n.sessions) // an unanswered flood shouldn't grow this
-			}
-			n.sessions[in.Session] = fam
+		if in, ok := e.(dht.Incoming); ok && !n.admitSession(fam, in) {
+			continue
 		}
 		op, ok := opOf(e)
 		if ch := n.waiters[waitKey{fam, op}]; ok && ch != nil {
@@ -234,6 +234,23 @@ func (n *Node) flush(fam int, f *family) {
 		default:
 		}
 	}
+}
+
+// admitSession records which family delivered an offer, reporting false
+// for an offer already seen: the same offer through the other family's DHT
+// is a replay, since each node dedupes only its own. An unanswered flood
+// evicts the oldest sessions.
+func (n *Node) admitSession(fam int, in dht.Incoming) bool {
+	if _, seen := n.sessions[in.Session]; seen {
+		return false
+	}
+	if len(n.order) >= maxSessions {
+		delete(n.sessions, n.order[0])
+		n.order = n.order[1:]
+	}
+	n.sessions[in.Session] = fam
+	n.order = append(n.order, in.Session)
+	return true
 }
 
 func opOf(e dht.Event) (dht.OpID, bool) {
@@ -512,9 +529,11 @@ func (n *Node) Answer(ctx context.Context, s dht.SessionID, payload []byte) erro
 	if err := n.do(ctx, func(now time.Time) {
 		fam, ok := n.sessions[s]
 		if !ok {
-			fam = 0
+			errc <- ErrUnknownSession
+			return
 		}
-		delete(n.sessions, s)
+		// Kept, not deleted: a later copy of this offer through the other
+		// family must still be recognized as a replay. Eviction bounds it.
 		errc <- n.fams[fam].node.Answer(now, s, payload)
 	}); err != nil {
 		return err

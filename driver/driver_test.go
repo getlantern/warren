@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -324,5 +325,45 @@ func TestDualStackSignal(t *testing.T) {
 		if err != nil || string(got) != "re: "+name {
 			t.Fatalf("%s caller: %v %q", name, err, got)
 		}
+	}
+}
+
+// An offer seen through one family is not delivered again through the
+// other, an answer to an unknown session fails instead of guessing a
+// family, and a flood evicts the oldest sessions rather than all of them.
+func TestSessionsDedupedAcrossFamilies(t *testing.T) {
+	n := &Node{sessions: map[dht.SessionID]int{}}
+	in := dht.Incoming{Session: dht.SessionID{1}}
+	delivered := 0
+	for _, fam := range []int{0, 1} {
+		if n.admitSession(fam, in) {
+			delivered++
+		}
+	}
+	if delivered != 1 {
+		t.Fatalf("the same offer through both families was delivered %d times", delivered)
+	}
+	if n.sessions[in.Session] != 0 {
+		t.Fatal("the replay through the other family moved the answer route")
+	}
+	for i := range maxSessions {
+		n.admitSession(0, dht.Incoming{Session: dht.SessionID{2, byte(i), byte(i >> 8)}})
+	}
+	if _, ok := n.sessions[in.Session]; ok {
+		t.Fatal("the oldest session survived a full table")
+	}
+	if len(n.sessions) != maxSessions {
+		t.Fatalf("sessions holds %d, want %d", len(n.sessions), maxSessions)
+	}
+}
+
+func TestAnswerUnknownSessionFails(t *testing.T) {
+	n, err := Listen("127.0.0.1:0", memberConfig(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	if err := n.Answer(context.Background(), dht.SessionID{9}, []byte("x")); !errors.Is(err, ErrUnknownSession) {
+		t.Fatalf("answer to an unknown session: %v", err)
 	}
 }
