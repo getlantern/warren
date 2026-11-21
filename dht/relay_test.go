@@ -302,7 +302,8 @@ func TestRelayReannounceKeepsRefill(t *testing.T) {
 }
 
 // A flood fast enough that every half-formed pair is within its grace must
-// still not lock out a new session: the heaviest source gives way.
+// still not lock out a new session: the oldest pair of a source no lighter
+// than the newcomer's gives way.
 func TestRelayFastFloodStillAdmits(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(82)), Rand: rng(83)})
 	for i := range 4 * r.cfg.MaxRelayPairs { // 16 sources, 4 each, all fresh
@@ -371,8 +372,9 @@ func TestRelayPendingCapRecyclesStalePairs(t *testing.T) {
 	}
 }
 
-// When every pair is young, the fallback evicts the heaviest source's
-// oldest pair, so a newcomer's fresh pair survives the next flood announces.
+// When every pair is young, the fallback is first in, first out among
+// sources no lighter than the announcer's, so a newcomer's fresh pair
+// survives the next flood announces.
 func TestRelayFallbackSparesNewcomer(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(88)), Rand: rng(89)})
 	src := 0
@@ -392,5 +394,24 @@ func TestRelayFallbackSparesNewcomer(t *testing.T) {
 	announceAt(t, r, at.Add(1500*time.Millisecond), addr(3), krpc.NodeID{34})
 	if r.RelayPairs() != 1 {
 		t.Fatal("the next flood announces evicted the newcomer's pair")
+	}
+}
+
+// Under a young flood, a busy shared address's own sessions don't evict
+// each other: the fallback never takes the announcer's own pairs.
+func TestRelayFallbackSparesAnnouncersOwnPairs(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(90)), Rand: rng(91)})
+	shared := netip.MustParseAddr("100.64.0.1")
+	for i := range 3 {
+		announce(t, r, netip.AddrPortFrom(shared, uint16(1+i)), krpc.NodeID{36, byte(i)})
+	}
+	for i := range 4*r.cfg.MaxRelayPairs - 3 {
+		announce(t, r, netip.AddrPortFrom(netip.AddrFrom4([4]byte{12, 0, byte(i), 1}), 6881), krpc.NodeID{37, byte(i)})
+	}
+	announceAt(t, r, t0.Add(time.Second), netip.AddrPortFrom(shared, 4), krpc.NodeID{36, 3})
+	for i := range 3 {
+		if r.rel.pairs[krpc.NodeID{36, byte(i)}] == nil {
+			t.Fatalf("the shared address's session %d was evicted by its own newer one", i)
+		}
 	}
 }

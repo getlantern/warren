@@ -167,20 +167,21 @@ type Session struct {
 	nextAnnounce    time.Time // next re-announce while the peer is unheard
 }
 
+func unmapAddr(a netip.AddrPort) netip.AddrPort {
+	if !a.IsValid() {
+		return a
+	}
+	return netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
+}
+
 func New(cfg Config) *Session {
 	cfg.defaults()
-	// Addresses arrive unmapped (from the socket and the wire), so compare
-	// like with like.
-	unmap := func(a netip.AddrPort) netip.AddrPort {
-		if !a.IsValid() {
-			return a
-		}
-		return netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
-	}
-	cfg.Relay = unmap(cfg.Relay)
+	// The socket delivers unmapped addresses; unmap configured and offered
+	// relays too, so comparisons match like with like.
+	cfg.Relay = unmapAddr(cfg.Relay)
 	relays := make([]netip.AddrPort, len(cfg.Relays))
 	for i, r := range cfg.Relays {
-		relays[i] = unmap(r)
+		relays[i] = unmapAddr(r)
 	}
 	cfg.Relays = relays
 	s := &Session{cfg: cfg, sockets: 1, reflectT: map[uint16]bool{}, sprayed: map[uint16]bool{}, sentTo: map[uint16]pair{}, nomTids: map[uint16]bool{}, relayT: map[uint16]relayQuery{}}
@@ -314,6 +315,12 @@ func (s *Session) Start(now time.Time, remote Offer) {
 	}
 	var extra int
 	s.strategy, s.target, extra = Plan(s.cfg.Local, remote.Profile, remote.Candidates, !s.cfg.NoDoubleBirthday)
+	remote.Relay = unmapAddr(remote.Relay)
+	offered := make([]netip.AddrPort, len(remote.Relays)) // the caller owns remote's slice
+	for i, r := range remote.Relays {
+		offered[i] = unmapAddr(r)
+	}
+	remote.Relays = offered
 	if r := s.chooseRelay(remote); r.IsValid() {
 		s.relay = netip.AddrPortFrom(r.Addr().Unmap(), r.Port()) // incoming addresses are unmapped
 	}

@@ -133,9 +133,11 @@ func (r *relay) evictPending(now time.Time, announcer netip.Prefix) bool {
 		// Every pair is young: take the oldest pair of any source no
 		// lighter than the announcer's, first in, first out regardless of
 		// how many that source holds, so a heavy source can't push out a
-		// lighter one's pairs.
+		// lighter one's pairs. Never the announcer's own: like evictOwn, a
+		// source doesn't drop its own pairs within their grace.
 		for k, q := range r.pairs {
-			if q.n != 1 || perSource[relaySource(q.peers[0])] < perSource[announcer] {
+			src := relaySource(q.peers[0])
+			if q.n != 1 || src == announcer || perSource[src] < perSource[announcer] {
 				continue
 			}
 			if best == nil || q.created.Before(best.created) || q.created.Equal(best.created) && bytes.Compare(k[:], victim[:]) < 0 {
