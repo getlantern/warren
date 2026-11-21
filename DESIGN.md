@@ -436,15 +436,17 @@ infrastructure.
 - **Volunteer cost is bounded.** Routers relay by default (`DisableRelay` opts
   out), with at most 16 pairs at once (`MaxRelayPairs`) and 512 KB/s per pair
   (`RelayRate`, a token bucket; packets over budget are dropped, so end-to-end
-  congestion control backs off). An address relays one pair, one source (an IPv4
-  address, or an IPv6 /64 and its /48) can hold at most 4 half-formed pairs, one
-  pair with itself, and complete pairs with other sources up to half of
-  `MaxRelayPairs` (announce tokens are per IP, so this stops one host filling
-  the table or holding more than half the active slots, while leaving a busy
-  client its fallback),
-  pairs that never forward anything expire after 20 seconds, pairs are fixed
-  once formed so a third announcer can't join or hijack them, idle pairs expire
-  after a minute, and read-only phones never relay.
+  congestion control backs off). Pairs are fixed once formed, so a third
+  announcer can't join or hijack them. Idle pairs expire after a minute, and
+  read-only phones never relay.
+- **Admission is loose by design.** An address relays one pair. A source (an
+  IPv4 address or IPv6 /64) holds at most 8 half-formed pairs and one pair
+  with itself. A full table evicts its oldest half-formed pair rather than
+  refusing new ones, so a flood of announces churns the table instead of
+  locking it. Tighter per-source limits would hit CGNAT users and relay-only
+  listeners as hard as attackers. So pairs between different sources are
+  bounded only by the pair cap, the byte budget and idle expiry, the
+  open-relay limit every volunteer relay shares.
 - **Each relay-only side trusts only routers it knows.** A relay learns both
   addresses. A relay-only listener picks the first offered candidate it has
   authenticated itself, or else its own closest contact. A relay-only caller

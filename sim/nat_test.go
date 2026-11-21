@@ -97,8 +97,8 @@ func TestSequentialNearTopStaysInRange(t *testing.T) {
 	local := netip.MustParseAddrPort("192.168.0.2:4000")
 	for i := range 36 {
 		m, ok := n.Outbound(local, netip.AddrPortFrom(netip.AddrFrom4([4]byte{9, 9, 0, byte(i)}), 1), now)
-		if ok && m.Port() < 65500 {
-			t.Fatalf("mapping %d got port %d, below the range", i, m.Port())
+		if !ok || m.Port() < 65500 {
+			t.Fatalf("mapping %d: port %d ok=%v, want one of the 36 ports in range", i, m.Port(), ok)
 		}
 	}
 }

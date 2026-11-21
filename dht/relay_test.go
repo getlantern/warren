@@ -117,102 +117,85 @@ func TestRelayBoundAddressCannotFillTable(t *testing.T) {
 }
 
 // Tokens are per IP, so one host announcing fresh info-hashes from many
-// source ports must not fill the table either.
-func TestRelayOneHostManyPortsCannotFillTable(t *testing.T) {
+// source ports is held to a few half-formed pairs.
+func TestRelayOneHostManyPortsHeldToPendingCap(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(60)), Rand: rng(61)})
 	host := netip.MustParseAddr("5.5.5.1")
 	for i := range 4 * r.cfg.MaxRelayPairs {
 		announce(t, r, netip.AddrPortFrom(host, uint16(10000+i)), krpc.NodeID{11, byte(i)})
 	}
-	if got, want := len(r.rel.pairs), v4Limits[0].pending; got != want {
-		t.Fatalf("one host holds %d half-formed pairs, want the cap %d", got, want)
+	if got := len(r.rel.pairs); got != maxPendingPerSource {
+		t.Fatalf("one host holds %d half-formed pairs, want the cap %d", got, maxPendingPerSource)
+	}
+}
+
+// A flood of half-formed pairs from many sources fills the table, but a
+// new session still gets in: the oldest half-formed pair is evicted.
+func TestRelayFullTableEvictsOldestPending(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(62)), Rand: rng(63)})
+	for i := range 4 * r.cfg.MaxRelayPairs {
+		announce(t, r, netip.AddrPortFrom(netip.AddrFrom4([4]byte{6, 6, byte(i), 1}), 6881), krpc.NodeID{13, byte(i)})
 	}
 	announce(t, r, addr(2), krpc.NodeID{12})
 	announce(t, r, addr(3), krpc.NodeID{12})
 	if r.RelayPairs() != 1 {
-		t.Fatalf("a legitimate pair could not form: %d active", r.RelayPairs())
+		t.Fatalf("a legitimate pair could not form in a full table: %d active", r.RelayPairs())
+	}
+	if len(r.rel.pairs) > 4*r.cfg.MaxRelayPairs {
+		t.Fatalf("table grew to %d", len(r.rel.pairs))
 	}
 }
 
-// One host pairing with itself, or spreading over its IPv6 /48, holds at
-// most its share of the active slots, leaving room for everyone else.
-func TestRelaySourceCannotHoldActiveSlots(t *testing.T) {
+// One host pairing with itself holds at most one slot, IPv4 or IPv6 /64.
+func TestRelaySelfPairsLimited(t *testing.T) {
 	selfPair := func(r *Node, a, b netip.AddrPort, tag byte, i int) {
 		announce(t, r, a, krpc.NodeID{tag, byte(i)})
 		announce(t, r, b, krpc.NodeID{tag, byte(i)})
 	}
-	r := New(Config{ID: outsiderID(rng(62)), Rand: rng(63)})
+	r := New(Config{ID: outsiderID(rng(64)), Rand: rng(65)})
 	v4 := netip.MustParseAddr("5.5.5.1")
 	for i := range r.cfg.MaxRelayPairs {
-		selfPair(r, netip.AddrPortFrom(v4, uint16(20000+2*i)), netip.AddrPortFrom(v4, uint16(20001+2*i)), 13, i)
+		selfPair(r, netip.AddrPortFrom(v4, uint16(20000+2*i)), netip.AddrPortFrom(v4, uint16(20001+2*i)), 14, i)
 	}
 	if got := r.RelayPairs(); got != maxSelfPairs {
-		t.Fatalf("one IPv4 host self-paired %d times, want the cap %d", got, maxSelfPairs)
+		t.Fatalf("one IPv4 host self-paired %d times, want %d", got, maxSelfPairs)
 	}
-
-	r = New(Config{ID: outsiderID(rng(66)), Rand: rng(67)})
-	for i := range r.cfg.MaxRelayPairs { // a different /64 each time, one /48
-		a := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, byte(i), 15: 1})
-		b := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, byte(i), 15: 2})
-		selfPair(r, netip.AddrPortFrom(a, 6881), netip.AddrPortFrom(b, 6881), 14, i)
-	}
-	if got := r.RelayPairs(); got != maxSelfPairs {
-		t.Fatalf("one IPv6 /48 self-paired %d times, want the cap %d", got, maxSelfPairs)
-	}
-
-	// A dual-stack host pairing its IPv4 side with its IPv6 side: these
-	// are pairs between two sources, capped at half the active slots.
-	r = New(Config{ID: outsiderID(rng(72)), Rand: rng(73)})
 	for i := range r.cfg.MaxRelayPairs {
-		v6 := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 15: byte(i + 1)})
-		selfPair(r, netip.AddrPortFrom(v4, uint16(20000+i)), netip.AddrPortFrom(v6, 6881), 19, i)
+		a := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 15: byte(2*i + 1)})
+		b := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 15: byte(2*i + 2)})
+		selfPair(r, netip.AddrPortFrom(a, 6881), netip.AddrPortFrom(b, 6881), 15, i)
 	}
-	if got, want := r.RelayPairs(), r.cfg.MaxRelayPairs/2; got != want {
-		t.Fatalf("a dual-stack host holds %d pairs, want at most half the slots (%d)", got, want)
+	if got := r.RelayPairs(); got != 2*maxSelfPairs {
+		t.Fatalf("an IPv4 host and one IPv6 /64 hold %d self-pairs, want %d", got, 2*maxSelfPairs)
 	}
 }
 
-// A busy client binds a relay on every dial; five dials to five peers in a
-// minute through the same router must all keep their fallback.
-func TestRelayBusyClientKeepsFallback(t *testing.T) {
-	r := New(Config{ID: outsiderID(rng(68)), Rand: rng(69)})
+// Many sessions from one address to different peers (a busy client, a
+// relay-only listener, or subscribers sharing a CGNAT IP) are not capped
+// per source, concurrent or not.
+func TestRelayBusySourceKeepsFallback(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(66)), Rand: rng(67)})
 	me := netip.MustParseAddr("5.5.5.1")
-	for i := range 5 {
-		info := krpc.NodeID{16, byte(i)}
-		announce(t, r, netip.AddrPortFrom(me, uint16(40000+i)), info)
-		announce(t, r, addr(10+i), info)
+	n := maxPendingPerSource
+	for i := range n { // all announce before any peer does
+		announce(t, r, netip.AddrPortFrom(me, uint16(40000+i)), krpc.NodeID{16, byte(i)})
 	}
-	if got := r.RelayPairs(); got != 5 {
-		t.Fatalf("a client's 5 dials formed %d pairs", got)
+	for i := range n {
+		announce(t, r, addr(10+i), krpc.NodeID{16, byte(i)})
 	}
-}
-
-// Pairs that never forward anything (the direct path won) free their slot
-// sooner than pairs in use.
-func TestRelayUnusedPairsExpireSooner(t *testing.T) {
-	r := New(Config{ID: outsiderID(rng(70)), Rand: rng(71)})
-	announce(t, r, addr(1), krpc.NodeID{17})
-	announce(t, r, addr(2), krpc.NodeID{17})
-	announce(t, r, addr(3), krpc.NodeID{18})
-	announce(t, r, addr(4), krpc.NodeID{18})
-	relayed(r, addr(3), utpLike) // pair 18 carries traffic
-	r.expireRelays(t0.Add(relayUnusedIdle))
-	if r.rel.pairs[krpc.NodeID{17}] != nil {
-		t.Fatal("an unused pair outlived relayUnusedIdle")
-	}
-	if r.rel.pairs[krpc.NodeID{18}] == nil {
-		t.Fatal("a pair in use expired early")
+	if got := r.RelayPairs(); got != n {
+		t.Fatalf("%d concurrent sessions from one address formed %d pairs", n, got)
 	}
 }
 
 // Zoned (link-local) senders count against their source like any other.
 func TestRelaySourceCountsZonedSenders(t *testing.T) {
-	r := New(Config{ID: outsiderID(rng(64)), Rand: rng(65)})
+	r := New(Config{ID: outsiderID(rng(68)), Rand: rng(69)})
 	ll := netip.MustParseAddr("fe80::1").WithZone("en0")
-	for i := range 4 * v6Limits[0].pending {
-		announce(t, r, netip.AddrPortFrom(ll, uint16(30000+i)), krpc.NodeID{15, byte(i)})
+	for i := range 2 * maxPendingPerSource {
+		announce(t, r, netip.AddrPortFrom(ll, uint16(30000+i)), krpc.NodeID{17, byte(i)})
 	}
-	if got, want := len(r.rel.pairs), v6Limits[0].pending; got != want {
-		t.Fatalf("a zoned source holds %d pairs, want the cap %d", got, want)
+	if got := len(r.rel.pairs); got != maxPendingPerSource {
+		t.Fatalf("a zoned source holds %d pairs, want the cap %d", got, maxPendingPerSource)
 	}
 }
