@@ -422,12 +422,12 @@ func TestCommittedLegKeepsClaim(t *testing.T) {
 	}
 }
 
-// A revoked answer isn't handed to later copies.
-func TestRevokedAnswerNotSentToCopies(t *testing.T) {
+// An offer that was never answered (publish nil) hands nothing to later
+// copies.
+func TestUnansweredOfferNotSentToCopies(t *testing.T) {
 	o := &offerEntry{done: make(chan struct{})}
-	o.publish([]byte("answer"))
-	o.revoke()
+	o.publish(nil)
 	if _, now := o.copyOf(dht.SessionID{1}); now {
-		t.Fatal("a copy got an answer that was revoked")
+		t.Fatal("a copy got an answer to an offer that was never answered")
 	}
 }

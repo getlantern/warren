@@ -183,11 +183,20 @@ func (e *Endpoint) publishOffer(ctx context.Context, o *offerEntry, answer []byt
 	return delivered
 }
 
-// revoke withdraws the answer: copies arriving later get nothing.
-func (o *offerEntry) revoke() {
+// deliverQueued sends answer to copies queued so far without making it
+// visible to later ones, returning how many it delivered.
+func (e *Endpoint) deliverQueued(ctx context.Context, o *offerEntry, answer []byte) int {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.answer = nil
+	queued := o.pending
+	o.pending = nil
+	o.mu.Unlock()
+	delivered := 0
+	for _, s := range queued {
+		if e.node.Answer(ctx, s, answer) == nil {
+			delivered++
+		}
+	}
+	return delivered
 }
 
 // wantFamilies decides which legs a provider runs for an offer: IPv4 when
@@ -761,13 +770,16 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	answer := offerOf(legs)
 	ab := answer.Marshal()
 	// Answer our own session first, then the queued copy. Keep the legs if
-	// either delivery worked; if none did, revoke the answer so a later
-	// copy can't send the caller toward legs we're closing.
-	ownErr := e.node.Answer(ctx, in.Session, ab)
-	if delivered := e.publishOffer(ctx, entry, ab); ownErr != nil && delivered == 0 {
-		entry.revoke()
+	// either delivery worked. Until one has, the answer isn't visible to
+	// later copies, which mustn't send the caller toward legs we close.
+	if err := e.node.Answer(ctx, in.Session, ab); err == nil {
+		e.publishOffer(ctx, entry, ab)
+	} else if e.deliverQueued(ctx, entry, ab) == 0 {
+		e.publishOffer(ctx, entry, nil)
 		abortAll(legs)
 		return
+	} else {
+		e.publishOffer(ctx, entry, ab)
 	}
 	// The IPv4 leg waits out the same head start as the caller's, so when
 	// IPv6 wins quickly a heavy IPv4 strategy is canceled before it sprays.
