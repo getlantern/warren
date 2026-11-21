@@ -38,7 +38,9 @@ const relayIdle = time.Minute
 //
 //   - An address relays one pair, checked before allocating.
 //   - A source (an IPv4 address or IPv6 /64; all link-local senders share
-//     one) holds at most maxPendingPerSource half-formed pairs. When the
+//     one) holds at most maxPendingPerSource half-formed pairs; at the cap,
+//     its own oldest pair past evictGrace makes way, so one subscriber
+//     behind a shared address can't pin its budget by refreshing. When the
 //     table is full, a half-formed pair is evicted rather than new ones
 //     refused: from the source holding the most, oldest created first,
 //     never one created less than evictGrace ago (long enough for the peer
@@ -97,9 +99,10 @@ func (r *relay) count(src netip.Prefix) (pending, self int) {
 // evictGrace since it was created (so a pair has time to complete, and
 // refreshes don't extend that), ties broken by info-hash for
 // determinism. If every pair is within its grace, a fast flood would
-// otherwise lock new sessions out, so it evicts the youngest pair of the
+// otherwise lock new sessions out, so it evicts the oldest pair of the
 // heaviest source instead, provided that source holds more half-formed
-// pairs than the announcer's. It reports whether it found one.
+// pairs than the announcer's: a newcomer's fresh pair is the last to go.
+// It reports whether it found one.
 func (r *relay) evictPending(now time.Time, announcer netip.Prefix) bool {
 	perSource := map[netip.Prefix]int{}
 	for _, q := range r.pairs {
@@ -142,12 +145,33 @@ func (r *relay) evictPending(now time.Time, announcer netip.Prefix) bool {
 					continue
 				}
 			case !q.created.Equal(best.created):
-				if q.created.Before(best.created) {
+				if !q.created.Before(best.created) {
 					continue
 				}
 			case bytes.Compare(k[:], victim[:]) >= 0:
 				continue
 			}
+			victim, best = k, q
+		}
+	}
+	if best == nil {
+		return false
+	}
+	delete(r.byAddr, best.peers[0])
+	delete(r.pairs, victim)
+	return true
+}
+
+// evictOwn drops src's oldest half-formed pair created at least evictGrace
+// ago, reporting whether there was one.
+func (r *relay) evictOwn(now time.Time, src netip.Prefix) bool {
+	var victim krpc.NodeID
+	var best *relayPair
+	for k, q := range r.pairs {
+		if q.n != 1 || relaySource(q.peers[0]) != src || now.Sub(q.created) < evictGrace {
+			continue
+		}
+		if best == nil || q.created.Before(best.created) || q.created.Equal(best.created) && bytes.Compare(k[:], victim[:]) < 0 {
 			victim, best = k, q
 		}
 	}
@@ -179,7 +203,7 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 		return
 	}
 	if p == nil {
-		if pending, _ := r.count(relaySource(from)); pending >= maxPendingPerSource {
+		if pending, _ := r.count(relaySource(from)); pending >= maxPendingPerSource && !r.evictOwn(now, relaySource(from)) {
 			return
 		}
 		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs && !r.evictPending(now, relaySource(from)) {

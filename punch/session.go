@@ -300,7 +300,9 @@ func (s *Session) Start(now time.Time, remote Offer) {
 	}
 	var extra int
 	s.strategy, s.target, extra = Plan(s.cfg.Local, remote.Profile, remote.Candidates, !s.cfg.NoDoubleBirthday)
-	s.relay = s.chooseRelay(remote)
+	if r := s.chooseRelay(remote); r.IsValid() {
+		s.relay = netip.AddrPortFrom(r.Addr().Unmap(), r.Port()) // incoming addresses are unmapped
+	}
 	sprays := s.strategy == Spray || s.strategy == DoubleBirthday
 	// A responder sprays only a public address. The initiator chose to call
 	// this peer; a responder acts on a stranger's offer, and spraying a

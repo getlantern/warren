@@ -445,9 +445,16 @@ infrastructure.
   half-formed pair rather than refusing new ones: from the source holding
   the most, oldest created first, never one created less than ten seconds
   ago (long enough for its peer to arrive), unless every pair is that
-  young, in which case the heaviest source gives up its youngest to a
-  lighter newcomer. Creation time, not activity, decides, so refreshing
-  can't protect a pair or pin a slot.
+  young, in which case the heaviest source gives up its oldest to a lighter
+  newcomer. At its cap, a source's own oldest stale pair makes way, so one
+  subscriber behind a shared address can't pin its budget. Creation time,
+  not activity, decides, so refreshing can't protect a pair. Under a flood
+  from many single-pair sources the router can't tell newcomers from
+  attackers, so the guarantee is first in, first out: a pair survives one
+  full table turnover (64 slots divided by the flood rate, about 6 seconds
+  at 10 announces a second, enough for its peer to arrive). A faster flood
+  from that many addresses can deny relaying through that router, and
+  sessions then fall back at their deadline.
   So a flood churns its own entries instead of locking the table. Clients
   re-announce every second until they hear their peer through the relay, so
   a pair evicted anyway is rebuilt. Tighter per-source limits would hit CGNAT users and relay-only

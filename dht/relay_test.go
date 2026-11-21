@@ -261,8 +261,8 @@ func TestRelayRefreshesCannotPinTable(t *testing.T) {
 		keys = append(keys, a)
 		announce(t, r, a, krpc.NodeID{24, byte(i)})
 	}
-	at := t0.Add(3 * time.Second)
-	for i, a := range keys { // every pair refreshed just now
+	at := t0.Add(evictGrace + time.Second)
+	for i, a := range keys { // every pair refreshed just now, past its grace
 		announceAt(t, r, at, a, krpc.NodeID{24, byte(i)})
 	}
 	announceAt(t, r, at, addr(2), krpc.NodeID{25})
@@ -270,7 +270,6 @@ func TestRelayRefreshesCannotPinTable(t *testing.T) {
 	if r.RelayPairs() != 1 {
 		t.Fatal("refreshed half-formed pairs locked a real session out")
 	}
-
 }
 
 // Zoned (link-local) senders count against their source like any other.
@@ -319,8 +318,9 @@ func TestRelayFastFloodStillAdmits(t *testing.T) {
 }
 
 // Under a sustained flood of single-pair sources, an initiator's pair
-// waits out its peer's later arrival: the grace covers it, and older flood
-// entries go first.
+// waits out its peer's later arrival: older flood entries go first, so a
+// pair survives one full table turnover (64 slots at 10 announces a second
+// is about 6s, longer than the peer's 3s).
 func TestRelayPairSurvivesFloodUntilPeerArrives(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(84)), Rand: rng(85)})
 	src := 0
@@ -335,10 +335,54 @@ func TestRelayPairSurvivesFloodUntilPeerArrives(t *testing.T) {
 	start := t0.Add(20 * time.Second)
 	announceAt(t, r, start, addr(2), krpc.NodeID{30})
 	for s := 1; s <= 3; s++ {
-		flood(start.Add(time.Duration(s)*time.Second), 32)
+		flood(start.Add(time.Duration(s)*time.Second), 10)
 	}
 	announceAt(t, r, start.Add(3*time.Second), addr(3), krpc.NodeID{30})
 	if r.RelayPairs() != 1 {
 		t.Fatal("the flood evicted the initiator's pair before its peer arrived")
+	}
+}
+
+// One subscriber behind a shared address refreshing its half-formed pairs
+// can't pin that address's budget: at the cap, its oldest stale pair makes
+// way for the next session from the address.
+func TestRelayPendingCapRecyclesStalePairs(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(86)), Rand: rng(87)})
+	shared := netip.MustParseAddr("100.64.0.1")
+	for i := range maxPendingPerSource {
+		announce(t, r, netip.AddrPortFrom(shared, uint16(3000+i)), krpc.NodeID{31, byte(i)})
+	}
+	later := t0.Add(evictGrace + time.Second)
+	for i := range maxPendingPerSource { // refreshed, still pending
+		announceAt(t, r, later, netip.AddrPortFrom(shared, uint16(3000+i)), krpc.NodeID{31, byte(i)})
+	}
+	announceAt(t, r, later, netip.AddrPortFrom(shared, 4000), krpc.NodeID{32})
+	announceAt(t, r, later, addr(5), krpc.NodeID{32})
+	if r.RelayPairs() != 1 {
+		t.Fatal("refreshed pairs pinned the shared address's budget")
+	}
+}
+
+// When every pair is young, the fallback evicts the heaviest source's
+// oldest pair, so a newcomer's fresh pair survives the next flood announces.
+func TestRelayFallbackSparesNewcomer(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(88)), Rand: rng(89)})
+	src := 0
+	next := func(at time.Time) {
+		a := netip.AddrPortFrom(netip.AddrFrom4([4]byte{11, byte(src >> 8), byte(src), 1}), 6881)
+		announceAt(t, r, at, a, krpc.NodeID{33, byte(src >> 8), byte(src)})
+		src++
+	}
+	for i := range 4 * r.cfg.MaxRelayPairs {
+		next(t0.Add(time.Duration(i) * 100 * time.Millisecond))
+	}
+	at := t0.Add(6500 * time.Millisecond) // every flood pair still within grace
+	announceAt(t, r, at, addr(2), krpc.NodeID{34})
+	for i := range 8 {
+		next(at.Add(time.Duration(i+1) * 150 * time.Millisecond))
+	}
+	announceAt(t, r, at.Add(1500*time.Millisecond), addr(3), krpc.NodeID{34})
+	if r.RelayPairs() != 1 {
+		t.Fatal("the next flood announces evicted the newcomer's pair")
 	}
 }
