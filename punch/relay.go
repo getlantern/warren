@@ -9,8 +9,10 @@ import (
 	"github.com/getlantern/warren/krpc"
 )
 
-// Relay fallback: both sides bind socket 0 to the initiator's chosen DHT
+// Relay fallback: both sides bind socket 0 to the agreed DHT
 // router with get_peers then announce_peer on a secret-derived info-hash.
+// The initiator offers candidate routers and the responder picks one (a
+// relay-only responder only ever picks a router it already knows).
 // The router pairs the two announcers and forwards non-KRPC datagrams
 // between them. Probes through it are 20-byte datagrams shaped like a uTP
 // ST_SYN (and ST_STATE for the reply) whose remaining bytes are a MAC, so

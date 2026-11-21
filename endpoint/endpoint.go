@@ -319,9 +319,14 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}); err != nil {
 		return
 	}
-	if !e.limiter.allow(in.Caller, offer.Candidates, relay, heavy, time.Now()) {
+	if e.cfg.RelayOnly && !relay.IsValid() {
+		return // no router we trust to relay through: refuse rather than leak
+	}
+	if !e.limiter.allow(in.Caller, offer.Candidates, chargedRelay(e.cfg.RelayOnly, relay), heavy, time.Now()) {
 		return
 	}
+	// The relay chosen here is final: the session uses exactly this one (or
+	// none).
 	sess, r, conn, err := e.prepare(ctx, punch.Config{Relay: relay})
 	if err != nil {
 		return
@@ -392,6 +397,19 @@ func locals(c *net.UDPConn) []netip.AddrPort {
 }
 
 const maxRelayCandidates = 8
+
+// chargedRelay is the relay address the inbound limiter budgets. A relay
+// taken on the caller's word is a third party we would contact for a
+// stranger, so it is budgeted like any probed host. A relay-only listener
+// relays only through routers it already knows, which a caller cannot aim
+// at anyone; budgeting those by address would let three offers a minute
+// lock out every caller that falls back to our own closest router.
+func chargedRelay(relayOnly bool, relay netip.AddrPort) netip.AddrPort {
+	if relayOnly {
+		return netip.AddrPort{}
+	}
+	return relay
+}
 
 // chooseRelay picks, as the listener, the relay both sides will use. A relay
 // learns both addresses, so a relay-only listener uses only a router it

@@ -160,3 +160,22 @@ func TestChooseRelay(t *testing.T) {
 		t.Errorf("relay-only, none known: got %v, want our own contact", got)
 	}
 }
+
+// A relay-only listener that falls back to its own closest router for every
+// caller must not lock itself out after a handful of offers: that router is
+// one we chose, so it is not budgeted by address.
+func TestRelayOnlyFallbackNotLockedOut(t *testing.T) {
+	var l inboundLimiter
+	own := netip.MustParseAddrPort("2.176.0.9:6881")
+	unknown := []netip.AddrPort{netip.MustParseAddrPort("6.6.6.6:6881")}
+	none := func(netip.AddrPort) bool { return false }
+	for i := range 2 * perNetworkMax {
+		relay := chooseRelay(true, unknown, []netip.AddrPort{own}, none)
+		if !l.allow(caller(byte(i)), ap(fmtAddr(i)), chargedRelay(true, relay), false, now) {
+			t.Fatalf("caller %d refused: the listener's own fallback relay was rate limited", i)
+		}
+	}
+	if chargedRelay(false, own) != own {
+		t.Fatal("a relay taken on the caller's word must still be budgeted")
+	}
+}

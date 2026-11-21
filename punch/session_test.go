@@ -177,3 +177,13 @@ func TestRelayAgreement(t *testing.T) {
 		t.Errorf("responder without a choice: got %v, want the initiator's first", got)
 	}
 }
+
+// A relay-only responder with no relay of its own choosing must not fall
+// back to the initiator's unauthenticated candidates.
+func TestRelayOnlyResponderIgnoresOfferedRelays(t *testing.T) {
+	s := New(Config{RelayOnly: true, Rand: rand.New(rand.NewPCG(8, 8))})
+	offered := Offer{Relays: []netip.AddrPort{netip.MustParseAddrPort("6.6.6.6:6881")}, Relay: netip.MustParseAddrPort("6.6.6.7:6881")}
+	if got := s.chooseRelay(offered); got.IsValid() {
+		t.Fatalf("relay-only responder fell back to the caller's relay %v", got)
+	}
+}

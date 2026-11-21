@@ -240,6 +240,11 @@ func (s *Session) chooseRelay(remote Offer) netip.AddrPort {
 		if s.cfg.Relay.IsValid() {
 			return s.cfg.Relay
 		}
+		if s.cfg.RelayOnly {
+			// Never fall back to the initiator's candidates: they are
+			// unauthenticated, and a relay learns our address.
+			return netip.AddrPort{}
+		}
 		if len(remote.Relays) > 0 {
 			return remote.Relays[0]
 		}
