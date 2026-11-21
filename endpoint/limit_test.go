@@ -150,14 +150,23 @@ func TestChooseRelay(t *testing.T) {
 	a, b, own := netip.MustParseAddrPort("2.176.0.1:6881"), netip.MustParseAddrPort("2.176.0.2:6881"), netip.MustParseAddrPort("2.176.0.9:6881")
 	knowsB := func(r netip.AddrPort) bool { return r == b }
 	none := func(netip.AddrPort) bool { return false }
-	if got, _ := chooseRelay(false, []netip.AddrPort{a, b}, []netip.AddrPort{own}, none); got != a {
-		t.Errorf("not relay-only: got %v, want the caller's first", got)
-	}
-	if got, _ := chooseRelay(true, []netip.AddrPort{a, b}, []netip.AddrPort{own}, knowsB); got != b {
-		t.Errorf("relay-only: got %v, want the first offered relay we know", got)
-	}
-	if got, _ := chooseRelay(true, []netip.AddrPort{a}, []netip.AddrPort{own}, none); got != own {
-		t.Errorf("relay-only, none known: got %v, want our own contact", got)
+	var zero netip.AddrPort
+	for _, tc := range []struct {
+		name          string
+		relayOnly     bool
+		offered       []netip.AddrPort
+		knows         func(netip.AddrPort) bool
+		relay, charge netip.AddrPort
+	}{
+		{"caller's first, charged", false, []netip.AddrPort{a, b}, none, a, a},
+		{"no offer", false, nil, none, zero, zero},
+		{"relay-only, known offered relay, uncharged", true, []netip.AddrPort{a, b}, knowsB, b, zero},
+		{"relay-only, own fallback, uncharged", true, []netip.AddrPort{a}, none, own, zero},
+	} {
+		relay, charge := chooseRelay(tc.relayOnly, tc.offered, []netip.AddrPort{own}, tc.knows)
+		if relay != tc.relay || charge != tc.charge {
+			t.Errorf("%s: got (%v, %v), want (%v, %v)", tc.name, relay, charge, tc.relay, tc.charge)
+		}
 	}
 }
 
