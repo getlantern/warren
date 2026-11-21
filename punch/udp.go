@@ -95,6 +95,9 @@ func (r *Runner) flush() (Event, error) {
 // Gather sends reflection pings and waits until a reflector answers or wait
 // elapses.
 func (r *Runner) Gather(ctx context.Context, reflectors []netip.AddrPort, wait time.Duration) error {
+	if len(reflectors) == 0 {
+		return nil // nothing to wait for
+	}
 	r.s.Reflect(reflectors)
 	if _, err := r.flush(); err != nil {
 		return err

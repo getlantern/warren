@@ -173,7 +173,7 @@ func TestRelayOnlyNeverUsesIPv6(t *testing.T) {
 	if _, err := e.DHT().Bootstrap(ctx, seeds); err != nil {
 		t.Fatal(err)
 	}
-	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: make([]byte, 32)}, true, new(atomic.Int32))
+	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: make([]byte, 32)}, true, true, new(atomic.Int32))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,5 +239,57 @@ func TestProbeableFiltersByFamily(t *testing.T) {
 	}
 	if got := probeable(cands, true, true); len(got) != 2 {
 		t.Fatalf("dual-stack listener charged %v", got)
+	}
+}
+
+// A dual-stack endpoint whose IPv6 DHT node has no contacts (an IPv6 stack
+// but no IPv6 peers) skips the IPv6 leg instead of waiting out a gather
+// with nothing to reflect off.
+func TestEmptyIPv6TableSkipsLeg(t *testing.T) {
+	var seeds4 []netip.AddrPort
+	for _, s := range dualNetwork(t, 6) {
+		if s.Addr().Is4() {
+			seeds4 = append(seeds4, s)
+		}
+	}
+	e := dualPhone(t, seeds4, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: make([]byte, 32)}, true, true, new(atomic.Int32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer abortAll(legs)
+	if took := time.Since(start); took > e.cfg.GatherWait/2 {
+		t.Fatalf("preparing legs took %v with an empty IPv6 table", took)
+	}
+	for _, l := range legs {
+		if l.v6 {
+			t.Fatal("prepared an IPv6 leg with no IPv6 contacts")
+		}
+	}
+}
+
+// A provider runs an IPv4 leg only when the caller offered IPv4 candidates
+// or relays, and an IPv6 leg only for IPv6 candidates it may punch.
+func TestWantFamilies(t *testing.T) {
+	v4c, v6c := netip.MustParseAddrPort("2.10.0.1:4000"), netip.MustParseAddrPort("[2001:db8::1]:4000")
+	relay := netip.MustParseAddrPort("2.176.0.9:6881")
+	for _, tc := range []struct {
+		name         string
+		o            punch.Offer
+		relayOnly    bool
+		want4, want6 bool
+	}{
+		{"IPv6-only caller", punch.Offer{Candidates: []netip.AddrPort{v6c}}, false, false, true},
+		{"IPv4-only caller", punch.Offer{Candidates: []netip.AddrPort{v4c}}, false, true, false},
+		{"dual caller", punch.Offer{Candidates: []netip.AddrPort{v4c, v6c}}, false, true, true},
+		{"relay-only caller", punch.Offer{Relays: []netip.AddrPort{relay}}, false, true, false},
+		{"relay-only listener", punch.Offer{Candidates: []netip.AddrPort{v6c}}, true, true, false},
+	} {
+		if v4, v6 := wantFamilies(tc.o, true, true, tc.relayOnly); v4 != tc.want4 || v6 != tc.want6 {
+			t.Errorf("%s: legs v4=%v v6=%v, want v4=%v v6=%v", tc.name, v4, v6, tc.want4, tc.want6)
+		}
 	}
 }

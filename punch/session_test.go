@@ -503,3 +503,25 @@ func TestSharedClaimCommitsOnePath(t *testing.T) {
 		t.Fatalf("the initiator kept pair %d, which its responder never connected on", kept)
 	}
 }
+
+// A deferred relay session holds its probes until halfway to the deadline,
+// even when relaying is its only strategy, so a racing IPv6 session gets
+// its chance before the relay commits the responder.
+func TestDeferRelayHoldsProbes(t *testing.T) {
+	router := netip.MustParseAddrPort("2.176.0.9:6881")
+	s := New(Config{Initiator: true, Secret: []byte("0123456789abcdef0123456789abcdef"), RelayOnly: true, Relays: []netip.AddrPort{router}, Rand: rand.New(rand.NewPCG(11, 11))})
+	s.DeferRelay()
+	now := time.Unix(1_800_000_000, 0)
+	s.Start(now, Offer{Relay: router})
+	s.relayToken, s.relayBound = []byte("tokn"), true // bound at once
+	probe := relayMAC([]byte("0123456789abcdef0123456789abcdef"), "probe initiator", 4)
+	for t2 := now; t2.Before(now.Add(s.cfg.Deadline/2 - 10*time.Millisecond)); t2 = t2.Add(10 * time.Millisecond) {
+		s.Tick(t2)
+		sends, _ := s.Drain()
+		for _, snd := range sends {
+			if bytes.Equal(snd.Data, probe) {
+				t.Fatalf("relay probe sent %v after start, before half the deadline", t2.Sub(now))
+			}
+		}
+	}
+}

@@ -43,8 +43,9 @@ func (s *Session) startRelay(now time.Time, secret []byte, me, peer string) {
 	s.relayProbe, s.relayAck = relayMAC(secret, "probe "+me, 4), relayMAC(secret, "ack "+me, 2)
 	s.peerProbe, s.peerAck = relayMAC(secret, "probe "+peer, 4), relayMAC(secret, "ack "+peer, 2)
 	s.relayFrom = now
-	if s.strategy != Relay {
-		// A direct path wins if one exists; fall back halfway to the deadline.
+	if s.strategy != Relay || s.relayDeferred {
+		// A direct path wins if one exists, here or on another session
+		// racing alongside; fall back halfway to the deadline.
 		s.relayFrom = now.Add(s.cfg.Deadline / 2)
 	}
 	s.nextRelay = now

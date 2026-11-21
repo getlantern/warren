@@ -580,7 +580,8 @@ own routing table, and `nodes` or `nodes6` in its replies. A query whose
   runs both nodes on the one loop goroutine, so the core stays
   single-threaded and siblings can call each other directly. Operations go to
   both nodes: bootstrap and publish on each, and the first successful get
-  wins. A host without IPv6 runs the IPv4 node alone.
+  wins. A host that can't bind IPv6 runs the IPv4 node alone; one that
+  binds IPv6 but has no IPv6 peers skips the IPv6 leg when connecting.
 - **Signaling.** A provider listens on both nodes, so it has a record under
   each family. A caller signals over every family it has and takes the first
   answer.
@@ -593,7 +594,11 @@ own routing table, and `nodes` or `nodes6` in its replies. A query whose
   common case is a direct simultaneous open. The caller's legs share one
   claim, so only one family is ever nominated and both sides keep the same
   path, and the provider punches a dual-stack caller's offer once though it
-  arrives through both DHTs. The endpoint negotiates relays for its IPv4 leg
+  arrives through both DHTs. While IPv6 races, the IPv4 leg on both sides
+  waits out the head start, and the caller holds IPv4 relay probes until
+  halfway to the deadline, since a relay probe commits the responder. The
+  provider runs an IPv4 leg only for an offer with IPv4 candidates or
+  relays. The endpoint negotiates relays for its IPv4 leg
   only (an IPv6 DHT node still volunteers as a router), and a relay-only
   endpoint never opens an IPv6 leg, since that leg punches directly and
   would reveal its address; it refuses to start without an IPv4 socket.

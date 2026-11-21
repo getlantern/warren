@@ -117,6 +117,16 @@ type Endpoint struct {
 	offers   map[[32]byte]time.Time // recent offer secrets, by hash
 }
 
+// wantFamilies decides which legs a provider runs for an offer: IPv4 when
+// the caller offered IPv4 candidates or relays, IPv6 when it offered IPv6
+// candidates and we may punch directly.
+func wantFamilies(o punch.Offer, has4, has6, relayOnly bool) (v4, v6 bool) {
+	f4 := o.Family(false)
+	v4 = has4 && (len(f4.Candidates) > 0 || len(f4.Relays) > 0 || f4.Relay.IsValid() || relayOnly)
+	v6 = has6 && !relayOnly && len(o.Family(true).Candidates) > 0
+	return v4, v6
+}
+
 // probeable filters candidates to the families we'll run a leg for.
 func probeable(cands []netip.AddrPort, v4, v6 bool) []netip.AddrPort {
 	var out []netip.AddrPort
@@ -273,7 +283,7 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	crand.Read(secret)
 	// The legs share one claim, so only one family is ever nominated and
 	// both sides keep the same path.
-	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: secret}, true, new(atomic.Int32))
+	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: secret}, true, true, new(atomic.Int32))
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +347,7 @@ func (e *Endpoint) families() (v4, v6 bool) {
 // directly, revealing our address). A caller passes claim, which its legs
 // share so that only one commits to a path. It fails only if no leg could
 // be prepared.
-func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV6 bool, claim *atomic.Int32) ([]*leg, error) {
+func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV4, wantV6 bool, claim *atomic.Int32) ([]*leg, error) {
 	has4, has6 := e.families()
 	type prepared struct {
 		l   *leg
@@ -359,7 +369,7 @@ func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV6 bool, claim
 			out[i] = prepared{l, err}
 		})
 	}
-	if has4 {
+	if has4 && wantV4 {
 		add(0, pc, false, 1)
 	}
 	if has6 && wantV6 && !e.cfg.RelayOnly {
@@ -437,6 +447,7 @@ func (e *Endpoint) race(ctx context.Context, legs []*leg, remote punch.Offer, pe
 		var delay time.Duration
 		if !l.v6 && v6Racing {
 			delay = headStart
+			l.sess.DeferRelay() // a relay probe would commit the path before IPv6 has had its chance
 		}
 		running++
 		go func() {
@@ -516,6 +527,12 @@ func (e *Endpoint) prepare(ctx context.Context, pc punch.Config, v6 bool) (*leg,
 	if !found {
 		conn.Close()
 		return nil, errors.New("endpoint: no DHT node for this address family")
+	}
+	if v6 && len(contacts) == 0 {
+		// A host with an IPv6 stack but no IPv6 peers (no route, or none
+		// bootstrapped) has nothing to reflect off or reach.
+		conn.Close()
+		return nil, errors.New("endpoint: no IPv6 DHT contacts")
 	}
 	reflectors := contacts[:min(3, len(contacts))]
 	if pc.Initiator && !v6 {
@@ -602,12 +619,12 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.
-	_, has6 := e.families()
-	wantV6 := has6 && !e.cfg.RelayOnly && len(offer.Family(true).Candidates) > 0
+	has4, has6 := e.families()
+	want4, wantV6 := wantFamilies(offer, has4, has6, e.cfg.RelayOnly)
 	heavy := false
 	if err := e.node.InspectEach(ctx, func(addr netip.AddrPort, d *dht.Node) {
 		v6 := !addr.Addr().Is4()
-		if v6 && !wantV6 {
+		if v6 && !wantV6 || !v6 && !want4 {
 			return
 		}
 		fo := offer.Family(v6)
@@ -634,9 +651,8 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		return // no router we trust to relay through: refuse rather than leak
 	}
 	// Charge only what a leg we'll run can probe.
-	has4, _ := e.families()
-	probed := probeable(offer.Candidates, has4, wantV6)
-	if !has4 {
+	probed := probeable(offer.Candidates, want4, wantV6)
+	if !want4 {
 		charged = netip.AddrPort{} // relays only run over IPv4
 	}
 	if !e.limiter.allow(in.Caller, probed, charged, heavy, time.Now()) {
@@ -644,7 +660,7 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	// The relay chosen here is final: the IPv4 session uses exactly this
 	// one (or none).
-	legs, err := e.legs(ctx, punch.Config{Relay: relay}, wantV6, nil)
+	legs, err := e.legs(ctx, punch.Config{Relay: relay}, want4, wantV6, nil)
 	if err != nil {
 		return
 	}
@@ -653,7 +669,9 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		abortAll(legs)
 		return
 	}
-	c, err := e.race(ctx, legs, offer, in.Caller, offer.Secret, 0)
+	// The IPv4 leg waits out the same head start as the caller's, so when
+	// IPv6 wins quickly a heavy IPv4 strategy is canceled before it sprays.
+	c, err := e.race(ctx, legs, offer, in.Caller, offer.Secret, e.cfg.HeadStart)
 	if err != nil {
 		return
 	}

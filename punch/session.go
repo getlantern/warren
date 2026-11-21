@@ -164,10 +164,13 @@ type Session struct {
 	relayT     map[uint16]relayQuery
 	nextRelay  time.Time // next bind step or probe
 	relayFrom  time.Time // when probing starts
-	relayProbe []byte
-	relayAck   []byte
-	peerProbe  []byte
-	peerAck    []byte
+	// relayDeferred holds relay probing until halfway to the deadline even
+	// when this session has no direct strategy (see DeferRelay).
+	relayDeferred bool
+	relayProbe    []byte
+	relayAck      []byte
+	peerProbe     []byte
+	peerAck       []byte
 	// relayProven: the responder's probe reached the initiator through the
 	// relay. relayUnanswered counts the initiator's probes since then.
 	relayProven     bool
@@ -295,6 +298,12 @@ func probeID(secret []byte, label string) krpc.NodeID {
 	h.Write(secret)
 	return krpc.NodeID(h.Sum(nil))
 }
+
+// DeferRelay, called before Start, holds relay probing until halfway to the
+// deadline even when this session has no direct strategy of its own: a
+// session for another address family is racing alongside and may find a
+// direct path, and an initiator's relay probe commits the responder.
+func (s *Session) DeferRelay() { s.relayDeferred = true }
 
 // Start begins punching toward the peer's offer.
 func (s *Session) Start(now time.Time, remote Offer) {
