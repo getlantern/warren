@@ -246,8 +246,13 @@ func (s *Session) Start(now time.Time, remote Offer) {
 	if !s.cfg.Initiator {
 		s.relay = remote.Relay
 	}
+	sprays := s.strategy == Spray || s.strategy == DoubleBirthday
+	// A responder sprays only a public address. The initiator chose to call
+	// this peer; a responder acts on a stranger's offer, and spraying a
+	// non-public address would probe its own LAN or localhost.
+	publicTarget := s.remoteIP.IsGlobalUnicast() && !s.remoteIP.IsPrivate()
 	noDirect := s.cfg.RelayOnly || len(remote.Candidates) == 0 || s.strategy == Relay ||
-		(s.strategy != Direct && s.strategy != Open && !s.remoteIP.IsValid())
+		(sprays && !s.remoteIP.IsValid()) || (sprays && !s.cfg.Initiator && !publicTarget)
 	if noDirect && !s.relay.IsValid() {
 		s.fail(ErrRelayNeeded)
 		return

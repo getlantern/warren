@@ -268,9 +268,20 @@ from the secret, so an off-path attacker can't forge one. An on-path observer
 who sees a probe could race a copy from its own address and get that address
 nominated. That is accepted: an on-path attacker can already drop the
 packets, and impersonation still fails, because hysteria2 pins the provider's
-key and derives its password from the secret. Inbound punches are rate-limited
-per candidate /24 (or /48) and globally (`endpoint/limit.go`), so a forged
-offer naming a victim can't turn a listener into a probe reflector.
+key and derives its password from the secret.
+
+**Inbound punches are rate-limited** (`endpoint/limit.go`), so a forged offer
+naming a victim can't turn a listener into a probe reflector:
+- per caller key, checked first so one key can't spend the shared budgets;
+- per probed network: public candidates by /24 (or /48), non-public ones and
+  the relay by exact address;
+- a global budget, charged only for punches that may spray.
+
+A responder also never sprays a non-public address. Doing so would port-scan
+its own LAN or localhost on a stranger's request. LAN candidates get only
+direct probes. Keys are free to mint, so a determined attacker can still
+exhaust the global spray budget; `Authorize` is the defense for a listener
+under attack.
 
 **The initiator nominates** the first confirmed path. Responses are matched by
 **transaction ID, not source address**, as ICE does. Under dependent mapping a

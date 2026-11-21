@@ -242,7 +242,8 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.
-	if !e.limiter.allow(offer.Candidates, time.Now()) {
+	spray := offer.Profile.Mapping == punch.MappingDependent
+	if !e.limiter.allow(in.Caller, offer.Candidates, offer.Relay, spray, time.Now()) {
 		return
 	}
 	if e.cfg.RelayOnly && offer.Relay.IsValid() {
