@@ -431,3 +431,35 @@ func TestUnansweredOfferNotSentToCopies(t *testing.T) {
 		t.Fatal("a copy got an answer to an offer that was never answered")
 	}
 }
+
+// When our own answer fails, the queued copy is tried without making the
+// answer visible: a copy arriving meanwhile is queued, not answered, and is
+// dropped if nobody got the answer.
+func TestFailedAnswerStaysInvisible(t *testing.T) {
+	node, err := driver.Listen("127.0.0.1:0", member(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	e := &Endpoint{node: node} // its Answers fail: no session is known
+
+	queued := &offerEntry{done: make(chan struct{})}
+	queued.copyOf(dht.SessionID{1})
+	if n := e.deliverQueued(context.Background(), queued, []byte("answer")); n != 0 {
+		t.Fatalf("delivered to %d copies through a node that knows no session", n)
+	}
+	select {
+	case <-queued.done:
+		t.Fatal("trying the queued copy made the answer visible")
+	default:
+	}
+
+	gap := &offerEntry{done: make(chan struct{})}
+	e.deliverQueued(context.Background(), gap, []byte("answer"))
+	if _, now := gap.copyOf(dht.SessionID{2}); now {
+		t.Fatal("a copy arriving after a failed answer got it")
+	}
+	if left := gap.publish(nil); len(left) != 0 {
+		t.Fatalf("publishing no answer returned copies to answer: %v", left)
+	}
+}
