@@ -117,3 +117,27 @@ func TestAbortUnblocksReader(t *testing.T) {
 		t.Fatal("Abort did not stop a blocked reader")
 	}
 }
+
+// Extra sockets open on the base socket's IP and family, IPv6 included.
+func TestExtraSocketsMatchIPv6Base(t *testing.T) {
+	base, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	defer base.Close()
+	s := New(Config{Initiator: true, Secret: []byte("0123456789abcdef0123456789abcdef"), Local: Profile{Mapping: MappingDependent, Allocation: AllocRandom}, Rand: rand.New(rand.NewPCG(9, 9))})
+	s.Start(time.Now(), Offer{Candidates: []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::1]:40000")}, Profile: Profile{Mapping: MappingIndependent}})
+	if s.Sockets() < 2 {
+		t.Fatalf("plan opens %d sockets; the test needs extras", s.Sockets())
+	}
+	r := NewRunner(s, base)
+	defer r.Abort()
+	if _, err := r.flush(); err != nil {
+		t.Fatalf("opening extra sockets on an IPv6 base: %v", err)
+	}
+	for i, c := range r.conns {
+		if ip := c.LocalAddr().(*net.UDPAddr).IP; !ip.Equal(net.IPv6loopback) {
+			t.Fatalf("socket %d bound to %v, want ::1", i, ip)
+		}
+	}
+}

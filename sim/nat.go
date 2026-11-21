@@ -164,7 +164,9 @@ func (n *NAT) allocate(localPort uint16, now time.Time) (uint16, bool) {
 	}
 	switch n.cfg.Alloc {
 	case PortPreserving:
-		if n.free(localPort) {
+		// Preserve only within the allocation range: the quota above
+		// counts every mapping against that range's size.
+		if lp := int(localPort); lp >= lo && lp <= hi && n.free(localPort) {
 			return localPort, true
 		}
 		return random()

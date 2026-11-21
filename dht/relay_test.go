@@ -93,3 +93,25 @@ func TestRelayPairLimit(t *testing.T) {
 	}
 	_ = time.Second
 }
+
+// One bound address announcing many fresh info-hashes must not fill the
+// pair table with empty pairs and lock out legitimate sessions.
+func TestRelayBoundAddressCannotFillTable(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(58)), Rand: rng(59)})
+	a := addr(1)
+	for i := range 4*r.cfg.MaxRelayPairs + 8 {
+		announce(t, r, a, krpc.NodeID{9, byte(i), byte(i >> 8)})
+	}
+	if got := len(r.rel.pairs); got != 1 {
+		t.Fatalf("one address created %d pairs", got)
+	}
+	announce(t, r, addr(2), krpc.NodeID{10})
+	announce(t, r, addr(3), krpc.NodeID{10})
+	if r.RelayPairs() != 1 {
+		t.Fatalf("a legitimate pair could not form: %d active", r.RelayPairs())
+	}
+	announce(t, r, a, krpc.NodeID{9, 0, 0}) // refreshing its own pair still works
+	if p := r.rel.byAddr[a]; p == nil || p != r.rel.pairs[krpc.NodeID{9, 0, 0}] {
+		t.Fatal("bound address lost its own pair")
+	}
+}

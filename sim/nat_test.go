@@ -33,3 +33,21 @@ func TestSequentialAllocatorNonCoprimeStep(t *testing.T) {
 		t.Fatal("allocator looped forever")
 	}
 }
+
+// A port-preserving NAT preserves only ports inside its allocation range;
+// outside it, it allocates in range, so the quota counts the right ports.
+func TestPortPreservingStaysInRange(t *testing.T) {
+	n := NewNAT(NATConfig{Public: netip.MustParseAddr("5.5.5.5"), Mapping: EndpointIndependentMapping,
+		Alloc: PortPreserving, BlockLo: 2048, BlockHi: 2049}, rand.New(rand.NewPCG(2, 2)))
+	now := time.Unix(1_800_000_000, 0)
+	dst := netip.MustParseAddrPort("9.9.9.9:1")
+	for _, lp := range []uint16{4000, 4001} {
+		m, ok := n.Outbound(netip.AddrPortFrom(netip.MustParseAddr("192.168.0.2"), lp), dst, now)
+		if !ok || m.Port() < 2048 || m.Port() > 2049 {
+			t.Fatalf("local port %d mapped to %v (ok=%v), want a port in 2048–2049", lp, m, ok)
+		}
+	}
+	if m, ok := n.Outbound(netip.MustParseAddrPort("192.168.0.2:2048"), dst, now); ok {
+		t.Fatalf("a third mapping fit in a two-port range: %v", m)
+	}
+}

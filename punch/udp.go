@@ -63,8 +63,12 @@ func (r *Runner) add(c *net.UDPConn) {
 
 func (r *Runner) flush() (Event, error) {
 	base := r.conns[0].LocalAddr().(*net.UDPAddr)
+	network := "udp6"
+	if base.IP.To4() != nil {
+		network = "udp4"
+	}
 	for len(r.conns) < r.s.Sockets() {
-		c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: base.IP})
+		c, err := net.ListenUDP(network, &net.UDPAddr{IP: base.IP, Zone: base.Zone})
 		if err != nil {
 			return nil, err
 		}

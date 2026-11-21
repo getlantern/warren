@@ -42,6 +42,12 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 		r.pairs, r.byAddr = map[krpc.NodeID]*relayPair{}, map[netip.AddrPort]*relayPair{}
 	}
 	p := r.pairs[infoHash]
+	if bound := r.byAddr[from]; bound != nil && bound != p {
+		// An address relays one pair; refuse before allocating, or one
+		// source could fill the table with empty pairs under fresh
+		// info-hashes.
+		return
+	}
 	if p == nil {
 		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs {
 			return
