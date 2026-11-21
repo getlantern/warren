@@ -445,8 +445,9 @@ infrastructure.
   half-formed pair rather than refusing new ones: from the source holding
   the most, oldest created first, never one created less than ten seconds
   ago (long enough for its peer to arrive), unless every pair is that
-  young, in which case the oldest pair of any source no lighter than the
-  newcomer's goes. At its cap, a source's own oldest stale pair makes way, so one
+  young, in which case the oldest pair of another source no lighter than
+  the newcomer's goes (a newcomer whose source is strictly the heaviest is
+  refused until a pair passes its grace, and retries). At its cap, a source's own oldest stale pair makes way, so one
   subscriber behind a shared address can't pin its budget. Creation time,
   not activity, decides, so refreshing can't protect a pair. Under a flood
   from many single-pair sources the router can't tell newcomers from

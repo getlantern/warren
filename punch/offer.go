@@ -95,6 +95,17 @@ func (o *Offer) Marshal() []byte {
 	return append(b, 'e')
 }
 
+// parseAddr reads a compact address in canonical form: IPv4-mapped
+// addresses (an 18-byte encoding of an IPv4 peer) are unmapped, so they
+// compare equal to what sockets report, and port 0 is rejected.
+func parseAddr(b []byte) (netip.AddrPort, bool) {
+	a, ok := krpc.ParseCompactAddr(b)
+	if !ok || a.Port() == 0 {
+		return netip.AddrPort{}, false
+	}
+	return unmapAddr(a), true
+}
+
 func UnmarshalOffer(b []byte) (Offer, error) {
 	var o Offer
 	v, err := bencode.Decode(b)
@@ -103,7 +114,7 @@ func UnmarshalOffer(b []byte) (Offer, error) {
 	}
 	if c, ok := v.Get("c"); ok && c.Kind == bencode.List {
 		for _, item := range c.List[:min(len(c.List), maxCandidates)] {
-			if a, ok := krpc.ParseCompactAddr(item.Str); ok && a.Port() != 0 {
+			if a, ok := parseAddr(item.Str); ok {
 				o.Candidates = append(o.Candidates, a)
 			}
 		}
@@ -119,11 +130,11 @@ func UnmarshalOffer(b []byte) (Offer, error) {
 		BlockLo: uint16(s[4])<<8 | uint16(s[5]), BlockHi: uint16(s[6])<<8 | uint16(s[7]),
 	}
 	if r, ok := v.Get("r"); ok && r.Kind == bencode.String {
-		o.Relay, _ = krpc.ParseCompactAddr(r.Str)
+		o.Relay, _ = parseAddr(r.Str)
 	}
 	if rs, ok := v.Get("rs"); ok && rs.Kind == bencode.List {
 		for _, item := range rs.List[:min(len(rs.List), maxRelays)] {
-			if a, ok := krpc.ParseCompactAddr(item.Str); ok && a.Port() != 0 {
+			if a, ok := parseAddr(item.Str); ok {
 				o.Relays = append(o.Relays, a)
 			}
 		}

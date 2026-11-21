@@ -41,12 +41,15 @@ const relayIdle = time.Minute
 //     one) holds at most maxPendingPerSource half-formed pairs; at the cap,
 //     its own oldest pair past evictGrace makes way, so one subscriber
 //     behind a shared address can't pin its budget by refreshing. When the
-//     table is full, a half-formed pair is evicted rather than new ones
+//     table is full, a half-formed pair is evicted rather than the newcomer
 //     refused: from the source holding the most, oldest created first,
 //     never one created less than evictGrace ago (long enough for the peer
-//     to arrive). Creation time, not activity, decides both, so refreshing
-//     can't protect a pair or pin a slot. Clients re-announce until
-//     paired, so an evicted pair is rebuilt.
+//     to arrive). If every pair is that young, the oldest pair of another
+//     source no lighter than the newcomer's goes; a newcomer whose source
+//     is strictly the heaviest is refused until a pair passes its grace.
+//     Creation time, not activity, decides, so refreshing can't protect a
+//     pair or pin a slot. Clients re-announce until paired, so an evicted
+//     or refused pair is retried.
 //   - A source pairs with itself at most maxSelfPairs times; only
 //     subscribers sharing one CGNAT IP need that at all.
 //
@@ -100,9 +103,10 @@ func (r *relay) count(src netip.Prefix) (pending, self int) {
 // refreshes don't extend that), ties broken by info-hash for
 // determinism. If every pair is within its grace, a fast flood would
 // otherwise lock new sessions out, so it evicts the oldest pair of any
-// source holding at least as many half-formed pairs as the announcer's:
-// first in, first out, so a fresh pair survives a full table turnover.
-// It reports whether it found one.
+// other source holding at least as many half-formed pairs as the
+// announcer's: first in, first out, so a fresh pair survives a full table
+// turnover. It reports whether it found one; it finds none when the
+// announcer's source is strictly the heaviest.
 func (r *relay) evictPending(now time.Time, announcer netip.Prefix) bool {
 	perSource := map[netip.Prefix]int{}
 	for _, q := range r.pairs {

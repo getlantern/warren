@@ -2,6 +2,7 @@ package punch
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand/v2"
 	"net/netip"
 	"testing"
@@ -383,5 +384,39 @@ func TestRelayReplyMustComeFromRelay(t *testing.T) {
 	s.HandlePacket(now, 0, netip.MustParseAddrPort("6.6.6.6:6881"), krpc.AppendMarshal(nil, &r))
 	if s.relayToken != nil {
 		t.Fatal("a reply from a stranger set the relay token")
+	}
+}
+
+// Offers are parsed into canonical addresses: an 18-byte IPv4-mapped
+// candidate or relay comes out unmapped (so it matches what sockets and
+// routing tables hold), and a relay with port 0 is dropped.
+func TestUnmarshalOfferCanonicalAddresses(t *testing.T) {
+	mapped := func(a string, port uint16) string {
+		ip := netip.MustParseAddr(a).As16()
+		ip[10], ip[11] = 0xff, 0xff
+		return string(ip[:]) + string([]byte{byte(port >> 8), byte(port)})
+	}
+	v4 := func(a string, port uint16) string {
+		ip := netip.MustParseAddr(a).As4()
+		return string(ip[:]) + string([]byte{byte(port >> 8), byte(port)})
+	}
+	str := func(s string) string { return fmt.Sprintf("%d:%s", len(s), s) }
+	raw := "d1:cl" + str(mapped("203.0.113.5", 4000)) + "e" +
+		"1:p" + str(string(make([]byte, 8))) +
+		"1:r" + str(v4("198.51.100.7", 0)) +
+		"2:rsl" + str(mapped("198.51.100.8", 6881)) + "e" +
+		"e"
+	o, err := UnmarshalOffer([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Candidates) != 1 || o.Candidates[0] != netip.MustParseAddrPort("203.0.113.5:4000") {
+		t.Fatalf("candidates %v, want the unmapped 203.0.113.5:4000", o.Candidates)
+	}
+	if len(o.Relays) != 1 || o.Relays[0] != netip.MustParseAddrPort("198.51.100.8:6881") {
+		t.Fatalf("relays %v, want the unmapped 198.51.100.8:6881", o.Relays)
+	}
+	if o.Relay.IsValid() {
+		t.Fatalf("a port-0 relay %v was accepted", o.Relay)
 	}
 }

@@ -414,4 +414,12 @@ func TestRelayFallbackSparesAnnouncersOwnPairs(t *testing.T) {
 			t.Fatalf("the shared address's session %d was evicted by its own newer one", i)
 		}
 	}
+	if r.rel.pairs[krpc.NodeID{36, 3}] != nil {
+		t.Fatal("the strictly heaviest source's newcomer was admitted by evicting a lighter source")
+	}
+	// A lighter newcomer is still admitted under the same young flood.
+	announceAt(t, r, t0.Add(time.Second), addr(7), krpc.NodeID{38})
+	if r.rel.pairs[krpc.NodeID{38}] == nil {
+		t.Fatal("a lighter newcomer was refused under a young flood")
+	}
 }
