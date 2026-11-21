@@ -196,3 +196,30 @@ func TestLibtorrentWireHabits(t *testing.T) {
 		t.Errorf("ping response p=%d ip=%v v=%q", r.R.P, r.IP, r.V)
 	}
 }
+
+// A failing entry that answers from a new address moves only if a newcomer
+// could take that address: never onto an IP another entry holds.
+func TestFailingEntryMoveRevalidated(t *testing.T) {
+	r := rng(16)
+	self := outsiderID(r)
+	tb := newTable(self, 8, false, func(krpc.NodeID, netip.Addr) bool { return true })
+	at := func(b byte) netip.AddrPort { return netip.AddrPortFrom(netip.AddrFrom4([4]byte{9, b, 0, 1}), 6881) }
+	a, b := outsiderID(r), outsiderID(r)
+	tb.heard(a, at(1), t0)
+	tb.heard(b, at(2), t0)
+	tb.failed(at(2), 5)
+	tb.heard(b, at(1), t0) // b claims a's address
+	if e := tb.byIP[tb.key(at(1))]; e == nil || e.id != a {
+		t.Fatalf("a's index entry was overwritten by a move: %+v", e)
+	}
+	if e := tb.get(b); e == nil || e.addr != at(2) {
+		t.Fatalf("b moved onto an occupied IP: %+v", e)
+	}
+	tb.heard(b, at(3), t0) // a free address is fine
+	if e := tb.get(b); e == nil || e.addr != at(3) || tb.byIP[tb.key(at(3))] != e {
+		t.Fatalf("legitimate move refused: %+v", e)
+	}
+	if tb.byIP[tb.key(at(2))] != nil {
+		t.Fatal("old address still indexed after the move")
+	}
+}

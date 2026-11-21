@@ -47,10 +47,17 @@ func MappingTimeout(ctx context.Context, reflector netip.AddrPort, gaps []time.D
 	p := &prober{cfg: Config{QueryTimeout: 3 * time.Second}, rep: &Report{Versions: map[string]int{}}}
 	p.cfg.defaults()
 	results := make([]GapResult, len(gaps))
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var wg sync.WaitGroup
 	for i, gap := range gaps {
 		s, err := p.open(i, true)
 		if err != nil {
+			// Stop and join the probes already running: each holds a socket
+			// for its whole gap, and running out of sockets is the likely
+			// cause of this error.
+			cancel()
+			wg.Wait()
 			return TimeoutResult{}, err
 		}
 		wg.Go(func() {

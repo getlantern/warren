@@ -10,7 +10,7 @@ Each is a separate one-off:
 
 | Mechanism | Where | What it does | Server |
 |---|---|---|---|
-| `utpshape` | `warren/utpshape/utpshape.go` | 20-byte BitTorrent uTP header, SYN→STATE handshake, AES-CTR payload with the header as IV | must unwrap |
+| `utpshape` | `warren/utpshape/utpshape.go` | 20-byte BitTorrent uTP header, SYN→STATE handshake, AES-CTR payload with a nonce taken from the header | must unwrap |
 | `pre_initial_junk` | `lantern-box/protocol/hysteria2x/outbound.go:139` | one random 8–64 byte datagram on each new UDP flow, before the Initial | stock |
 | `quicprelude` | `outline-sdk/x/quicprelude` | invalid Initial-shaped datagram before each packet that may carry a ClientHello | stock |
 | Salamander | `sing-quic/hysteria2/salamander.go` | 8-byte random salt, BLAKE2b-derived XOR | stock (sing-quic native) |
@@ -276,14 +276,18 @@ tell a client from a prober.
 **`cipher` stage.** It encrypts the bytes after the headers of earlier stages.
 
 ```jsonc
-{ "cipher": "aes-256-ctr", "iv": { "header_bytes": [2, 18] } }      // utpshape
+{ "cipher": "aes-256-ctr", "iv": { "header_bytes": [[2, 12], [16, 18]], "block_counter": 4 } } // utpshape
 { "cipher": "blake2b256-xor", "salt": "salt" }                      // Salamander: key = BLAKE2b-256(key ‖ salt), repeated
 { "cipher": "chacha20", "nonce": ["seq", "ts"], "nonce_pad": "key" }
 ```
 
 The compiler requires the IV or nonce to include a `counter`, `timestamp` or
 `random` field that changes on every packet and has at least 32 bits of
-entropy in total. Otherwise the spec is rejected. The QUIC payload is already
+entropy in total. For a counter-mode cipher the IV must also end in a
+dedicated `block_counter` of at least 4 bytes, starting at zero, so the
+per-packet fields sit in the nonce rather than in the bits CTR increments.
+Without it, two packets with consecutive sequence numbers and the same
+timestamp share keystream. A spec that breaks either rule is rejected. The QUIC payload is already
 encrypted and authenticated, so keystream reuse wouldn't expose user data. It
 would expose the XOR of two QUIC headers, though, and that is a fingerprint.
 
@@ -437,7 +441,7 @@ stages, exactly as in `GeckoPacketConn.WriteTo`. The bandit can now vary
       },
       "unauthenticated_replies": "mimic"
     },
-    { "cipher": "aes-256-ctr", "iv": { "header_bytes": [2, 18] } }
+    { "cipher": "aes-256-ctr", "iv": { "header_bytes": [[2, 12], [16, 18]], "block_counter": 4 } }
   ]},
   "expect": { "overhead": 20, "class": "engine" }
 }
@@ -480,7 +484,7 @@ keepalive, and frames QUIC as DTLS 1.2 `application_data` records:
         { "name": "seq",     "bytes": 6, "kind": "counter", "start": "random", "advance": "on_send" },
         { "name": "len",     "bytes": 2, "kind": "length", "of": "payload" }
     ]},
-    { "cipher": "aes-256-ctr", "iv": { "header_bytes": [3, 11] }, "iv_pad": "key" }
+    { "cipher": "aes-256-ctr", "iv": { "header_bytes": [3, 11] }, "iv_pad": "key", "block_counter": 4 }
   ]},
   "expect": { "overhead": 15, "class": "engine" }
 }

@@ -279,8 +279,11 @@ func (p *prober) listen(ctx context.Context, s *sock) {
 	p.mu.Unlock()
 }
 
+// listenUDP opens probe sockets; tests replace it to simulate exhaustion.
+var listenUDP = net.ListenUDP
+
 func (p *prober) open(idx int, readOnly bool) (*sock, error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	conn, err := listenUDP("udp4", &net.UDPAddr{})
 	if err != nil {
 		return nil, err
 	}

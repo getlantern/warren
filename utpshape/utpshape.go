@@ -7,9 +7,9 @@
 // IDs, incrementing sequence numbers, acknowledgements of the peer's
 // sequence, and microsecond timestamps. Connections open with an empty
 // ST_SYN answered by ST_STATE, as uTP's do. The payload is encrypted with
-// AES-CTR, so it looks like BitTorrent's encrypted (MSE) streams. The IV is
-// the header's own connection ID, timestamps, window and sequence number, so
-// the only overhead is the header itself.
+// AES-CTR, so it looks like BitTorrent's encrypted (MSE) streams. The nonce
+// is the header's own connection ID, timestamps and sequence number, so the
+// only overhead is the header itself.
 //
 // The layer hides; it does not authenticate. It is meant to carry protocols
 // that authenticate every packet themselves, such as QUIC. Packets that fail
@@ -131,11 +131,16 @@ func (c *Conn) header(h []byte, p *peer, typ byte, connID uint16) {
 	binary.BigEndian.PutUint16(h[18:], p.ack)
 }
 
-// xor applies the payload keystream. The IV is header bytes 2–18: connection
-// ID, timestamp, timestamp difference, window, and sequence number. The
-// microsecond timestamp and sequence number keep it unique per packet.
+// xor applies the payload keystream. The counter block is a 12-byte packet
+// nonce (the header's connection ID, timestamp, timestamp difference and
+// sequence number) followed by a 4-byte block counter starting at zero, so
+// packets that share a timestamp never share keystream: the sequence
+// number sits in the nonce, not in the bits CTR increments.
 func (c *Conn) xor(dst, src, h []byte) {
-	cipher.NewCTR(c.block, h[2:18]).XORKeyStream(dst, src)
+	var iv [aes.BlockSize]byte
+	copy(iv[0:10], h[2:12])
+	copy(iv[10:12], h[16:18])
+	cipher.NewCTR(c.block, iv[:]).XORKeyStream(dst, src)
 }
 
 func (c *Conn) peer(addr netip.AddrPort, now time.Time) *peer {

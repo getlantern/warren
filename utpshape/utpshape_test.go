@@ -2,6 +2,7 @@ package utpshape
 
 import (
 	"bytes"
+	"crypto/aes"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -317,3 +318,30 @@ func TestOversizedDatagramDropped(t *testing.T) {
 		t.Fatalf("got %q, %v; want the oversized datagram skipped", buf[:n], err)
 	}
 }
+
+// Two packets in the same microsecond, with consecutive sequence numbers,
+// must not share keystream: before the fix, packet N's second block used
+// the counter of packet N+1's first.
+func TestSameTimestampNoKeystreamReuse(t *testing.T) {
+	c := New(nopConn{}, []byte("key"))
+	h1 := make([]byte, HeaderLen)
+	binary.BigEndian.PutUint16(h1[2:], 7)
+	binary.BigEndian.PutUint32(h1[4:], 123456)
+	binary.BigEndian.PutUint32(h1[12:], advertisedWindow)
+	binary.BigEndian.PutUint16(h1[16:], 100)
+	h2 := append([]byte(nil), h1...)
+	binary.BigEndian.PutUint16(h2[16:], 101)
+	zeros := make([]byte, 4*aes.BlockSize)
+	k1, k2 := make([]byte, len(zeros)), make([]byte, len(zeros))
+	c.xor(k1, zeros, h1)
+	c.xor(k2, zeros, h2)
+	for i := 0; i < len(k1); i += aes.BlockSize {
+		for j := 0; j < len(k2); j += aes.BlockSize {
+			if bytes.Equal(k1[i:i+aes.BlockSize], k2[j:j+aes.BlockSize]) {
+				t.Fatalf("packet %d block %d reuses packet %d block %d keystream", 100, i/aes.BlockSize, 101, j/aes.BlockSize)
+			}
+		}
+	}
+}
+
+type nopConn struct{ net.PacketConn }

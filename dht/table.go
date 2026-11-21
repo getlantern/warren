@@ -103,7 +103,10 @@ func (t *table) get(id krpc.NodeID) *entry {
 	return nil
 }
 
-func (t *table) admissible(id krpc.NodeID, addr netip.AddrPort, b *bucket) bool {
+// admissible reports whether id at addr may join bucket b. skip, if set, is
+// an entry moving to addr: it is left out of the bucket's prefix count (the
+// caller has already unindexed it).
+func (t *table) admissible(id krpc.NodeID, addr netip.AddrPort, b *bucket, skip *entry) bool {
 	ip := addr.Addr().Unmap()
 	if id == t.self || !t.accept(id, ip) || t.byIP[t.key(addr)] != nil {
 		return false
@@ -117,7 +120,7 @@ func (t *table) admissible(id krpc.NodeID, addr netip.AddrPort, b *bucket) bool 
 	}
 	n := 0
 	for _, e := range b.nodes {
-		if prefixOf(e.addr.Addr()) == p {
+		if e != skip && prefixOf(e.addr.Addr()) == p {
 			n++
 		}
 	}
@@ -146,14 +149,20 @@ func (t *table) heard(id krpc.NodeID, addr netip.AddrPort, now time.Time) {
 			if e.fails == 0 {
 				return
 			}
+			// A move is a new admission: the new address must pass the same
+			// BEP 42, occupancy and prefix checks a newcomer would.
 			t.unindex(e)
+			if !t.admissible(id, addr, b, e) {
+				t.index(e)
+				return
+			}
 			e.addr = addr
 			t.index(e)
 		}
 		e.lastResp, e.fails = now, 0
 		return
 	}
-	if !t.admissible(id, addr, b) {
+	if !t.admissible(id, addr, b, nil) {
 		return
 	}
 	e := &entry{id: id, addr: addr, lastResp: now}
@@ -199,7 +208,7 @@ func (t *table) failed(addr netip.AddrPort, threshold int) (promoted *entry) {
 	for i := len(b.cache) - 1; i >= 0; i-- {
 		c := b.cache[i]
 		b.cache = slices.Delete(b.cache, i, i+1)
-		if t.admissible(c.id, c.addr, b) {
+		if t.admissible(c.id, c.addr, b, nil) {
 			c.fails = 0
 			b.nodes = append(b.nodes, c)
 			t.index(c)
@@ -218,7 +227,7 @@ func (t *table) wantsVerify(id krpc.NodeID, addr netip.AddrPort) bool {
 		return false
 	}
 	b := t.bucketFor(id)
-	if !t.admissible(id, addr, b) {
+	if !t.admissible(id, addr, b, nil) {
 		return false
 	}
 	if len(b.nodes) < t.k {
