@@ -151,19 +151,22 @@ func TestChooseRelay(t *testing.T) {
 	knowsB := func(r netip.AddrPort) bool { return r == b }
 	none := func(netip.AddrPort) bool { return false }
 	var zero netip.AddrPort
+	mine := []netip.AddrPort{own}
 	for _, tc := range []struct {
 		name          string
 		relayOnly     bool
 		offered       []netip.AddrPort
+		own           []netip.AddrPort
 		knows         func(netip.AddrPort) bool
 		relay, charge netip.AddrPort
 	}{
-		{"caller's first, charged", false, []netip.AddrPort{a, b}, none, a, a},
-		{"no offer", false, nil, none, zero, zero},
-		{"relay-only, known offered relay, uncharged", true, []netip.AddrPort{a, b}, knowsB, b, zero},
-		{"relay-only, own fallback, uncharged", true, []netip.AddrPort{a}, none, own, zero},
+		{"caller's first, charged", false, []netip.AddrPort{a, b}, mine, none, a, a},
+		{"no offer", false, nil, mine, none, zero, zero},
+		{"relay-only, known offered relay, uncharged", true, []netip.AddrPort{a, b}, mine, knowsB, b, zero},
+		{"relay-only, own fallback, uncharged", true, []netip.AddrPort{a}, mine, none, own, zero},
+		{"relay-only, nothing trusted: no relay", true, []netip.AddrPort{a}, nil, none, zero, zero},
 	} {
-		relay, charge := chooseRelay(tc.relayOnly, tc.offered, []netip.AddrPort{own}, tc.knows)
+		relay, charge := chooseRelay(tc.relayOnly, tc.offered, tc.own, tc.knows)
 		if relay != tc.relay || charge != tc.charge {
 			t.Errorf("%s: got (%v, %v), want (%v, %v)", tc.name, relay, charge, tc.relay, tc.charge)
 		}
