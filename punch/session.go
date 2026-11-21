@@ -485,7 +485,7 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 			return
 		}
 		t := binary.BigEndian.Uint16(m.T)
-		if q := s.relayT[t]; socket == 0 && q != 0 {
+		if q := s.relayT[t]; socket == 0 && q != 0 && from == s.relay {
 			delete(s.relayT, t)
 			s.relayReply(now, &m, q)
 			return

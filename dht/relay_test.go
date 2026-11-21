@@ -251,8 +251,8 @@ func TestRelayBusySourceKeepsFallback(t *testing.T) {
 	}
 }
 
-// Refreshing half-formed pairs can't pin the table: grace runs from
-// creation, and a half-formed pair expires at maxPendingAge regardless.
+// Refreshing half-formed pairs can't pin the table: grace and eviction
+// order both go by creation time.
 func TestRelayRefreshesCannotPinTable(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(78)), Rand: rng(79)})
 	var keys []netip.AddrPort
@@ -271,16 +271,6 @@ func TestRelayRefreshesCannotPinTable(t *testing.T) {
 		t.Fatal("refreshed half-formed pairs locked a real session out")
 	}
 
-	r = New(Config{ID: outsiderID(rng(80)), Rand: rng(81)})
-	for i := range 3 {
-		for at := time.Duration(0); at < maxPendingAge; at += 10 * time.Second { // refreshed well within relayIdle
-			announceAt(t, r, t0.Add(at), addr(20+i), krpc.NodeID{26, byte(i)})
-		}
-	}
-	r.expireRelays(t0.Add(maxPendingAge))
-	if n := len(r.rel.pairs); n != 0 {
-		t.Fatalf("%d refreshed half-formed pairs outlived maxPendingAge", n)
-	}
 }
 
 // Zoned (link-local) senders count against their source like any other.
@@ -325,5 +315,30 @@ func TestRelayFastFloodStillAdmits(t *testing.T) {
 	announceAt(t, r, at, addr(3), krpc.NodeID{28})
 	if r.RelayPairs() != 1 {
 		t.Fatal("a fresh flood locked a real session out")
+	}
+}
+
+// Under a sustained flood of single-pair sources, an initiator's pair
+// waits out its peer's later arrival: the grace covers it, and older flood
+// entries go first.
+func TestRelayPairSurvivesFloodUntilPeerArrives(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(84)), Rand: rng(85)})
+	src := 0
+	flood := func(at time.Time, n int) {
+		for range n {
+			a := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(src >> 8), byte(src), 1}), 6881)
+			announceAt(t, r, at, a, krpc.NodeID{29, byte(src >> 8), byte(src)})
+			src++
+		}
+	}
+	flood(t0, 4*r.cfg.MaxRelayPairs)
+	start := t0.Add(20 * time.Second)
+	announceAt(t, r, start, addr(2), krpc.NodeID{30})
+	for s := 1; s <= 3; s++ {
+		flood(start.Add(time.Duration(s)*time.Second), 32)
+	}
+	announceAt(t, r, start.Add(3*time.Second), addr(3), krpc.NodeID{30})
+	if r.RelayPairs() != 1 {
+		t.Fatal("the flood evicted the initiator's pair before its peer arrived")
 	}
 }

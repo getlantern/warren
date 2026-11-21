@@ -115,12 +115,12 @@ func (s *Session) relayReply(now time.Time, m *krpc.Msg, q relayQuery) {
 	case m.Y != krpc.Response:
 	case q == relayGetPeers && s.relayToken == nil && len(m.R.Token) > 0:
 		s.relayToken = append([]byte(nil), m.R.Token...)
+		clear(s.relayT) // earlier retries are moot
 		s.nextRelay = now
-	case q == relayAnnounce:
-		if !s.relayBound {
-			s.nextAnnounce = now.Add(relayReannounce)
-		}
+	case q == relayAnnounce && !s.relayBound:
 		s.relayBound = true
+		clear(s.relayT)
+		s.nextAnnounce = now.Add(relayReannounce)
 		s.nextRelay = now
 	}
 }

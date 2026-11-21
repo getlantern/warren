@@ -364,3 +364,24 @@ func TestRelayBoundOnlyByAnnounceReply(t *testing.T) {
 		t.Fatal("a get_peers reply marked the relay bound")
 	}
 }
+
+// A relay reply forged from another address must not advance the bind.
+func TestRelayReplyMustComeFromRelay(t *testing.T) {
+	router := netip.MustParseAddrPort("2.176.0.9:6881")
+	s := New(Config{RelayOnly: true, Relay: router, Rand: rand.New(rand.NewPCG(7, 7))})
+	now := time.Unix(1_800_000_000, 0)
+	s.Start(now, Offer{Secret: []byte("0123456789abcdef0123456789abcdef")})
+	sends, _ := s.Drain()
+	var tid []byte
+	for _, snd := range sends {
+		var m krpc.Msg
+		if krpc.Unmarshal(snd.Data, &m) == nil && m.Q == "get_peers" {
+			tid = m.T
+		}
+	}
+	r := krpc.Msg{T: tid, Y: krpc.Response, R: krpc.Return{Token: []byte("tokn")}}
+	s.HandlePacket(now, 0, netip.MustParseAddrPort("6.6.6.6:6881"), krpc.AppendMarshal(nil, &r))
+	if s.relayToken != nil {
+		t.Fatal("a reply from a stranger set the relay token")
+	}
+}

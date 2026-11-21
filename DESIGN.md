@@ -441,12 +441,13 @@ infrastructure.
   read-only phones never relay.
 - **Admission is loose by design.** An address relays one pair. A source (an
   IPv4 address or IPv6 /64; all link-local senders share one) holds at most
-  8 half-formed pairs and one pair with itself. A half-formed pair lives at
-  most 30 seconds however often it is re-announced. A full table evicts a
+  8 half-formed pairs and one pair with itself. A full table evicts a
   half-formed pair rather than refusing new ones: from the source holding
-  the most, least recently active first, never one created less than two
-  seconds ago, unless every pair is that young, in which case the heaviest
-  source gives up its youngest to a lighter newcomer.
+  the most, oldest created first, never one created less than ten seconds
+  ago (long enough for its peer to arrive), unless every pair is that
+  young, in which case the heaviest source gives up its youngest to a
+  lighter newcomer. Creation time, not activity, decides, so refreshing
+  can't protect a pair or pin a slot.
   So a flood churns its own entries instead of locking the table. Clients
   re-announce every second until they hear their peer through the relay, so
   a pair evicted anyway is rebuilt. Tighter per-source limits would hit CGNAT users and relay-only
