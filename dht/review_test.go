@@ -280,25 +280,27 @@ func TestRelistenAdvancesSequence(t *testing.T) {
 }
 
 // Pruning the sequence table must never forget a live record's number that
-// is still ahead of the clock.
+// is still ahead of the clock. The record at risk is a different one from
+// the record whose signing triggers the prune: here the previous epoch's.
 func TestRecordSeqPruneKeepsLiveEntries(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(90)), Rand: rng(91)})
 	n.Listen(t0, ed25519.NewKeyFromSeed(make([]byte, 32)))
-	var target krpc.NodeID
 	var epoch int64
-	for e, tg := range n.lst.records {
-		epoch, target = e, tg
+	for e := range n.lst.records {
+		epoch = e
 	}
+	prev := n.signRecord(t0, epoch-1)
 	for range 5 {
-		n.signRecord(t0, epoch) // several re-signs in one second: seq runs ahead of the clock
+		n.signRecord(t0, epoch-1) // several re-signs in one second: ahead of the clock
 	}
-	ahead := n.recordSeq[target]
-	for i := range 2 * maxRecordSeqs { // fill the table with stale entries
+	ahead := n.recordSeq[prev]
+	for i := range 2 * maxRecordSeqs { // stale entries fill the table
 		n.recordSeq[krpc.NodeID{byte(i), byte(i >> 8), 0xee}] = t0.Unix() - 100
 	}
-	n.signRecord(t0, epoch)
-	if got := n.recordSeq[target]; got <= ahead {
-		t.Fatalf("re-sign after pruning gave seq %d, not above the live %d", got, ahead)
+	n.signRecord(t0, epoch) // triggers the prune
+	n.signRecord(t0, epoch-1)
+	if got := n.recordSeq[prev]; got <= ahead {
+		t.Fatalf("previous-epoch record re-signed at seq %d, not above its live %d", got, ahead)
 	}
 	if len(n.recordSeq) > maxRecordSeqs {
 		t.Fatalf("table not pruned: %d entries", len(n.recordSeq))
