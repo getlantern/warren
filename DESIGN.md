@@ -436,8 +436,9 @@ infrastructure.
 - **Volunteer cost is bounded.** Routers relay by default (`DisableRelay` opts
   out), with at most 16 pairs at once (`MaxRelayPairs`) and 512 KB/s per pair
   (`RelayRate`, a token bucket; packets over budget are dropped, so end-to-end
-  congestion control backs off). An address relays one pair, one source IP can
-  hold at most 4 half-formed pairs (announce tokens are per IP), pairs are fixed
+  congestion control backs off). An address relays one pair, one source (an IPv4
+  address or IPv6 /64) can be in at most 4 pairs, half-formed or complete
+  (announce tokens are per IP), pairs are fixed
   once formed so a third announcer can't join or hijack them, idle pairs expire
   after a minute, and read-only phones never relay.
 - **Each relay-only side trusts only routers it knows.** A relay learns both

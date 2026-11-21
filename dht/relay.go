@@ -29,16 +29,35 @@ type relay struct {
 
 const relayIdle = time.Minute
 
-// maxPendingPerIP bounds the half-formed pairs one source IP can hold.
-// Announce tokens are per IP, so without it one host could fill the table
-// from many ports; it isn't 1 because subscribers behind one CGNAT IP share
-// it.
-const maxPendingPerIP = 4
+// maxPairsPerSource bounds the pairs, half-formed or complete, that have a
+// member from one source: an IPv4 address or an IPv6 /64, which one host
+// controls. Announce tokens are per IP, so without it one host could fill
+// the table from many ports, or pair with itself to hold every active slot.
+// It isn't 1 because subscribers behind one CGNAT IP share it.
+const maxPairsPerSource = 4
 
-func (r *relay) pendingFrom(ip netip.Addr) int {
+func relaySource(ip netip.Addr) netip.Prefix {
+	ip = ip.Unmap()
+	if ip.Is4() {
+		return netip.PrefixFrom(ip, 32)
+	}
+	p, _ := ip.Prefix(64)
+	return p
+}
+
+func (p *relayPair) from(src netip.Prefix) bool {
+	for i := range p.n {
+		if src.Contains(p.peers[i].Addr().Unmap()) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *relay) pairsFrom(src netip.Prefix) int {
 	c := 0
 	for _, p := range r.pairs {
-		if p.n == 1 && p.peers[0].Addr() == ip {
+		if p.from(src) {
 			c++
 		}
 	}
@@ -65,7 +84,7 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 		return
 	}
 	if p == nil {
-		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs || r.pendingFrom(from.Addr()) >= maxPendingPerIP {
+		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs || r.pairsFrom(relaySource(from.Addr())) >= maxPairsPerSource {
 			return
 		}
 		p = &relayPair{created: now, active: now, tokens: float64(n.cfg.RelayRate)}
@@ -82,6 +101,9 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 	}
 	if p.n == 1 && n.activePairs() >= n.cfg.MaxRelayPairs {
 		return
+	}
+	if src := relaySource(from.Addr()); !p.from(src) && r.pairsFrom(src) >= maxPairsPerSource {
+		return // joining would give this source another pair
 	}
 	p.peers[p.n] = from
 	p.n++

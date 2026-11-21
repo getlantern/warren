@@ -124,12 +124,37 @@ func TestRelayOneHostManyPortsCannotFillTable(t *testing.T) {
 	for i := range 4 * r.cfg.MaxRelayPairs {
 		announce(t, r, netip.AddrPortFrom(host, uint16(10000+i)), krpc.NodeID{11, byte(i)})
 	}
-	if got := len(r.rel.pairs); got != maxPendingPerIP {
-		t.Fatalf("one host holds %d half-formed pairs, want the cap %d", got, maxPendingPerIP)
+	if got := len(r.rel.pairs); got != maxPairsPerSource {
+		t.Fatalf("one host holds %d half-formed pairs, want the cap %d", got, maxPairsPerSource)
 	}
 	announce(t, r, addr(2), krpc.NodeID{12})
 	announce(t, r, addr(3), krpc.NodeID{12})
 	if r.RelayPairs() != 1 {
 		t.Fatalf("a legitimate pair could not form: %d active", r.RelayPairs())
+	}
+}
+
+// One host pairing with itself from two ports, or spreading over its IPv6
+// /64, must not hold more than its share of relay pairs.
+func TestRelaySourceCannotHoldActiveSlots(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(62)), Rand: rng(63)})
+	v4 := netip.MustParseAddr("5.5.5.1")
+	for i := range r.cfg.MaxRelayPairs {
+		info := krpc.NodeID{13, byte(i)}
+		announce(t, r, netip.AddrPortFrom(v4, uint16(20000+2*i)), info)
+		announce(t, r, netip.AddrPortFrom(v4, uint16(20001+2*i)), info)
+	}
+	if got := r.RelayPairs(); got != maxPairsPerSource {
+		t.Fatalf("one IPv4 host self-paired %d times, want the cap %d", got, maxPairsPerSource)
+	}
+	for i := range r.cfg.MaxRelayPairs {
+		a := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, byte(i), 1})
+		b := netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, byte(i), 2})
+		info := krpc.NodeID{14, byte(i)}
+		announce(t, r, netip.AddrPortFrom(a, 6881), info)
+		announce(t, r, netip.AddrPortFrom(b, 6881), info)
+	}
+	if got := r.RelayPairs(); got != 2*maxPairsPerSource {
+		t.Fatalf("an IPv4 host and one IPv6 /64 hold %d pairs, want %d", got, 2*maxPairsPerSource)
 	}
 }
