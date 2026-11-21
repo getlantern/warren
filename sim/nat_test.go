@@ -77,3 +77,28 @@ func TestRangeBelow1024Terminates(t *testing.T) {
 		t.Fatal("allocator spun forever")
 	}
 }
+
+// A range with no port at or above 1024 is rejected, not silently rewritten.
+func TestRangeEntirelyBelow1024Rejected(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewNAT accepted a 100–500 range")
+		}
+	}()
+	NewNAT(NATConfig{Public: netip.MustParseAddr("5.5.5.5"), BlockLo: 100, BlockHi: 500}, rand.New(rand.NewPCG(4, 4)))
+}
+
+// A sequential allocator near the top of the port space starts, and stays,
+// inside its range.
+func TestSequentialNearTopStaysInRange(t *testing.T) {
+	n := NewNAT(NATConfig{Public: netip.MustParseAddr("5.5.5.5"), Mapping: EndpointDependentMapping,
+		Alloc: SequentialPorts, Step: 40, BlockLo: 65500, BlockHi: 65535}, rand.New(rand.NewPCG(5, 5)))
+	now := time.Unix(1_800_000_000, 0)
+	local := netip.MustParseAddrPort("192.168.0.2:4000")
+	for i := range 36 {
+		m, ok := n.Outbound(local, netip.AddrPortFrom(netip.AddrFrom4([4]byte{9, 9, 0, byte(i)}), 1), now)
+		if ok && m.Port() < 65500 {
+			t.Fatalf("mapping %d got port %d, below the range", i, m.Port())
+		}
+	}
+}

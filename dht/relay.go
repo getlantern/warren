@@ -20,6 +20,7 @@ type relayPair struct {
 	created time.Time
 	active  time.Time
 	tokens  float64 // byte budget, refilled at RelayRate
+	used    bool    // has forwarded a datagram
 }
 
 type relay struct {
@@ -27,41 +28,71 @@ type relay struct {
 	byAddr map[netip.AddrPort]*relayPair
 }
 
-const relayIdle = time.Minute
+const (
+	relayIdle = time.Minute
+	// relayUnusedIdle expires pairs that never forwarded anything sooner:
+	// every session binds a relay alongside punching, and most then
+	// connect directly and never use it.
+	relayUnusedIdle = 20 * time.Second
+)
 
-// maxPairsPerSource bounds the pairs, half-formed or complete, that have a
-// member from one source: an IPv4 address or an IPv6 /64, which one host
-// controls. Announce tokens are per IP, so without it one host could fill
-// the table from many ports, or pair with itself to hold every active slot.
-// It isn't 1 because subscribers behind one CGNAT IP share it.
-const maxPairsPerSource = 4
-
-func relaySource(ip netip.Addr) netip.Prefix {
-	ip = ip.Unmap()
-	if ip.Is4() {
-		return netip.PrefixFrom(ip, 32)
-	}
-	p, _ := ip.Prefix(64)
-	return p
+// Per-source limits. Announce tokens are per IP, so without them one host
+// could fill the table from many ports, or pair with itself to hold every
+// active slot. A source is an IPv4 address, or an IPv6 /64 and, more
+// loosely, the /48 a single customer is often delegated. The limits aren't
+// 1 because subscribers behind one CGNAT IP share it, and complete pairs
+// get more room than half-formed ones so a busy client (every dial binds a
+// relay) keeps its fallback.
+type sourceLimit struct {
+	bits              int
+	pending, complete int
 }
+
+var (
+	v4Limits = []sourceLimit{{32, 4, 8}}
+	v6Limits = []sourceLimit{{64, 4, 8}, {48, 8, 8}}
+)
+
+// relayNorm drops the IPv4-mapped form and any zone: Prefix.Contains never
+// matches a zoned address, so a link-local sender with a zone would
+// otherwise escape the per-source count.
+func relayNorm(ip netip.Addr) netip.Addr { return ip.Unmap().WithZone("") }
 
 func (p *relayPair) from(src netip.Prefix) bool {
 	for i := range p.n {
-		if src.Contains(p.peers[i].Addr().Unmap()) {
+		if src.Contains(relayNorm(p.peers[i].Addr())) {
 			return true
 		}
 	}
 	return false
 }
 
-func (r *relay) pairsFrom(src netip.Prefix) int {
-	c := 0
-	for _, p := range r.pairs {
-		if p.from(src) {
-			c++
+// admits reports whether from may open a new half-formed pair (joining is
+// false) or complete p (joining is true) within its source limits.
+func (r *relay) admits(from netip.AddrPort, p *relayPair, joining bool) bool {
+	ip := relayNorm(from.Addr())
+	limits := v4Limits
+	if !ip.Is4() {
+		limits = v6Limits
+	}
+	for _, l := range limits {
+		src, _ := ip.Prefix(l.bits)
+		pending, complete := 0, 0
+		for _, q := range r.pairs {
+			if q == p || !q.from(src) {
+				continue
+			}
+			if q.n == 2 {
+				complete++
+			} else {
+				pending++
+			}
+		}
+		if joining && complete >= l.complete || !joining && pending >= l.pending {
+			return false
 		}
 	}
-	return c
+	return true
 }
 
 func (n *Node) relaying() bool { return !n.cfg.ReadOnly && !n.cfg.DisableRelay }
@@ -84,7 +115,7 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 		return
 	}
 	if p == nil {
-		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs || r.pairsFrom(relaySource(from.Addr())) >= maxPairsPerSource {
+		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs || !r.admits(from, nil, false) {
 			return
 		}
 		p = &relayPair{created: now, active: now, tokens: float64(n.cfg.RelayRate)}
@@ -102,8 +133,8 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 	if p.n == 1 && n.activePairs() >= n.cfg.MaxRelayPairs {
 		return
 	}
-	if src := relaySource(from.Addr()); !p.from(src) && r.pairsFrom(src) >= maxPairsPerSource {
-		return // joining would give this source another pair
+	if p.n == 1 && (!r.admits(from, p, true) || !r.admits(p.peers[0], p, true)) {
+		return // a complete pair counts against both members' sources
 	}
 	p.peers[p.n] = from
 	p.n++
@@ -135,6 +166,7 @@ func (n *Node) relayForward(now time.Time, from netip.AddrPort, b []byte) {
 		return // over budget: drop, and the end-to-end congestion control backs off
 	}
 	p.tokens -= float64(len(b))
+	p.used = true
 	to := p.peers[0]
 	if from == to {
 		to = p.peers[1]
@@ -144,7 +176,7 @@ func (n *Node) relayForward(now time.Time, from netip.AddrPort, b []byte) {
 
 func (n *Node) expireRelays(now time.Time) {
 	for k, p := range n.rel.pairs {
-		if now.Sub(p.active) >= relayIdle {
+		if idle := now.Sub(p.active); idle >= relayIdle || !p.used && idle >= relayUnusedIdle {
 			for i := range p.n {
 				delete(n.rel.byAddr, p.peers[i])
 			}

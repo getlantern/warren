@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"net/netip"
 	"time"
@@ -78,10 +79,14 @@ func NewNAT(cfg NATConfig, rng *rand.Rand) *NAT {
 		cfg.BlockLo, cfg.BlockHi = 1024, 65535
 	}
 	// Ports below 1024 are never allocated, so the range (and the quota
-	// counted against it) starts at 1024.
+	// counted against it) starts at 1024. A range entirely below that is a
+	// configuration mistake.
+	if cfg.BlockHi < 1024 || cfg.BlockLo > cfg.BlockHi {
+		panic(fmt.Sprintf("sim: NAT port range %d–%d has no allocatable port", cfg.BlockLo, cfg.BlockHi))
+	}
 	cfg.BlockLo = max(cfg.BlockLo, 1024)
-	cfg.BlockHi = max(cfg.BlockHi, cfg.BlockLo)
-	return &NAT{cfg: cfg, rng: rng, byKey: map[mapKey]*natMapping{}, byPort: map[uint16]*natMapping{}, last: cfg.BlockLo + uint16(rng.IntN(64))}
+	size := int(cfg.BlockHi) - int(cfg.BlockLo) + 1
+	return &NAT{cfg: cfg, rng: rng, byKey: map[mapKey]*natMapping{}, byPort: map[uint16]*natMapping{}, last: cfg.BlockLo + uint16(rng.IntN(min(64, size)))}
 }
 
 func (n *NAT) Public() netip.Addr { return n.cfg.Public }
