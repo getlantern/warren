@@ -440,10 +440,13 @@ infrastructure.
   announcer can't join or hijack them. Idle pairs expire after a minute, and
   read-only phones never relay.
 - **Admission is loose by design.** An address relays one pair. A source (an
-  IPv4 address or IPv6 /64) holds at most 8 half-formed pairs and one pair
-  with itself. A full table evicts its oldest half-formed pair rather than
-  refusing new ones, so a flood of announces churns the table instead of
-  locking it. Tighter per-source limits would hit CGNAT users and relay-only
+  IPv4 address, an IPv6 /64, or a link-local address) holds at most 8
+  half-formed pairs and one pair with itself. A full table evicts a
+  half-formed pair rather than refusing new ones: from the source holding
+  the most, least recently active first, never one younger than two seconds.
+  So a flood churns its own entries instead of locking the table. Clients
+  re-announce every second until they hear their peer through the relay, so
+  a pair evicted anyway is rebuilt. Tighter per-source limits would hit CGNAT users and relay-only
   listeners as hard as attackers. So pairs between different sources are
   bounded only by the pair cap, the byte budget and idle expiry, the
   open-relay limit every volunteer relay shares.

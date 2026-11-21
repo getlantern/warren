@@ -20,7 +20,10 @@ import (
 // produce them.
 
 const (
-	relayRetry      = 500 * time.Millisecond
+	relayRetry = 500 * time.Millisecond
+	// relayReannounce: until the peer is heard through the relay, keep
+	// announcing, so a half-formed pair the router evicted is rebuilt.
+	relayReannounce = time.Second
 	relayProbeEvery = 100 * time.Millisecond
 	relayProbeLen   = 20
 )
@@ -47,8 +50,22 @@ func (s *Session) startRelay(now time.Time, secret []byte, me, peer string) {
 	s.nextRelay = now
 }
 
+func (s *Session) reannouncing() bool {
+	return s.relay.IsValid() && s.relayBound && !s.relayProven && !s.done
+}
+
 func (s *Session) tickRelay(now time.Time) {
-	if !s.relay.IsValid() || s.nominating || now.Before(s.nextRelay) {
+	if !s.relay.IsValid() || s.nominating {
+		return
+	}
+	if s.reannouncing() && !now.Before(s.nextAnnounce) {
+		// Untracked: the reply changes nothing, and tracking it would
+		// reset the probe timer.
+		info := s.relayInfo
+		s.query0("announce_peer", krpc.Args{InfoHash: &info, Token: s.relayToken, Port: 6881, ImpliedPort: true})
+		s.nextAnnounce = now.Add(relayReannounce)
+	}
+	if now.Before(s.nextRelay) {
 		return
 	}
 	switch {
@@ -93,6 +110,9 @@ func (s *Session) relayReply(now time.Time, m *krpc.Msg) {
 		s.relayToken = append([]byte(nil), m.R.Token...)
 		s.nextRelay = now
 	case s.relayToken != nil:
+		if !s.relayBound {
+			s.nextAnnounce = now.Add(relayReannounce)
+		}
 		s.relayBound = true
 		s.nextRelay = now
 	}
@@ -114,7 +134,7 @@ func (s *Session) relayData(socket int, from netip.AddrPort, b []byte) {
 	case s.cfg.Initiator && !s.done && hmac.Equal(b, s.peerAck):
 		s.connectRelayed()
 	case s.cfg.Initiator && hmac.Equal(b, s.peerProbe):
-		s.relayProven = true
+		s.relayProven = true // the pair exists: stop re-announcing
 	}
 }
 

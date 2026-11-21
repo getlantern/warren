@@ -164,6 +164,7 @@ type Session struct {
 	// relay. relayUnanswered counts the initiator's probes since then.
 	relayProven     bool
 	relayUnanswered int
+	nextAnnounce    time.Time // next re-announce while the peer is unheard
 }
 
 func New(cfg Config) *Session {
@@ -345,6 +346,9 @@ func (s *Session) NextWakeup() time.Time {
 	}
 	if s.relay.IsValid() && !s.nominating && !s.nextRelay.IsZero() {
 		timers = append(timers, s.nextRelay)
+	}
+	if !s.nominating && s.reannouncing() {
+		timers = append(timers, s.nextAnnounce)
 	}
 	w := s.deadline
 	for _, t := range timers {

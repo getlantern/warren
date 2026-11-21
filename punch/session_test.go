@@ -196,6 +196,13 @@ func TestRelayOnlyResponderIgnoresOfferedRelays(t *testing.T) {
 // announcers. dropToA decides, at send time, whether the router loses a
 // datagram it forwards to A.
 func relayPair(t *testing.T, a, b *Session, router netip.AddrPort, start time.Time, dropToA func([]byte) bool) (Event, Event) {
+	return relayPairForget(t, a, b, router, start, dropToA, false)
+}
+
+// relayPairForget is relayPair with a router that, if forgetB, answers B's
+// first announce but drops it, as a router evicting B's half-formed pair
+// does.
+func relayPairForget(t *testing.T, a, b *Session, router netip.AddrPort, start time.Time, dropToA func([]byte) bool, forgetB bool) (Event, Event) {
 	t.Helper()
 	addrA, addrB := netip.MustParseAddrPort("198.51.100.1:40000"), netip.MustParseAddrPort("203.0.113.1:40000")
 	announced := map[netip.AddrPort]bool{}
@@ -209,7 +216,11 @@ func relayPair(t *testing.T, a, b *Session, router netip.AddrPort, start time.Ti
 		if s.Data[0] == 'd' && krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
 			r := krpc.Msg{T: m.T, Y: krpc.Response, R: krpc.Return{Token: []byte("tokn")}}
 			if m.Q == "announce_peer" {
-				announced[from] = true
+				if forgetB && from == addrB {
+					forgetB = false
+				} else {
+					announced[from] = true
+				}
 			}
 			to := a
 			if from == addrB {
@@ -296,5 +307,25 @@ func TestSequentialWindowAtTopOfPortSpace(t *testing.T) {
 	cands := []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:40000")}
 	if got := targetRange(seq, cands); got != (portRange{40001, 40000 + predictWindow}) {
 		t.Errorf("mid-range window %+v", got)
+	}
+}
+
+// A router that evicts the responder's half-formed pair after accepting its
+// announce must not strand the session: both sides re-announce until they
+// hear each other, so the pair is rebuilt.
+func TestRelayEvictedBindingRebuilt(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	router := netip.MustParseAddrPort("2.176.0.9:6881")
+	a := New(Config{Initiator: true, Secret: secret, RelayOnly: true, Relays: []netip.AddrPort{router}, Rand: rand.New(rand.NewPCG(3, 3))})
+	b := New(Config{RelayOnly: true, Relay: router, Rand: rand.New(rand.NewPCG(4, 4))})
+	now := time.Unix(1_800_000_000, 0)
+	b.Start(now, a.Offer(nil))
+	a.Start(now, b.Offer(nil))
+	evA, evB := relayPairForget(t, a, b, router, now, func([]byte) bool { return false }, true)
+	if c, ok := evA.(Connected); !ok || !c.Relayed {
+		t.Fatalf("initiator after the router forgot the responder's binding: %+v", evA)
+	}
+	if c, ok := evB.(Connected); !ok || !c.Relayed {
+		t.Fatalf("responder: %+v", evB)
 	}
 }

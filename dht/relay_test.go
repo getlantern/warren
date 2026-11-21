@@ -12,8 +12,25 @@ import (
 // binding does.
 func announce(t *testing.T, n *Node, from netip.AddrPort, info krpc.NodeID) {
 	t.Helper()
-	r := query(t, n, from, krpc.Msg{Q: "get_peers", A: krpc.Args{ID: outsiderID(rng(50)), InfoHash: &info}})
-	ok := query(t, n, from, krpc.Msg{Q: "announce_peer", A: krpc.Args{ID: outsiderID(rng(51)), InfoHash: &info, Token: r.R.Token, Port: 6881, ImpliedPort: true}})
+	announceAt(t, n, t0, from, info)
+}
+
+func announceAt(t *testing.T, n *Node, at time.Time, from netip.AddrPort, info krpc.NodeID) {
+	t.Helper()
+	q := func(m krpc.Msg) *krpc.Msg {
+		m.T, m.Y = []byte("aa"), krpc.Query
+		n.HandlePacket(at, from, krpc.AppendMarshal(nil, &m))
+		sends, _ := n.Drain()
+		for _, s := range sends {
+			var r krpc.Msg
+			if s.To == from && krpc.Unmarshal(s.Data, &r) == nil && r.Y != krpc.Query {
+				return &r
+			}
+		}
+		return nil
+	}
+	r := q(krpc.Msg{Q: "get_peers", A: krpc.Args{ID: outsiderID(rng(50)), InfoHash: &info}})
+	ok := q(krpc.Msg{Q: "announce_peer", A: krpc.Args{ID: outsiderID(rng(51)), InfoHash: &info, Token: r.R.Token, Port: 6881, ImpliedPort: true}})
 	if ok == nil || ok.Y != krpc.Response {
 		t.Fatalf("announce rejected: %+v", ok)
 	}
@@ -129,20 +146,59 @@ func TestRelayOneHostManyPortsHeldToPendingCap(t *testing.T) {
 	}
 }
 
-// A flood of half-formed pairs from many sources fills the table, but a
-// new session still gets in: the oldest half-formed pair is evicted.
-func TestRelayFullTableEvictsOldestPending(t *testing.T) {
+// A flood fills the table with half-formed pairs and keeps going, but a
+// real session still pairs: eviction takes from the heaviest source, and
+// never a pair younger than evictGrace.
+func TestRelayFullTableEvictsFromFlood(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(62)), Rand: rng(63)})
-	for i := range 4 * r.cfg.MaxRelayPairs {
-		announce(t, r, netip.AddrPortFrom(netip.AddrFrom4([4]byte{6, 6, byte(i), 1}), 6881), krpc.NodeID{13, byte(i)})
+	flood := func(at time.Time, round int) {
+		for i := range 4 * r.cfg.MaxRelayPairs {
+			src := netip.AddrFrom4([4]byte{6, byte(round), byte(i % 8), 1}) // 8 fresh sources a round
+			announceAt(t, r, at, netip.AddrPortFrom(src, uint16(1000*round+i)), krpc.NodeID{13, byte(round), byte(i)})
+		}
 	}
-	announce(t, r, addr(2), krpc.NodeID{12})
-	announce(t, r, addr(3), krpc.NodeID{12})
+	flood(t0, 0)
+	if got := len(r.rel.pairs); got != 4*r.cfg.MaxRelayPairs {
+		t.Fatalf("flood filled %d slots", got)
+	}
+	listenAt := t0.Add(3 * time.Second)
+	announceAt(t, r, listenAt, addr(2), krpc.NodeID{12})
+	flood(listenAt, 1)                                                    // the flood keeps announcing
+	announceAt(t, r, listenAt.Add(time.Second), addr(3), krpc.NodeID{12}) // the caller arrives
 	if r.RelayPairs() != 1 {
-		t.Fatalf("a legitimate pair could not form in a full table: %d active", r.RelayPairs())
+		t.Fatalf("the real session was evicted by the flood: %d active", r.RelayPairs())
 	}
 	if len(r.rel.pairs) > 4*r.cfg.MaxRelayPairs {
 		t.Fatalf("table grew to %d", len(r.rel.pairs))
+	}
+}
+
+// Eviction must not depend on map order: with equal activity times, the
+// same pair goes every time.
+func TestRelayEvictionDeterministic(t *testing.T) {
+	victim := func() krpc.NodeID {
+		r := New(Config{ID: outsiderID(rng(70)), Rand: rng(71)})
+		for i := range 4 * r.cfg.MaxRelayPairs {
+			announce(t, r, netip.AddrPortFrom(netip.AddrFrom4([4]byte{7, 7, byte(i), 1}), 6881), krpc.NodeID{20, byte(i)})
+		}
+		before := map[krpc.NodeID]bool{}
+		for k := range r.rel.pairs {
+			before[k] = true
+		}
+		announceAt(t, r, t0.Add(3*time.Second), addr(9), krpc.NodeID{21})
+		for k := range before {
+			if r.rel.pairs[k] == nil {
+				return k
+			}
+		}
+		t.Fatal("nothing evicted")
+		return krpc.NodeID{}
+	}
+	first := victim()
+	for range 20 {
+		if v := victim(); v != first {
+			t.Fatalf("evicted %x, then %x", first[:2], v[:2])
+		}
 	}
 }
 
@@ -171,8 +227,9 @@ func TestRelaySelfPairsLimited(t *testing.T) {
 }
 
 // Many sessions from one address to different peers (a busy client, a
-// relay-only listener, or subscribers sharing a CGNAT IP) are not capped
-// per source, concurrent or not.
+// relay-only listener, or subscribers sharing a CGNAT IP): completed pairs
+// aren't capped per source, while concurrent half-formed ones are, at
+// maxPendingPerSource.
 func TestRelayBusySourceKeepsFallback(t *testing.T) {
 	r := New(Config{ID: outsiderID(rng(66)), Rand: rng(67)})
 	me := netip.MustParseAddr("5.5.5.1")
@@ -186,6 +243,25 @@ func TestRelayBusySourceKeepsFallback(t *testing.T) {
 	if got := r.RelayPairs(); got != n {
 		t.Fatalf("%d concurrent sessions from one address formed %d pairs", n, got)
 	}
+	for i := range n + 1 { // completed pairs free the half-formed budget
+		announce(t, r, netip.AddrPortFrom(me, uint16(41000+i)), krpc.NodeID{18, byte(i)})
+	}
+	if pending, _ := r.rel.count(relaySource(netip.AddrPortFrom(me, 0))); pending != n {
+		t.Fatalf("one address holds %d half-formed pairs, want the cap %d", pending, n)
+	}
+}
+
+// Link-local senders on different hosts are different sources, though all
+// sit in fe80::/64.
+func TestRelayLinkLocalSendersAreSeparateSources(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(74)), Rand: rng(75)})
+	for i := range 2 * maxPendingPerSource {
+		ll := netip.AddrFrom16([16]byte{0xfe, 0x80, 15: byte(i + 1)})
+		announce(t, r, netip.AddrPortFrom(ll, 6881), krpc.NodeID{22, byte(i)})
+	}
+	if got := len(r.rel.pairs); got != 2*maxPendingPerSource {
+		t.Fatalf("%d link-local hosts got %d pairs", 2*maxPendingPerSource, got)
+	}
 }
 
 // Zoned (link-local) senders count against their source like any other.
@@ -197,5 +273,22 @@ func TestRelaySourceCountsZonedSenders(t *testing.T) {
 	}
 	if got := len(r.rel.pairs); got != maxPendingPerSource {
 		t.Fatalf("a zoned source holds %d pairs, want the cap %d", got, maxPendingPerSource)
+	}
+}
+
+// A member's re-announce must not throw away the byte budget that refilled
+// while the pair was quiet.
+func TestRelayReannounceKeepsRefill(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(76)), Rand: rng(77), RelayRate: 1000})
+	a, b := addr(1), addr(2)
+	announce(t, r, a, krpc.NodeID{23})
+	announce(t, r, b, krpc.NodeID{23})
+	pkt := append([]byte{0x01, 0}, make([]byte, 998)...) // the whole 1000-byte budget
+	relayed(r, a, pkt)
+	later := t0.Add(1100 * time.Millisecond)
+	announceAt(t, r, later, a, krpc.NodeID{23}) // a re-announces after the budget refilled
+	r.HandlePacket(later, a, pkt)
+	if s, _ := r.Drain(); len(s) != 1 {
+		t.Fatalf("a refilled budget was lost to a re-announce: forwarded %d", len(s))
 	}
 }
