@@ -156,6 +156,9 @@ type Node struct {
 	signals   []*signalOp
 	fwd       forwarder
 	rel       relay
+	// sibling is the node for the other address family, whose table answers
+	// queries that want that family (libtorrent's get_foreign_node).
+	sibling *Node
 }
 
 func New(cfg Config) *Node {
@@ -201,6 +204,12 @@ func (n *Node) Drain() ([]Send, []Event) {
 }
 
 func (n *Node) Reflections() []Reflection { return slices.Clone(n.reflections) }
+
+// SetSibling pairs this node with the node for the other address family,
+// as libtorrent pairs its per-family nodes: queries here that want the
+// other family get referrals from the sibling's table of the same
+// personality. Both nodes must be driven by the same goroutine.
+func (n *Node) SetSibling(s *Node) { n.sibling = s }
 
 func (n *Node) RoutingSize() (community, mainline int) {
 	if n.comm != nil {
@@ -1053,7 +1062,17 @@ func (n *Node) referrals(t *table, target krpc.NodeID, from netip.AddrPort, want
 	if len(want) > 0 {
 		wantV4, wantV6 = slices.Contains(want, "n4"), slices.Contains(want, "n6")
 	}
-	for _, ni := range t.closest(target, 4*n.cfg.K) {
+	cands := t.closest(target, 4*n.cfg.K)
+	if s := n.sibling; s != nil {
+		st := s.main
+		if t == n.comm {
+			st = s.comm
+		}
+		if st != nil {
+			cands = append(cands, st.closest(target, 4*n.cfg.K)...)
+		}
+	}
+	for _, ni := range cands {
 		if ni.Addr.Addr().Unmap().Is4() {
 			if wantV4 && len(v4) < n.cfg.K {
 				v4 = append(v4, ni)

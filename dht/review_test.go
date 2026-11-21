@@ -306,3 +306,31 @@ func TestRecordSeqPruneKeepsLiveEntries(t *testing.T) {
 		t.Fatalf("table not pruned: %d entries", len(n.recordSeq))
 	}
 }
+
+// With per-family nodes paired as siblings, a query that wants the other
+// family is answered from the sibling's table, as libtorrent does, and the
+// community and Mainline personalities stay apart.
+func TestSiblingAnswersForeignFamily(t *testing.T) {
+	r := rng(76)
+	v4 := New(Config{ID: outsiderID(r), Rand: rng(77)})
+	v6 := New(Config{ID: outsiderID(r), Rand: rng(78)})
+	v4.SetSibling(v6)
+	v6.SetSibling(v4)
+	for i := 1; i <= 6; i++ {
+		v4.main.heard(outsiderID(r), addr(i), t0)
+		v6.main.heard(outsiderID(r), netip.AddrPortFrom(netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, byte(i), 15: 1}), 6881), t0)
+	}
+	target := outsiderID(r)
+	resp := query(t, v4, addr(100), krpc.Msg{Q: "find_node", A: krpc.Args{ID: outsiderID(r), Target: &target, Want: []string{"n4", "n6"}}})
+	if len(resp.R.Nodes) == 0 || len(resp.R.Nodes6) == 0 {
+		t.Fatalf("v4 node answered %d v4 and %d v6 referrals, want both", len(resp.R.Nodes), len(resp.R.Nodes6))
+	}
+	resp = query(t, v6, netip.MustParseAddrPort("[2001:db8::99]:1"), krpc.Msg{Q: "find_node", A: krpc.Args{ID: outsiderID(r), Target: &target, Want: []string{"n4"}}})
+	if len(resp.R.Nodes) == 0 || len(resp.R.Nodes6) != 0 {
+		t.Fatalf("v6 node asked for n4 answered %d v4 and %d v6", len(resp.R.Nodes), len(resp.R.Nodes6))
+	}
+	resp = query(t, v4, addr(100), krpc.Msg{Q: "find_node", A: krpc.Args{ID: outsiderID(r), Target: &target}})
+	if len(resp.R.Nodes6) != 0 {
+		t.Fatal("a query without want got the sibling's family")
+	}
+}

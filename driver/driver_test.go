@@ -225,3 +225,104 @@ func TestEventsClosedOnShutdown(t *testing.T) {
 		t.Fatal("Events consumer still blocked after Close")
 	}
 }
+
+func memberConfig6(ro bool) dht.Config {
+	c := memberConfig(ro)
+	var id krpc.NodeID
+	rand.Read(id[:])
+	c.ID = farsi.Tag(krpc.SecureID(netip.MustParseAddr("::1"), id))
+	return c
+}
+
+// A dual-stack network: each node runs an IPv4 and an IPv6 node as
+// siblings. A provider listening on both is reachable by an IPv4-only
+// caller and by an IPv6-only one, and each answer goes back through the
+// node that delivered the offer.
+func TestDualStackSignal(t *testing.T) {
+	probe, err := ListenDual("256.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	probe.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	dual := func(ro bool) *Node {
+		n, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(ro), memberConfig6(ro))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { n.Close() })
+		if len(n.Addrs()) != 2 {
+			t.Fatalf("dual node bound %v", n.Addrs())
+		}
+		return n
+	}
+	var nodes []*Node
+	for i := range 12 {
+		n := dual(false)
+		if i > 0 {
+			if _, err := n.Bootstrap(ctx, nodes[0].Addrs()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		nodes = append(nodes, n)
+	}
+	for _, n := range nodes {
+		n.Bootstrap(ctx, nodes[len(nodes)-1].Addrs())
+	}
+
+	provider := dual(true)
+	if _, err := provider.Bootstrap(ctx, nodes[3].Addrs()); err != nil {
+		t.Fatal(err)
+	}
+	pk := ed25519.NewKeyFromSeed([]byte("provider-seed-provider-seed-0123"))
+	if err := provider.Listen(ctx, pk); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for e := range provider.Events() {
+			if in, ok := e.(dht.Incoming); ok {
+				provider.Answer(ctx, in.Session, append([]byte("re: "), in.Payload...))
+			}
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		withHolders := 0
+		provider.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+			if len(d.Holders()) > 0 {
+				withHolders++
+			}
+		})
+		if withHolders == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("records reached holders on %d of 2 families", withHolders)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	only4, err := Listen("127.0.0.1:0", memberConfig(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { only4.Close() })
+	only6, err := ListenDual("256.0.0.1:0", "[::1]:0", memberConfig(true), memberConfig6(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { only6.Close() })
+	if a := only6.Addrs(); len(a) != 1 || a[0].Addr().Is4() {
+		t.Fatalf("IPv6-only node bound %v", a)
+	}
+	for name, caller := range map[string]*Node{"IPv4-only": only4, "IPv6-only": only6} {
+		if _, err := caller.Bootstrap(ctx, nodes[5].Addrs()); err != nil {
+			t.Fatalf("%s bootstrap: %v", name, err)
+		}
+		got, err := caller.Signal(ctx, ed25519.NewKeyFromSeed(make([]byte, 32)), [32]byte(pk.Public().(ed25519.PublicKey)), []byte(name))
+		if err != nil || string(got) != "re: "+name {
+			t.Fatalf("%s caller: %v %q", name, err, got)
+		}
+	}
+}
