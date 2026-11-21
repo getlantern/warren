@@ -432,9 +432,10 @@ func TestUnansweredOfferNotSentToCopies(t *testing.T) {
 	}
 }
 
-// When our own answer fails, the queued copy is tried without making the
-// answer visible: a copy arriving meanwhile is queued, not answered, and is
-// dropped if nobody got the answer.
+// deliverQueued takes the queued copy and tries it without making the
+// answer visible to later copies, and a copy arriving after a failed
+// delivery is queued, then dropped by publish(nil). (inbound's ordering,
+// own answer first, isn't pinned here: that would need a fake node.)
 func TestFailedAnswerStaysInvisible(t *testing.T) {
 	node, err := driver.Listen("127.0.0.1:0", member(false))
 	if err != nil {
@@ -447,6 +448,9 @@ func TestFailedAnswerStaysInvisible(t *testing.T) {
 	queued.copyOf(dht.SessionID{1})
 	if n := e.deliverQueued(context.Background(), queued, []byte("answer")); n != 0 {
 		t.Fatalf("delivered to %d copies through a node that knows no session", n)
+	}
+	if len(queued.pending) != 0 {
+		t.Fatal("deliverQueued left the copy queued instead of taking it")
 	}
 	select {
 	case <-queued.done:
