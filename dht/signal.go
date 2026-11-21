@@ -349,7 +349,8 @@ type session struct {
 	// the answer. A retry never replaces via: offers are replayable, so a
 	// later source may be anyone, and redirecting to it would let a replayer
 	// swallow the answer.
-	relays []netip.AddrPort
+	relays     []netip.AddrPort
+	unverified int // relays that are not adopted holders
 	// tokens are write tokens fetched from relays we never adopted, kept per
 	// session so they are bounded and expire with it.
 	tokens map[netip.AddrPort][]byte
@@ -576,10 +577,19 @@ func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) b
 		return matched
 	}
 	if _, dup := l.seen[string(m.Salt)]; dup {
-		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil && from != s.via && !slices.Contains(s.relays, from) && len(s.relays) < maxSessionRelays {
-			s.relays = append(s.relays, from)
-			if s.answer != nil {
-				n.sendAnswer(now, s, from)
+		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil && from != s.via && !slices.Contains(s.relays, from) {
+			// Our adopted holders always qualify (few, and known to store the
+			// record); unverified sources share a small cap, so replays can't
+			// crowd out a genuine retry.
+			holder := slices.ContainsFunc(l.holders, func(h *holder) bool { return h.addr == from })
+			if holder || s.unverified < maxSessionRelays {
+				if !holder {
+					s.unverified++
+				}
+				s.relays = append(s.relays, from)
+				if s.answer != nil {
+					n.sendAnswer(now, s, from)
+				}
 			}
 		}
 		return true

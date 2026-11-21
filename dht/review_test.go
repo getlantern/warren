@@ -218,3 +218,34 @@ func TestReplayedOfferDoesNotHijackAnswer(t *testing.T) {
 		t.Fatalf("answer sent to %d addresses; replays must be capped at %d extra", total, maxSessionRelays)
 	}
 }
+
+// Replays from unverified addresses must not use up the slots a genuine
+// retry through one of our holders needs.
+func TestReplaysCannotCrowdOutHolder(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(86)), Rand: rng(87)})
+	n.Listen(t0, ed25519.NewKeyFromSeed(make([]byte, 32)))
+	n.Drain()
+	holderAddr := addr(77)
+	var target krpc.NodeID
+	for _, tg := range n.lst.records {
+		target = tg
+	}
+	n.lst.holders = append(n.lst.holders, &holder{addr: holderAddr, target: target, token: []byte("htok")})
+	m := buildOffer(t, n)
+	n.acceptOffer(t0, addr(50), m)
+	_, events := n.Drain()
+	in := events[0].(Incoming)
+	for i := range 10 {
+		n.acceptOffer(t0, netip.AddrPortFrom(addr(66).Addr(), uint16(1000+i)), m)
+	}
+	n.acceptOffer(t0, holderAddr, m) // the caller's genuine retry
+	n.Answer(t0, in.Session, []byte("ok"))
+	sends, _ := n.Drain()
+	for _, s := range sends {
+		var q krpc.Msg
+		if s.To == holderAddr && krpc.Unmarshal(s.Data, &q) == nil && q.Q == "put" && string(q.A.Token) == "htok" {
+			return
+		}
+	}
+	t.Fatal("the holder's retry was crowded out by replays")
+}
