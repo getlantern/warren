@@ -295,6 +295,11 @@ func TestDualStackSignal(t *testing.T) {
 	if err := provider.Listen(ctx, pk); err != nil {
 		t.Fatal(err)
 	}
+	var keys [][32]byte
+	provider.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) { keys = append(keys, d.SignalKey()) })
+	if len(keys) != 2 || keys[0] != keys[1] || keys[0] == ([32]byte{}) {
+		t.Fatal("the two families listen with different signaling keys, so their records conflict")
+	}
 	go func() {
 		for e := range provider.Events() {
 			if in, ok := e.(dht.Incoming); ok {

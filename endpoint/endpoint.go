@@ -666,27 +666,49 @@ func (e *Endpoint) events() {
 			if !ok {
 				return
 			}
-			in, ok := ev.(dht.Incoming)
-			if !ok {
-				continue
+			if in, ok := ev.(dht.Incoming); ok {
+				e.incoming(in)
 			}
-			if e.cfg.Authorize != nil && !e.cfg.Authorize(in.Caller) {
-				continue
-			}
-			select {
-			case e.slots <- struct{}{}:
-			default:
-				continue // at capacity; the caller times out or retries
-			}
-			e.wg.Go(func() {
-				defer func() { <-e.slots }()
-				e.inbound(in)
-			})
 		}
 	}
 }
 
-func (e *Endpoint) inbound(in dht.Incoming) {
+// incoming admits one offer. Copies of an offer through the other family's
+// DHT are handled before taking a slot: they never punch, and the DHT won't
+// deliver a dropped one again. A new offer gets a slot and its own worker,
+// or is dropped at capacity.
+func (e *Endpoint) incoming(in dht.Incoming) {
+	if e.cfg.Authorize != nil && !e.cfg.Authorize(in.Caller) {
+		return
+	}
+	offer, err := punch.UnmarshalOffer(in.Payload)
+	if err != nil || len(offer.Secret) < 16 {
+		return
+	}
+	entry, first := e.firstOffer(in.Caller, offer.Secret, time.Now())
+	if !first {
+		if answer, now := entry.copyOf(in.Session); now {
+			e.wg.Go(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), e.cfg.GatherWait)
+				defer cancel()
+				_ = e.node.Answer(ctx, in.Session, answer)
+			})
+		}
+		return
+	}
+	select {
+	case e.slots <- struct{}{}:
+	default:
+		entry.publish(nil) // at capacity: no answer, so queued copies get none
+		return             // the caller times out or retries
+	}
+	e.wg.Go(func() {
+		defer func() { <-e.slots }()
+		e.inbound(in, offer, entry)
+	})
+}
+
+func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.GatherWait+e.cfg.PunchDeadline+2*time.Second)
 	defer cancel()
 	go func() {
@@ -696,21 +718,9 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		case <-ctx.Done():
 		}
 	}()
-	offer, err := punch.UnmarshalOffer(in.Payload)
-	if err != nil || len(offer.Secret) < 16 {
-		return
-	}
-	entry, first := e.firstOffer(in.Caller, offer.Secret, time.Now())
-	if !first {
-		// A dual-stack caller signals the same offer through each family's
-		// DHT; its secret identifies it. Punch and charge for it once, but
-		// answer this copy too, with the same answer, in case the other
-		// copy's answer is lost.
-		if answer, now := entry.copyOf(in.Session); now {
-			_ = e.node.Answer(ctx, in.Session, answer)
-		}
-		return
-	}
+	// A dual-stack caller signals the same offer through each family's DHT;
+	// its secret identifies it. events() answered any copy that arrived
+	// first; this, the first copy, punches and charges once.
 	defer e.publishOffer(ctx, entry, nil) // any early return leaves copies unanswered
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.

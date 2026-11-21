@@ -8,7 +8,9 @@ package driver
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"net"
 	"net/netip"
@@ -561,7 +563,12 @@ func (n *Node) Snapshot(ctx context.Context) ([]byte, error) {
 // callers of either family can reach us. Offers arrive as dht.Incoming on
 // Events; reply with Answer.
 func (n *Node) Listen(ctx context.Context, priv ed25519.PrivateKey) error {
-	errs, err := n.each(ctx, func(_ int, d *dht.Node, now time.Time) error { return d.Listen(now, priv) })
+	// One signaling key for every family, so their records are identical.
+	x, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	errs, err := n.each(ctx, func(_ int, d *dht.Node, now time.Time) error { return d.ListenKey(now, priv, x) })
 	if err != nil {
 		return err
 	}

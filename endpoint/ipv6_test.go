@@ -470,3 +470,20 @@ func TestFailedAnswerStaysInvisible(t *testing.T) {
 		t.Fatalf("publishing no answer returned copies to answer: %v", left)
 	}
 }
+
+// A copy of an offer through the other family's DHT is handled without an
+// inbound slot: with every slot busy (the first copy holds one), the copy
+// is still queued for the first copy's answer instead of dropped.
+func TestCopyNeedsNoSlot(t *testing.T) {
+	e := &Endpoint{cfg: Config{GatherWait: time.Second, PunchDeadline: 6 * time.Second}, slots: make(chan struct{}, 1)}
+	e.slots <- struct{}{} // the first copy's worker holds the only slot
+	secret := make([]byte, 32)
+	crand.Read(secret)
+	caller := [32]byte{9}
+	entry, _ := e.firstOffer(caller, secret, time.Now()) // the first copy, in progress
+	offer := punch.Offer{Secret: secret, Candidates: []netip.AddrPort{netip.MustParseAddrPort("2.10.0.1:4000")}}
+	e.incoming(dht.Incoming{Session: dht.SessionID{5}, Caller: caller, Payload: offer.Marshal()})
+	if queued := entry.publish([]byte("answer")); len(queued) != 1 || queued[0] != (dht.SessionID{5}) {
+		t.Fatalf("the copy wasn't queued while slots were full: %v", queued)
+	}
+}
