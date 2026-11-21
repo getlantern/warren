@@ -37,12 +37,15 @@ const relayIdle = time.Minute
 // therefore loose, and target what one address can do cheaply:
 //
 //   - An address relays one pair, checked before allocating.
-//   - A source (an IPv4 address, an IPv6 /64, or a link-local address)
-//     holds at most maxPendingPerSource half-formed pairs. When the table
-//     is full, a half-formed pair is evicted rather than new ones refused:
-//     from the source holding the most, least recently active first, never
-//     one younger than evictGrace. A flood churns its own entries, and
-//     clients re-announce until paired, so an evicted pair is rebuilt.
+//   - A source (an IPv4 address or IPv6 /64; all link-local senders share
+//     one) holds at most maxPendingPerSource half-formed pairs. When the
+//     table is full, a half-formed pair is evicted rather than new ones
+//     refused: from the source holding the most, least recently active
+//     first, never one created less than evictGrace ago. A flood churns its
+//     own entries, and clients re-announce until paired, so an evicted pair
+//     is rebuilt.
+//   - A half-formed pair lives at most maxPendingAge however often it is
+//     re-announced, so refreshes can't pin table slots.
 //   - A source pairs with itself at most maxSelfPairs times; only
 //     subscribers sharing one CGNAT IP need that at all.
 //
@@ -53,6 +56,7 @@ const (
 	maxPendingPerSource = 8
 	maxSelfPairs        = 1
 	evictGrace          = 2 * time.Second
+	maxPendingAge       = 30 * time.Second
 )
 
 // relayNorm drops the IPv4-mapped form and any zone: Prefix.Contains never
@@ -63,11 +67,8 @@ func relayNorm(ip netip.Addr) netip.Addr { return ip.Unmap().WithZone("") }
 func relaySource(a netip.AddrPort) netip.Prefix {
 	ip := relayNorm(a.Addr())
 	bits := 64
-	switch {
-	case ip.Is4():
+	if ip.Is4() {
 		bits = 32
-	case ip.IsLinkLocalUnicast():
-		bits = 128 // every link-local address shares fe80::/64
 	}
 	p, _ := ip.Prefix(bits)
 	return p
@@ -95,7 +96,8 @@ func (r *relay) count(src netip.Prefix) (pending, self int) {
 
 // evictPending drops a half-formed pair to make room: from the source
 // holding the most, the least recently active one, never one younger than
-// evictGrace (so a pair has time to complete), ties broken by info-hash for
+// evictGrace since it was created (so a pair has time to complete, and
+// refreshes don't extend that), ties broken by info-hash for
 // determinism. It reports whether it found one.
 func (r *relay) evictPending(now time.Time) bool {
 	perSource := map[netip.Prefix]int{}
@@ -119,7 +121,7 @@ func (r *relay) evictPending(now time.Time) bool {
 		return bytes.Compare(k[:], victim[:]) < 0
 	}
 	for k, q := range r.pairs {
-		if q.n == 1 && now.Sub(q.active) >= evictGrace && better(k, q) {
+		if q.n == 1 && now.Sub(q.created) >= evictGrace && better(k, q) {
 			victim, best = k, q
 		}
 	}
@@ -216,7 +218,7 @@ func (n *Node) relayForward(now time.Time, from netip.AddrPort, b []byte) {
 
 func (n *Node) expireRelays(now time.Time) {
 	for k, p := range n.rel.pairs {
-		if now.Sub(p.active) >= relayIdle {
+		if now.Sub(p.active) >= relayIdle || p.n < 2 && now.Sub(p.created) >= maxPendingAge {
 			for i := range p.n {
 				delete(n.rel.byAddr, p.peers[i])
 			}

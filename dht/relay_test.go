@@ -251,16 +251,35 @@ func TestRelayBusySourceKeepsFallback(t *testing.T) {
 	}
 }
 
-// Link-local senders on different hosts are different sources, though all
-// sit in fe80::/64.
-func TestRelayLinkLocalSendersAreSeparateSources(t *testing.T) {
-	r := New(Config{ID: outsiderID(rng(74)), Rand: rng(75)})
-	for i := range 2 * maxPendingPerSource {
-		ll := netip.AddrFrom16([16]byte{0xfe, 0x80, 15: byte(i + 1)})
-		announce(t, r, netip.AddrPortFrom(ll, 6881), krpc.NodeID{22, byte(i)})
+// Refreshing half-formed pairs can't pin the table: grace runs from
+// creation, and a half-formed pair expires at maxPendingAge regardless.
+func TestRelayRefreshesCannotPinTable(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(78)), Rand: rng(79)})
+	var keys []netip.AddrPort
+	for i := range 4 * r.cfg.MaxRelayPairs {
+		a := netip.AddrPortFrom(netip.AddrFrom4([4]byte{8, 8, byte(i), 1}), 6881)
+		keys = append(keys, a)
+		announce(t, r, a, krpc.NodeID{24, byte(i)})
 	}
-	if got := len(r.rel.pairs); got != 2*maxPendingPerSource {
-		t.Fatalf("%d link-local hosts got %d pairs", 2*maxPendingPerSource, got)
+	at := t0.Add(3 * time.Second)
+	for i, a := range keys { // every pair refreshed just now
+		announceAt(t, r, at, a, krpc.NodeID{24, byte(i)})
+	}
+	announceAt(t, r, at, addr(2), krpc.NodeID{25})
+	announceAt(t, r, at, addr(3), krpc.NodeID{25})
+	if r.RelayPairs() != 1 {
+		t.Fatal("refreshed half-formed pairs locked a real session out")
+	}
+
+	r = New(Config{ID: outsiderID(rng(80)), Rand: rng(81)})
+	for i := range 3 {
+		for at := time.Duration(0); at < maxPendingAge; at += 10 * time.Second { // refreshed well within relayIdle
+			announceAt(t, r, t0.Add(at), addr(20+i), krpc.NodeID{26, byte(i)})
+		}
+	}
+	r.expireRelays(t0.Add(maxPendingAge))
+	if n := len(r.rel.pairs); n != 0 {
+		t.Fatalf("%d refreshed half-formed pairs outlived maxPendingAge", n)
 	}
 }
 
