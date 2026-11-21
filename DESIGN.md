@@ -429,7 +429,10 @@ infrastructure.
   and both sides bind it in parallel with punching, so falling back is instant.
   Relay probes are authenticated datagrams shaped like uTP `SYN`/`STATE`. Probing
   starts immediately when the plan has no direct strategy, and otherwise
-  halfway to the punch deadline, so a direct path always wins.
+  halfway to the punch deadline, so a direct path always wins. Both sides
+  probe. The listener answers the caller's probe with three acks and hands
+  off; if every ack is lost, the caller, having seen the listener's probes,
+  connects after five unanswered probes, as on a direct path.
 - **Volunteer cost is bounded.** Routers relay by default (`DisableRelay` opts
   out), with at most 16 pairs at once (`MaxRelayPairs`) and 512 KB/s per pair
   (`RelayRate`, a token bucket; packets over budget are dropped, so end-to-end

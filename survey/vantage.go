@@ -37,7 +37,22 @@ type Vantage struct {
 	pending   map[uint16]*waiter  // by transaction id, across both sockets
 	contacted map[netip.Addr]bool // anyone we exchanged packets with
 	queue     []netip.AddrPort    // referred, never contacted
+	alt       chan altProbe       // other-port probes owed to inbound queriers
 }
+
+type altProbe struct {
+	to    netip.AddrPort
+	label string
+	at    time.Time
+}
+
+// Inbound queries come from anyone, with spoofable source addresses, so
+// what they can make us remember or probe is bounded: past these limits new
+// queriers are answered but neither tracked nor probed.
+var (
+	maxContacted = 1 << 20
+	maxAltQueue  = 1024
+)
 
 func NewVantage(cfg Config) (*Vantage, error) {
 	if cfg.ProbesPerSecond == 0 {
@@ -61,7 +76,7 @@ func NewVantage(cfg Config) (*Vantage, error) {
 		a.Close()
 		return nil, err
 	}
-	v := &Vantage{cfg: cfg, a: a, b: b, tally: NewTally(), pending: map[uint16]*waiter{}, contacted: map[netip.Addr]bool{}}
+	v := &Vantage{cfg: cfg, a: a, b: b, tally: NewTally(), pending: map[uint16]*waiter{}, contacted: map[netip.Addr]bool{}, alt: make(chan altProbe, maxAltQueue)}
 	rand.Read(v.id[:])
 	return v, nil
 }
@@ -75,6 +90,7 @@ func (v *Vantage) Run(ctx context.Context) error {
 	go v.read(v.a, true)
 	go v.read(v.b, false)
 	go v.walk(ctx)
+	go v.altProbes(ctx)
 	tick := time.NewTicker(time.Second / time.Duration(v.cfg.ProbesPerSecond))
 	defer tick.Stop()
 	for {
@@ -254,24 +270,55 @@ func (v *Vantage) serve(c *net.UDPConn, from netip.AddrPort, q *krpc.Msg) {
 		return
 	}
 	v.mu.Lock()
-	first := !v.contacted[from.Addr()]
-	v.contacted[from.Addr()] = true
+	first := !v.contacted[from.Addr()] && len(v.contacted) < maxContacted
+	if first {
+		v.contacted[from.Addr()] = true
+	}
 	v.mu.Unlock()
 	if !first {
 		return
 	}
 	label := v.cfg.Label(from.Addr())
 	v.tally.update(label, func(c *Counts) { c.InboundSeen++ })
-	go func() {
-		time.Sleep(v.cfg.AltDelay)
-		ok := v.ping(v.b, from)
-		v.tally.update(label, func(c *Counts) {
-			c.AltProbed++
-			if ok {
-				c.AltAns++
-			}
-		})
-	}()
+	select {
+	case v.alt <- altProbe{to: from, label: label, at: time.Now().Add(v.cfg.AltDelay)}:
+	default: // queue full: skip the probe rather than grow
+	}
+}
+
+// altProbes sends the owed other-port probes, each no earlier than its due
+// time and all paced at ProbesPerSecond, so concurrent pings stay bounded
+// by that rate times the ping timeout.
+func (v *Vantage) altProbes(ctx context.Context) {
+	tick := time.NewTicker(time.Second / time.Duration(v.cfg.ProbesPerSecond))
+	defer tick.Stop()
+	for {
+		var p altProbe
+		select {
+		case <-ctx.Done():
+			return
+		case p = <-v.alt:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Until(p.at)):
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		go func() {
+			ok := v.ping(v.b, p.to)
+			v.tally.update(p.label, func(c *Counts) {
+				c.AltProbed++
+				if ok {
+					c.AltAns++
+				}
+			})
+		}()
+	}
 }
 
 func host(hp string) string {

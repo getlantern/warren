@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"slices"
@@ -34,22 +35,36 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	var timeout *natprobe.TimeoutResult
 	if *mappingTimeout && len(rep.Reflectors) > 0 {
 		tr, err := natprobe.MappingTimeout(ctx, rep.Reflectors[0], nil)
 		if err != nil {
 			log.Printf("mapping timeout: %v", err)
 		}
-		defer printTimeout(tr)
+		timeout = &tr
 	}
 	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(rep); err != nil {
+		if err := writeJSON(os.Stdout, rep, timeout); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 	printReport(rep)
+	if timeout != nil {
+		printTimeout(*timeout)
+	}
+}
+
+// writeJSON writes one JSON document: the report's fields, plus the
+// timeout result when it was measured.
+func writeJSON(w io.Writer, rep *natprobe.Report, timeout *natprobe.TimeoutResult) error {
+	out := struct {
+		*natprobe.Report
+		MappingTimeout *natprobe.TimeoutResult `json:"mapping_timeout,omitempty"`
+	}{rep, timeout}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
 }
 
 func printReport(r *natprobe.Report) {

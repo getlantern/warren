@@ -109,11 +109,14 @@ func Analyze(local netip.AddrPort, obs []Observation) Analysis {
 		a.Strategy = "insufficient reflector replies"
 		return a
 	}
-	port, share := modalPort(main)
+	// The modal mapping is a whole public endpoint: a NAT that keeps the
+	// port but picks a different public IP per destination is still
+	// endpoint-dependent, and a peer can't reuse what it reflects.
+	ep, share := modalEndpoint(main)
 	if share >= modalShareForIndependent {
 		a.Mapping = MappingEndpointIndependent
 		a.Allocation = AllocationNotApplicable
-		a.PortPreserving = port == local.Port()
+		a.PortPreserving = ep.Port() == local.Port()
 		a.Strategy = "direct: advertise the reflexive address and simultaneous-open"
 		return a
 	}
@@ -158,11 +161,12 @@ func filter(obs []Observation, keep func(Observation) bool) []Observation {
 	return out
 }
 
-func modalPort(obs []Observation) (uint16, float64) {
-	counts := map[uint16]int{}
-	best, bestN := uint16(0), 0
+func modalEndpoint(obs []Observation) (netip.AddrPort, float64) {
+	counts := map[netip.AddrPort]int{}
+	var best netip.AddrPort
+	bestN := 0
 	for _, o := range obs {
-		p := o.Mapped.Port()
+		p := o.Mapped
 		counts[p]++
 		if counts[p] > bestN {
 			best, bestN = p, counts[p]

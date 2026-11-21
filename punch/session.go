@@ -160,6 +160,10 @@ type Session struct {
 	relayAck   []byte
 	peerProbe  []byte
 	peerAck    []byte
+	// relayProven: the responder's probe reached the initiator through the
+	// relay. relayUnanswered counts the initiator's probes since then.
+	relayProven     bool
+	relayUnanswered int
 }
 
 func New(cfg Config) *Session {

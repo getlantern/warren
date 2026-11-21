@@ -105,3 +105,15 @@ func ExampleBirthdayOdds() {
 	fmt.Printf("%.3f %.3f\n", BirthdayOdds(64, 256, portSpace), BirthdayOdds(64, 256, 2048))
 	// Output: 0.224 1.000
 }
+
+// A NAT that preserves the port but uses a different public IP per
+// destination gives no reusable endpoint, so it is endpoint-dependent.
+func TestSamePortDifferentIPsIsDependent(t *testing.T) {
+	obs := obsWith([]uint16{40000, 40000, 40000, 40000, 40000, 40000}, 0)
+	for i := range obs {
+		obs[i].Mapped = netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, byte(10 + i)}), 40000)
+	}
+	if a := Analyze(local, obs); a.Mapping != MappingEndpointDependent {
+		t.Fatalf("same port across %d public IPs classified %s", len(obs), a.Mapping)
+	}
+}

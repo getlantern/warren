@@ -1,10 +1,13 @@
 package punch
 
 import (
+	"bytes"
 	"math/rand/v2"
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/getlantern/warren/krpc"
 )
 
 // A responder acting on a stranger's offer must never spray a non-public
@@ -185,5 +188,113 @@ func TestRelayOnlyResponderIgnoresOfferedRelays(t *testing.T) {
 	offered := Offer{Relays: []netip.AddrPort{netip.MustParseAddrPort("6.6.6.6:6881")}, Relay: netip.MustParseAddrPort("6.6.6.7:6881")}
 	if got := s.chooseRelay(offered); got.IsValid() {
 		t.Fatalf("relay-only responder fell back to the caller's relay %v", got)
+	}
+}
+
+// relayPair runs two sessions through a fake router that hands out a token,
+// accepts the announce, and forwards non-KRPC datagrams between the two
+// announcers. dropToA decides, at send time, whether the router loses a
+// datagram it forwards to A.
+func relayPair(t *testing.T, a, b *Session, router netip.AddrPort, start time.Time, dropToA func([]byte) bool) (Event, Event) {
+	t.Helper()
+	addrA, addrB := netip.MustParseAddrPort("198.51.100.1:40000"), netip.MustParseAddrPort("203.0.113.1:40000")
+	announced := map[netip.AddrPort]bool{}
+	var evA, evB Event
+	now := start
+	route := func(from netip.AddrPort, s Send) {
+		if s.To != router {
+			return
+		}
+		var m krpc.Msg
+		if s.Data[0] == 'd' && krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+			r := krpc.Msg{T: m.T, Y: krpc.Response, R: krpc.Return{Token: []byte("tokn")}}
+			if m.Q == "announce_peer" {
+				announced[from] = true
+			}
+			to := a
+			if from == addrB {
+				to = b
+			}
+			to.HandlePacket(now, 0, router, krpc.AppendMarshal(nil, &r))
+			return
+		}
+		if !announced[addrA] || !announced[addrB] {
+			return
+		}
+		if from == addrA {
+			b.HandlePacket(now, 0, router, s.Data)
+		} else if !dropToA(s.Data) {
+			a.HandlePacket(now, 0, router, s.Data)
+		}
+	}
+	for range 1000 {
+		now = now.Add(10 * time.Millisecond)
+		a.Tick(now)
+		b.Tick(now)
+		for range 3 {
+			sa, ea := a.Drain()
+			sb, eb := b.Drain()
+			for _, e := range ea {
+				if _, ok := e.(Connected); ok || evA == nil {
+					evA = e
+				}
+			}
+			for _, e := range eb {
+				if _, ok := e.(Connected); ok || evB == nil {
+					evB = e
+				}
+			}
+			for _, s := range sa {
+				route(addrA, s)
+			}
+			for _, s := range sb {
+				route(addrB, s)
+			}
+		}
+		if _, ok := evA.(Connected); ok {
+			break
+		}
+		if _, ok := evA.(Failed); ok {
+			break
+		}
+	}
+	return evA, evB
+}
+
+// If the router loses every copy of the responder's ack, the responder has
+// already handed its socket off; the initiator must still connect.
+func TestRelayLostAckBurstStillConnects(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	router := netip.MustParseAddrPort("2.176.0.9:6881")
+	a := New(Config{Initiator: true, Secret: secret, RelayOnly: true, Relays: []netip.AddrPort{router}, Rand: rand.New(rand.NewPCG(1, 1))})
+	b := New(Config{RelayOnly: true, Relay: router, Rand: rand.New(rand.NewPCG(2, 2))})
+	now := time.Unix(1_800_000_000, 0)
+	offerA := a.Offer(nil)
+	b.Start(now, offerA)
+	a.Start(now, b.Offer(nil))
+	ack := relayMAC(secret, "ack responder", 2)
+	evA, evB := relayPair(t, a, b, router, now, func(d []byte) bool { return bytes.Equal(d, ack) })
+	if c, ok := evB.(Connected); !ok || !c.Relayed {
+		t.Fatalf("responder: %+v", evB)
+	}
+	if c, ok := evA.(Connected); !ok || !c.Relayed {
+		t.Fatalf("initiator did not connect after losing every relay ack: %+v", evA)
+	}
+}
+
+// A sequential window that would cross the top of the port space must fall
+// back to the full range rather than truncate or wrap to port 0.
+func TestSequentialWindowAtTopOfPortSpace(t *testing.T) {
+	seq := Profile{Mapping: MappingDependent, Allocation: AllocSequential, Step: 1}
+	full := portRange{1024, 65535}
+	for _, last := range []uint16{65100, 65534, 65535} {
+		cands := []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("203.0.113.1"), last)}
+		if got := targetRange(seq, cands); got != full {
+			t.Errorf("last port %d: got %+v, want the full range", last, got)
+		}
+	}
+	cands := []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:40000")}
+	if got := targetRange(seq, cands); got != (portRange{40001, 40000 + predictWindow}) {
+		t.Errorf("mid-range window %+v", got)
 	}
 }

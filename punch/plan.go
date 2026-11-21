@@ -74,8 +74,11 @@ func targetRange(p Profile, cands []netip.AddrPort) portRange {
 	case AllocSequential:
 		if last, ok := reflexivePort(cands); ok {
 			step := max(int(p.Step), 1)
-			hi := min(int(last)+step*predictWindow, 65535)
-			return portRange{last + 1, uint16(hi)}
+			// Where the allocator wraps to is unknown, so a window that
+			// would run past the top of the port space narrows nothing.
+			if hi := int(last) + step*predictWindow; hi <= 65535 {
+				return portRange{last + 1, uint16(hi)}
+			}
 		}
 	case AllocBlock:
 		if p.BlockHi > p.BlockLo {

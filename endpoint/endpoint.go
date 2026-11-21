@@ -50,9 +50,10 @@ type Config struct {
 
 // Conn is a punched path to a peer. Just after connecting, the socket can
 // still receive a few hole-punching control datagrams (KRPC, first byte
-// 'd'), such as duplicate final acknowledgements. Protocols layered above
-// drop them (uTP shaping and QUIC both reject them); raw users should read
-// with Recv, which skips them.
+// 'd'), such as duplicate final acknowledgements, and a relayed one a few
+// 20-byte relay probes or acks. Protocols layered above drop them (uTP
+// shaping and QUIC both reject them); raw users should read with Recv,
+// which skips the KRPC ones, and ignore the relay ones.
 type Conn struct {
 	*net.UDPConn
 	Remote netip.AddrPort

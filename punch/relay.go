@@ -62,11 +62,21 @@ func (s *Session) tickRelay(now time.Time) {
 		s.nextRelay = now.Add(relayRetry)
 	case now.Before(s.relayFrom):
 		s.nextRelay = s.relayFrom
-	case s.cfg.Initiator:
-		s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayProbe})
-		s.nextRelay = now.Add(relayProbeEvery)
+	case s.cfg.Initiator && s.relayProven && s.relayUnanswered >= nominateAttempts:
+		// The responder's probe reached us through the relay, so it is
+		// bound and paired; repeated silence means its acks were lost after
+		// it handed the socket to the application, which can no longer
+		// answer. A wrong guess fails loudly in the authenticated handshake
+		// that follows.
+		s.connectRelayed()
 	default:
-		s.nextRelay = s.deadline // the responder waits for the initiator's probe
+		// Both sides probe: the initiator's probe is what the responder
+		// acks, and the responder's tells the initiator the path works.
+		s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayProbe})
+		if s.cfg.Initiator && s.relayProven {
+			s.relayUnanswered++
+		}
+		s.nextRelay = now.Add(relayProbeEvery)
 	}
 }
 
@@ -103,6 +113,8 @@ func (s *Session) relayData(socket int, from netip.AddrPort, b []byte) {
 		}
 	case s.cfg.Initiator && !s.done && hmac.Equal(b, s.peerAck):
 		s.connectRelayed()
+	case s.cfg.Initiator && hmac.Equal(b, s.peerProbe):
+		s.relayProven = true
 	}
 }
 
