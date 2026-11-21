@@ -51,3 +51,29 @@ func TestPortPreservingStaysInRange(t *testing.T) {
 		t.Fatalf("a third mapping fit in a two-port range: %v", m)
 	}
 }
+
+// A range reaching below 1024 is clamped, so allocation fails when the
+// usable ports run out instead of spinning forever.
+func TestRangeBelow1024Terminates(t *testing.T) {
+	n := NewNAT(NATConfig{Public: netip.MustParseAddr("5.5.5.5"), Mapping: EndpointDependentMapping, Alloc: RandomPorts, BlockHi: 1100}, rand.New(rand.NewPCG(3, 3)))
+	now := time.Unix(1_800_000_000, 0)
+	local := netip.MustParseAddrPort("192.168.0.2:4000")
+	done := make(chan int, 1)
+	go func() {
+		ok := 0
+		for i := range 200 {
+			if _, good := n.Outbound(local, netip.AddrPortFrom(netip.AddrFrom4([4]byte{9, 9, byte(i >> 8), byte(i)}), 1), now); good {
+				ok++
+			}
+		}
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if ok != 77 {
+			t.Fatalf("allocated %d mappings, want the 77 usable ports 1024–1100", ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("allocator spun forever")
+	}
+}

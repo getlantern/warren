@@ -115,3 +115,21 @@ func TestRelayBoundAddressCannotFillTable(t *testing.T) {
 		t.Fatal("bound address lost its own pair")
 	}
 }
+
+// Tokens are per IP, so one host announcing fresh info-hashes from many
+// source ports must not fill the table either.
+func TestRelayOneHostManyPortsCannotFillTable(t *testing.T) {
+	r := New(Config{ID: outsiderID(rng(60)), Rand: rng(61)})
+	host := netip.MustParseAddr("5.5.5.1")
+	for i := range 4 * r.cfg.MaxRelayPairs {
+		announce(t, r, netip.AddrPortFrom(host, uint16(10000+i)), krpc.NodeID{11, byte(i)})
+	}
+	if got := len(r.rel.pairs); got != maxPendingPerIP {
+		t.Fatalf("one host holds %d half-formed pairs, want the cap %d", got, maxPendingPerIP)
+	}
+	announce(t, r, addr(2), krpc.NodeID{12})
+	announce(t, r, addr(3), krpc.NodeID{12})
+	if r.RelayPairs() != 1 {
+		t.Fatalf("a legitimate pair could not form: %d active", r.RelayPairs())
+	}
+}

@@ -77,6 +77,10 @@ func NewNAT(cfg NATConfig, rng *rand.Rand) *NAT {
 	if cfg.BlockHi == 0 {
 		cfg.BlockLo, cfg.BlockHi = 1024, 65535
 	}
+	// Ports below 1024 are never allocated, so the range (and the quota
+	// counted against it) starts at 1024.
+	cfg.BlockLo = max(cfg.BlockLo, 1024)
+	cfg.BlockHi = max(cfg.BlockHi, cfg.BlockLo)
 	return &NAT{cfg: cfg, rng: rng, byKey: map[mapKey]*natMapping{}, byPort: map[uint16]*natMapping{}, last: cfg.BlockLo + uint16(rng.IntN(64))}
 }
 

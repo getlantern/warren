@@ -64,8 +64,11 @@ func (r *Runner) add(c *net.UDPConn) {
 func (r *Runner) flush() (Event, error) {
 	base := r.conns[0].LocalAddr().(*net.UDPAddr)
 	network := "udp6"
-	if base.IP.To4() != nil {
+	switch {
+	case base.IP.To4() != nil:
 		network = "udp4"
+	case base.IP.IsUnspecified():
+		network = "udp" // a dual-stack base: v6-only extras couldn't reach IPv4 peers
 	}
 	for len(r.conns) < r.s.Sockets() {
 		c, err := net.ListenUDP(network, &net.UDPAddr{IP: base.IP, Zone: base.Zone})

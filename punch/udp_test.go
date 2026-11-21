@@ -141,3 +141,31 @@ func TestExtraSocketsMatchIPv6Base(t *testing.T) {
 		}
 	}
 }
+
+// On a dual-stack wildcard base, extra sockets must still reach IPv4 peers.
+// (Linux rejects IPv4 sends on v6-only sockets; macOS may not, so this
+// guards the fix where it matters.)
+func TestExtraSocketsOnDualStackBaseReachIPv4(t *testing.T) {
+	base, err := net.ListenUDP("udp", &net.UDPAddr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	if ip := base.LocalAddr().(*net.UDPAddr).IP; ip.To4() != nil {
+		t.Skip("no dual-stack wildcard socket here")
+	}
+	peer := loopbackConn(t)
+	defer peer.Close()
+	s := New(Config{Initiator: true, Secret: []byte("0123456789abcdef0123456789abcdef"), Local: Profile{Mapping: MappingDependent, Allocation: AllocRandom}, Rand: rand.New(rand.NewPCG(10, 10))})
+	s.Start(time.Now(), Offer{Candidates: []netip.AddrPort{addrOf(peer)}, Profile: Profile{Mapping: MappingIndependent}})
+	r := NewRunner(s, base)
+	defer r.Abort()
+	if _, err := r.flush(); err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range r.conns[1:] {
+		if _, err := c.WriteToUDPAddrPort([]byte("x"), addrOf(peer)); err != nil {
+			t.Fatalf("extra socket %d can't send to an IPv4 peer: %v", i+1, err)
+		}
+	}
+}

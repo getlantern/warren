@@ -29,6 +29,22 @@ type relay struct {
 
 const relayIdle = time.Minute
 
+// maxPendingPerIP bounds the half-formed pairs one source IP can hold.
+// Announce tokens are per IP, so without it one host could fill the table
+// from many ports; it isn't 1 because subscribers behind one CGNAT IP share
+// it.
+const maxPendingPerIP = 4
+
+func (r *relay) pendingFrom(ip netip.Addr) int {
+	c := 0
+	for _, p := range r.pairs {
+		if p.n == 1 && p.peers[0].Addr() == ip {
+			c++
+		}
+	}
+	return c
+}
+
 func (n *Node) relaying() bool { return !n.cfg.ReadOnly && !n.cfg.DisableRelay }
 
 // relayAnnounce records an announcer for infoHash, pairing the second
@@ -49,7 +65,7 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 		return
 	}
 	if p == nil {
-		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs {
+		if len(r.pairs) >= 4*n.cfg.MaxRelayPairs || r.pendingFrom(from.Addr()) >= maxPendingPerIP {
 			return
 		}
 		p = &relayPair{created: now, active: now, tokens: float64(n.cfg.RelayRate)}
@@ -61,8 +77,8 @@ func (n *Node) relayAnnounce(now time.Time, from netip.AddrPort, infoHash krpc.N
 			return
 		}
 	}
-	if p.n == 2 || r.byAddr[from] != nil {
-		return // pairs are fixed once formed; an address relays one pair
+	if p.n == 2 {
+		return // pairs are fixed once formed
 	}
 	if p.n == 1 && n.activePairs() >= n.cfg.MaxRelayPairs {
 		return
