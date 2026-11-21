@@ -97,6 +97,8 @@ type Endpoint struct {
 	done    chan struct{}
 	once    sync.Once
 	wg      sync.WaitGroup
+	mu      sync.Mutex
+	closed  bool // guards wg.Add for outbound Connects against Close's Wait
 }
 
 func New(cfg Config) (*Endpoint, error) {
@@ -122,6 +124,9 @@ func New(cfg Config) (*Endpoint, error) {
 func (e *Endpoint) DHT() *driver.Node { return e.node }
 
 func (e *Endpoint) Close() error {
+	e.mu.Lock()
+	e.closed = true
+	e.mu.Unlock()
 	e.once.Do(func() { close(e.done) })
 	err := e.node.Close()
 	e.wg.Wait()
@@ -155,6 +160,25 @@ func (e *Endpoint) Accept(ctx context.Context) (*Conn, error) {
 
 // Connect reaches peer by public key, signing the offer with identity.
 func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, peer [32]byte) (*Conn, error) {
+	// An outbound connection is owned by the endpoint until it is returned:
+	// Close cancels it and waits for its runner and sockets to be released.
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil, ErrClosed
+	}
+	e.wg.Add(1)
+	e.mu.Unlock()
+	defer e.wg.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-e.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	secret := make([]byte, 32)
 	crand.Read(secret)
 	sess, r, conn, err := e.prepare(ctx, punch.Config{Initiator: true, Secret: secret})

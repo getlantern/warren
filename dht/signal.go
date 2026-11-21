@@ -72,7 +72,6 @@ var (
 	ErrNotListening    = errors.New("dht: not listening")
 	ErrUnknownSession  = errors.New("dht: unknown or expired session")
 	ErrPayloadTooLarge = errors.New("dht: signaling payload too large")
-	ErrNoToken         = errors.New("dht: no write token for the relaying holder")
 )
 
 const (
@@ -358,6 +357,8 @@ type listener struct {
 	sessions map[SessionID]*session
 	seen     map[string]time.Time
 	retry    time.Duration // publication backoff while nothing stores our record
+	// tokens are write tokens fetched from replicas we didn't adopt.
+	tokens map[netip.AddrPort][]byte
 }
 
 // Listen publishes a signaling record for priv's key and keeps it reachable.
@@ -366,9 +367,13 @@ func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
 	if err != nil {
 		return err
 	}
+	// A new identity replaces the old one entirely: its records stop being
+	// republished, since their offers could no longer be decrypted.
+	n.Unlisten()
 	n.lst = &listener{
 		priv: priv, pub: [32]byte(priv.Public().(ed25519.PublicKey)), x: x,
 		records: map[int64]krpc.NodeID{}, sessions: map[SessionID]*session{}, seen: map[string]time.Time{},
+		tokens: map[netip.AddrPort][]byte{},
 	}
 	n.ensureRecords(now)
 	n.maintain(now)
@@ -451,8 +456,8 @@ func (n *Node) isRecord(target krpc.NodeID) bool {
 // recordStored adopts the nodes that acknowledged a record put as holders:
 // the closest few, plus a domestic one when domestic copies are on.
 func (n *Node) recordStored(now time.Time, l *lookup) {
-	if n.lst == nil {
-		return
+	if n.lst == nil || !n.isRecord(l.target) {
+		return // a publication started by a listener since replaced
 	}
 	if len(l.acked) == 0 {
 		// Nothing stored it, e.g. Listen before Bootstrap or every contact
@@ -564,8 +569,12 @@ func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) b
 		return matched
 	}
 	if _, dup := l.seen[string(m.Salt)]; dup {
-		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil && s.answer != nil {
-			n.sendAnswer(now, from, s.answer)
+		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil {
+			if s.answer != nil {
+				n.sendAnswer(now, from, s.answer)
+			} else {
+				s.via = from // not answered yet: reply through the holder that just proved alive
+			}
 		}
 		return true
 	}
@@ -608,37 +617,51 @@ func (n *Node) Answer(now time.Time, id SessionID, payload []byte) error {
 	if s == nil || !now.Before(s.expires) || s.answer != nil {
 		return ErrUnknownSession
 	}
-	var token []byte
-	for _, h := range n.lst.holders {
-		if h.addr == s.via && h.token != nil {
-			token = h.token
-		}
-	}
-	if token == nil {
-		return ErrNoToken
-	}
 	m, err := NewMutable(n.lst.priv, s.answerSalt, now.Unix(), bencode.AppendBytes(nil, n.seal(s.key, payload)))
 	if err != nil {
 		return err
 	}
-	a := m.args()
-	a.Token = token
-	n.send(now, s.via, "put", a, &txn{kind: txPing})
 	s.answer = &m
+	n.sendAnswer(now, s.via, &m)
 	return nil
 }
 
-// sendAnswer resends a kept answer through the holder that relayed a retried
-// offer, if we hold a write token for it.
+// sendAnswer sends an answer through the holder that relayed the offer. Any
+// replica of our record can relay one, including one whose put
+// acknowledgement we lost and so never adopted; without a write token for it
+// we fetch one with a get first.
 func (n *Node) sendAnswer(now time.Time, via netip.AddrPort, m *MutableItem) {
-	for _, h := range n.lst.holders {
+	if tok := n.lst.tokenFor(via); tok != nil {
+		a := m.args()
+		a.Token = tok
+		n.send(now, via, "put", a, &txn{kind: txPing})
+		return
+	}
+	for _, target := range n.lst.records {
+		t := target
+		n.send(now, via, "get", krpc.Args{Target: &t}, &txn{kind: txAnswerToken, answer: m})
+		return
+	}
+}
+
+// answerToken completes sendAnswer once a holder hands us a write token.
+func (n *Node) answerToken(now time.Time, via netip.AddrPort, m *krpc.Msg, answer *MutableItem) {
+	if n.lst == nil || m.Y != krpc.Response || len(m.R.Token) == 0 {
+		return
+	}
+	n.lst.tokens[via] = slices.Clone(m.R.Token)
+	a := answer.args()
+	a.Token = m.R.Token
+	n.send(now, via, "put", a, &txn{kind: txPing})
+}
+
+func (l *listener) tokenFor(via netip.AddrPort) []byte {
+	for _, h := range l.holders {
 		if h.addr == via && h.token != nil {
-			a := m.args()
-			a.Token = h.token
-			n.send(now, via, "put", a, &txn{kind: txPing})
-			return
+			return h.token
 		}
 	}
+	return l.tokens[via]
 }
 
 // ---- caller ----

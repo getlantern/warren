@@ -186,12 +186,13 @@ func TestLibtorrentWireHabits(t *testing.T) {
 		if m.Q != "get_peers" {
 			t.Errorf("bootstrap sent %q; libtorrent bootstraps with get_peers", m.Q)
 		}
-		if string(m.V) != string(DefaultVersion) || len(m.T) != 2 {
+		// Pin the literal bytes, not the constant: libtorrent 2.1.1 is LT\x02\x11.
+		if string(m.V) != "LT\x02\x11" || len(m.T) != 2 {
 			t.Errorf("query v=%q t=%dB; want libtorrent's v and 2-byte t", m.V, len(m.T))
 		}
 	}
 	r := query(t, n, addr(7), krpc.Msg{Q: "ping", A: krpc.Args{ID: outsiderID(rng(42))}})
-	if r.R.P != int(addr(7).Port()) || !r.IP.IsValid() || string(r.V) != string(DefaultVersion) {
+	if r.R.P != int(addr(7).Port()) || !r.IP.IsValid() || string(r.V) != "LT\x02\x11" {
 		t.Errorf("ping response p=%d ip=%v v=%q", r.R.P, r.IP, r.V)
 	}
 }

@@ -1,0 +1,35 @@
+package sim
+
+import (
+	"math/rand/v2"
+	"net/netip"
+	"testing"
+	"time"
+)
+
+// A step that doesn't divide evenly into the block visits only some ports;
+// allocation must still terminate and use the remaining ports.
+func TestSequentialAllocatorNonCoprimeStep(t *testing.T) {
+	n := NewNAT(NATConfig{Public: netip.MustParseAddr("5.5.5.5"), Mapping: EndpointDependentMapping,
+		Alloc: SequentialPorts, Step: 2, BlockLo: 2048, BlockHi: 2048 + 2047}, rand.New(rand.NewPCG(1, 1)))
+	local := netip.MustParseAddrPort("192.168.0.2:4000")
+	now := time.Unix(1_800_000_000, 0)
+	done := make(chan int, 1)
+	go func() {
+		ok := 0
+		for i := range 2048 {
+			if _, good := n.Outbound(local, netip.AddrPortFrom(netip.AddrFrom4([4]byte{9, 9, byte(i >> 8), byte(i)}), 1), now); good {
+				ok++
+			}
+		}
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if ok != 2048 {
+			t.Fatalf("allocated %d of 2048 ports", ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("allocator looped forever")
+	}
+}

@@ -94,3 +94,79 @@ func TestReflectionsOrderedByMappingCreation(t *testing.T) {
 }
 
 var _ = time.Second
+
+// An offer can arrive through a replica we never adopted (its put ack was
+// lost); the answer must still go out, fetching a write token first.
+func TestAnswerThroughUnadoptedReplica(t *testing.T) {
+	r := rng(80)
+	n := New(Config{ID: outsiderID(r), Rand: rng(81)})
+	provider := ed25519.NewKeyFromSeed(make([]byte, 32))
+	if err := n.Listen(t0, provider); err != nil {
+		t.Fatal(err)
+	}
+	n.Drain()
+	var target krpc.NodeID
+	for _, tg := range n.lst.records {
+		target = tg
+	}
+	// Build an offer exactly as a caller does.
+	e, _ := ecdhX25519(n.randBytes(32))
+	shared, _ := e.ECDH(n.lst.x.PublicKey())
+	offerKey, _, _ := signalKeys(shared, e.PublicKey().Bytes(), n.lst.x.PublicKey().Bytes())
+	sealed := append(e.PublicKey().Bytes(), n.seal(offerKey, []byte("hi"))...)
+	caller := ed25519.NewKeyFromSeed(append(make([]byte, 31), 1))
+	m, _ := NewMutable(caller, offerSalt(n.randBytes(16), target), t0.Unix(), bencodeBytes(sealed))
+	via := addr(42) // not among lst.holders
+	if !n.acceptOffer(t0, via, &m) {
+		t.Fatal("offer not accepted")
+	}
+	_, events := n.Drain()
+	in, ok := events[0].(Incoming)
+	if !ok {
+		t.Fatalf("events %+v", events)
+	}
+	if err := n.Answer(t0, in.Session, []byte("ok")); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	sends, _ := n.Drain()
+	var getTID []byte
+	for _, s := range sends {
+		var q krpc.Msg
+		if krpc.Unmarshal(s.Data, &q) == nil && s.To == via && q.Q == "get" {
+			getTID = q.T
+		}
+	}
+	if getTID == nil {
+		t.Fatal("no token fetch sent to the unadopted replica")
+	}
+	resp := krpc.Msg{T: getTID, Y: krpc.Response, R: krpc.Return{ID: outsiderID(r), Token: []byte("tokn")}}
+	n.HandlePacket(t0, via, krpc.AppendMarshal(nil, &resp))
+	sends, _ = n.Drain()
+	for _, s := range sends {
+		var q krpc.Msg
+		if krpc.Unmarshal(s.Data, &q) == nil && s.To == via && q.Q == "put" && string(q.A.Token) == "tokn" {
+			return
+		}
+	}
+	t.Fatal("answer not sent after the token arrived")
+}
+
+// A second Listen replaces the first identity: its records stop being
+// republished.
+func TestListenReplacesIdentity(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(82)), Rand: rng(83)})
+	a := ed25519.NewKeyFromSeed(make([]byte, 32))
+	b := ed25519.NewKeyFromSeed(append(make([]byte, 31), 9))
+	n.Listen(t0, a)
+	var old krpc.NodeID
+	for _, tg := range n.lst.records {
+		old = tg
+	}
+	n.Listen(t0, b)
+	if _, ok := n.owned[old]; ok {
+		t.Fatal("the replaced identity's record is still published")
+	}
+	if len(n.owned) != 1 {
+		t.Fatalf("%d owned records, want 1", len(n.owned))
+	}
+}

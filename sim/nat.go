@@ -170,16 +170,25 @@ func (n *NAT) allocate(localPort uint16, now time.Time) (uint16, bool) {
 		return random()
 	case SequentialPorts:
 		p := int(n.last)
-		for {
+		// A step that doesn't divide evenly into the range can cycle through
+		// only some ports, so bound the walk, then take any free port.
+		for range size {
 			p += n.cfg.Step * (1 + n.rng.IntN(n.cfg.Jitter+1))
 			if p > hi {
-				p = lo + p%size
+				p = lo + (p-lo)%size
 			}
 			if n.free(uint16(p)) {
 				n.last = uint16(p)
 				return n.last, true
 			}
 		}
+		for q := lo; q <= hi; q++ {
+			if n.free(uint16(q)) {
+				n.last = uint16(q)
+				return n.last, true
+			}
+		}
+		return 0, false
 	default:
 		return random()
 	}

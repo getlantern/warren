@@ -80,6 +80,7 @@ const (
 	txPing
 	txKeepalive
 	txOffer
+	txAnswerToken
 )
 
 type txn struct {
@@ -94,6 +95,7 @@ type txn struct {
 	holder   *holder // keepalive
 	signal   *signalOp
 	attempt  int
+	answer   *MutableItem // txAnswerToken: the answer waiting for a token
 }
 
 // record is what a put carries: an immutable value or a signed mutable item.
@@ -567,6 +569,8 @@ func (n *Node) handleReply(now time.Time, from netip.AddrPort, m *krpc.Msg) {
 		}
 	case txOffer:
 		n.offerAcked(t.signal, t.attempt, m.Y == krpc.Response)
+	case txAnswerToken:
+		n.answerToken(now, from, m, t.answer)
 	}
 }
 

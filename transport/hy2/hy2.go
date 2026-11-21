@@ -100,10 +100,10 @@ func (o *Options) quic(shaped net.PacketConn, df bool) qtls.QUICOptions {
 		q.ConnectionReceiveWindow = 5 << 19 // 2.5 MiB
 	}
 	if s := o.shaper(); s != nil && s.Overhead() > 0 {
-		// Start small enough that the overhead still fits the minimum IPv6
-		// path MTU (1232); MTU discovery then measures the real path
-		// including the overhead.
-		q.InitialPacketSize = min(1200, 1232-s.Overhead())
+		// Start at QUIC's 1200-byte minimum, which plus the (validated)
+		// overhead fits the 1232-byte IPv6 minimum path MTU; MTU discovery
+		// then measures the real path including the overhead.
+		q.InitialPacketSize = 1200 // QUIC's minimum; validate caps the overhead to fit
 		if d, ok := shaped.(DontFragmenter); ok {
 			df = df || d.DontFragment()
 		}
@@ -121,6 +121,20 @@ func (o *Options) logger() logger.ContextLogger {
 
 // shape returns the socket hysteria2 should use, plus a Salamander password
 // when hysteria2 should scramble it itself.
+// maxShaperOverhead is the most a shaper may add: QUIC's Initial packets are
+// at least 1200 bytes, and 1200 plus the overhead must fit the 1232-byte
+// IPv6 minimum path MTU.
+const maxShaperOverhead = 32
+
+var errShaperOverhead = errors.New("hy2: shaper overhead exceeds 32 bytes, which QUIC's 1200-byte Initials cannot absorb within the IPv6 minimum MTU")
+
+func (o *Options) validate() error {
+	if s := o.shaper(); s != nil && s.Overhead() > maxShaperOverhead {
+		return errShaperOverhead
+	}
+	return nil
+}
+
 func (o *Options) shaper() Shaper {
 	if o.Shaper != nil {
 		return o.Shaper
@@ -158,6 +172,9 @@ func (s *Server) Close() error {
 
 // Serve runs a hysteria2 server on pc whose certificate is identity's key.
 func Serve(ctx context.Context, pc net.PacketConn, identity ed25519.PrivateKey, opts Options, h Handler) (*Server, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
 	cert, err := certificate(identity)
 	if err != nil {
 		return nil, err
@@ -194,6 +211,9 @@ type Client struct {
 // accepts only a certificate for peerKey. The QUIC connection opens with the
 // first DialConn.
 func Dial(ctx context.Context, pc net.PacketConn, remote netip.AddrPort, peerKey [32]byte, opts Options) (*Client, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
 	df := dontFragment(pc)
 	shaped, salamander := opts.shape(pc)
 	tc := &tls.Config{

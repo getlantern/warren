@@ -187,3 +187,21 @@ func TestReceiveWindowCaps(t *testing.T) {
 		t.Fatalf("explicit windows not honored: %d / %d", q.StreamReceiveWindow, q.ConnectionReceiveWindow)
 	}
 }
+
+type bigShaper struct{ UTP }
+
+func (bigShaper) Overhead() int { return 64 }
+
+// A shaper too large for QUIC's 1200-byte Initials within the IPv6 minimum
+// MTU must be refused, not silently produce undeliverable Initials.
+func TestOversizedShaperRefused(t *testing.T) {
+	c := udp(t)
+	defer c.Close()
+	opts := Options{Shaper: bigShaper{}, Password: "pw"}
+	if _, err := Serve(context.Background(), c, key("s"), opts, echoOrCount); err != errShaperOverhead {
+		t.Fatalf("Serve: %v, want errShaperOverhead", err)
+	}
+	if _, err := Dial(context.Background(), c, c.LocalAddr().(*net.UDPAddr).AddrPort(), serverKey(), opts); err != errShaperOverhead {
+		t.Fatalf("Dial: %v, want errShaperOverhead", err)
+	}
+}

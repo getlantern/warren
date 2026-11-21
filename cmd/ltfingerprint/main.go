@@ -276,7 +276,7 @@ func describe(v bencode.Value, inner string) string {
 		parts = append(parts, fmt.Sprintf("t:%dB", len(t.Str)))
 	}
 	if ver, ok := v.Get("v"); ok {
-		parts = append(parts, fmt.Sprintf("v:%q", ver.Str[:min(2, len(ver.Str))])+fmt.Sprintf("+%dB", max(0, len(ver.Str)-2)))
+		parts = append(parts, fmt.Sprintf("v:%q", ver.Str)) // full bytes, so a version change shows
 	}
 	if ip, ok := v.Get("ip"); ok {
 		parts = append(parts, fmt.Sprintf("ip:%dB", len(ip.Str)))

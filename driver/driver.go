@@ -74,6 +74,7 @@ func (n *Node) Addr() netip.AddrPort { return n.addr }
 
 // Events delivers events not tied to a caller's operation, such as
 // PartitionChanged and IsolationChanged. Events are dropped if not consumed.
+// The channel is closed when the node shuts down.
 func (n *Node) Events() <-chan dht.Event { return n.events }
 
 func (n *Node) Close() error {
@@ -110,6 +111,7 @@ func (n *Node) read() {
 
 func (n *Node) loop(node *dht.Node) {
 	defer n.wg.Done()
+	defer close(n.events) // consumers ranging over Events stop at shutdown
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 	for {

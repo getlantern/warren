@@ -170,6 +170,16 @@ overhead per datagram from the stages. `expect.overhead` is an optional
 assertion that fails compilation if it is wrong. It costs nothing and catches
 mistakes in review.
 
+**Two size quantities, kept separate.** *Framing overhead* is the fixed number
+of bytes the stages add to every datagram (headers, tags); it is what the MTU
+rule in §6 constrains, and what `expect.overhead` and `MaxOverhead` mean.
+*Padding expansion* is variable: a padding stage may grow a small datagram up
+to its size ceiling (for example a 100-byte datagram padded to 1200). Padding
+is bounded by its ceiling, not by the framing overhead, and the ceiling itself
+must leave room for the framing overhead within the path budget. So the wire
+length of input x is at most max(len(x), padding ceiling) + framing overhead,
+and exactly len(x) + framing overhead for a spec with no padding.
+
 ### Distributions
 
 Anywhere a count, size or duration appears, any of these forms is accepted:
@@ -495,7 +505,8 @@ but never loosen them.
 | Prelude datagrams / bytes per flow | 64 / 64 KiB | stops a bad spec from becoming a flood |
 | Blocking `gap_ms` per write, total | 200 ms | it stalls quic-go's send loop |
 | `periodic_ms` minimum | 1000 ms | battery and radio (§10) |
-| Header bytes / total overhead | 64 / 64 (warn above 32) | IPv6 minimum MTU (§6) |
+| Framing overhead (header bytes + tags) | 64 (warn above 32) | IPv6 minimum MTU (§6) |
+| Padding ceiling plus framing overhead | 1232 unless DF-verified PMTUD | IPv6 minimum MTU (§6) |
 | Wire datagram | 2048 | matches sing-quic `geckoMaxOnWireSize` |
 | Fragments per packet | 8 | Gecko's limit |
 | Reassembly bytes | 1 MiB server, 64 KiB client | GOMEMLIMIT |
@@ -943,10 +954,16 @@ thing for older quic-go. So the rule is that glamour conns never expose
    upstream PR to sagernet/quic-go or a getlantern fork with a `replace`.
 2. **SO_REUSEPORT sharding (no fork, do first).** The inbound opens N sockets
    with `SO_REUSEPORT` and runs N `hysteria2.Service` instances with the same
-   users. The kernel hashes each 4-tuple to one socket, which is stable for
-   QUIC. A port hop is a new 4-tuple and a new connection anyway. This doesn't
-   reduce syscalls, but it spreads them across cores, which is what a busy VPS
-   needs.
+   users. The kernel hashes each 4-tuple to one socket. That is *not* stable
+   for a QUIC connection whose tuple changes: sing-quic's port hopping keeps
+   one QUIC connection across hops (`HopConn` only swaps the underlying UDP
+   socket), and NAT rebinding changes the client's tuple too. A changed tuple
+   can hash to a Service that doesn't own the connection, which then drops or
+   resets it. So sharding needs connection-ID-aware dispatch (route by
+   destination connection ID to the owning Service) or shared connection
+   ownership, or must be limited to tracks without port hopping, accepting
+   that NAT rebinding breaks the connection. It doesn't reduce syscalls, but
+   it spreads them across cores, which is what a busy VPS needs.
 3. **Cheaper per-packet work.** Fused copy and transform, no allocation, and
    no `crypto/rand` per packet (§7). This mostly helps the Salamander-class
    path.
@@ -1042,7 +1059,9 @@ instead of `UTP{}`; nothing else in `transport/hy2` changes. P2P has its own nee
 - **Properties** over the spec corpus and over specs generated from the
   grammar:
   - `Decode(Encode(x)) == x`.
-  - Wire length ≤ len(x) + `MaxOverhead`.
+  - Wire length ≤ max(len(x), padding ceiling) + `MaxOverhead` (framing
+    overhead; see §3), and exactly len(x) + `MaxOverhead` for specs without
+    padding.
   - Replies ≤ 1 per received datagram and no longer than it.
   - `AllocsPerRun == 0`.
 - **Fuzzing:** `go test -fuzz` on `Parse` and `Compile` with arbitrary JSON:

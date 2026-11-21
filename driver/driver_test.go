@@ -205,3 +205,23 @@ func TestSignalOverUDP(t *testing.T) {
 	}
 	t.Logf("signaled over real UDP in %v", time.Since(start))
 }
+
+// Consumers ranging over Events must stop when the node closes.
+func TestEventsClosedOnShutdown(t *testing.T) {
+	n, err := Listen("127.0.0.1:0", memberConfig(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		for range n.Events() {
+		}
+		close(done)
+	}()
+	n.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Events consumer still blocked after Close")
+	}
+}
