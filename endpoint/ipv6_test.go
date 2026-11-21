@@ -214,15 +214,32 @@ func TestFirstOfferDedupes(t *testing.T) {
 	if ok || copyEntry != entry {
 		t.Fatal("a repeated offer was accepted twice, or didn't share the first copy's entry")
 	}
-	entry.publish([]byte("answer"))
-	entry.publish(nil) // later publishes don't change it
-	select {
-	case <-copyEntry.done:
-		if string(copyEntry.answer) != "answer" {
-			t.Fatalf("the copy got answer %q", copyEntry.answer)
-		}
-	default:
-		t.Fatal("the copy wasn't released by the first copy's answer")
+	// A copy arriving before the answer is queued, not left waiting; the
+	// first copy answers it on publishing. Further copies get nothing.
+	if _, now := copyEntry.copyOf(dht.SessionID{1}); now {
+		t.Fatal("a copy was answered before there was an answer")
+	}
+	if _, now := copyEntry.copyOf(dht.SessionID{2}); now {
+		t.Fatal("a third copy was answered")
+	}
+	queued := entry.publish([]byte("answer"))
+	if len(queued) != 1 || queued[0] != (dht.SessionID{1}) {
+		t.Fatalf("publishing returned queued copies %v, want just the first copy", queued)
+	}
+	if entry.publish(nil) != nil || string(entry.answer) != "answer" {
+		t.Fatal("a later publish changed the answer")
+	}
+	late, ok := e.firstOffer(alice, secret, now.Add(2*time.Second))
+	if ok {
+		t.Fatal("a late copy was treated as new")
+	}
+	if _, now := late.copyOf(dht.SessionID{3}); now {
+		t.Fatal("a copy beyond the cap was answered after publishing")
+	}
+	fresh := &offerEntry{done: make(chan struct{})}
+	fresh.publish([]byte("ready"))
+	if a, now := fresh.copyOf(dht.SessionID{4}); !now || string(a) != "ready" {
+		t.Fatal("a copy arriving after the answer wasn't answered at once")
 	}
 	if !first(bob, now.Add(time.Second)) {
 		t.Fatal("another caller's offer was blocked by the first caller's entry")

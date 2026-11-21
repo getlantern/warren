@@ -118,17 +118,64 @@ type Endpoint struct {
 	dupes    atomic.Int64             // repeat copies seen, for tests
 }
 
-// offerEntry is one offer being answered. Copies of it through another DHT
-// wait for its answer and send the same one through their own session.
+// offerEntry is one offer being answered. A copy of it through the other
+// family's DHT gets the same answer through its own session, sent at once
+// if the answer is ready or by the first copy when it is. Copies never
+// wait, so they hold no inbound slot, and only one is answered: a caller
+// replaying its own offer gets nothing more.
 type offerEntry struct {
-	at     time.Time
-	done   chan struct{} // closed once answer is set
-	answer []byte        // nil when there is no answer
-	once   sync.Once
+	at       time.Time
+	mu       sync.Mutex
+	done     chan struct{} // closed once answer is set
+	answer   []byte        // nil when there is no answer
+	answered int           // copies answered or queued
+	pending  []dht.SessionID
 }
 
-func (o *offerEntry) publish(answer []byte) {
-	o.once.Do(func() { o.answer = answer; close(o.done) })
+const maxOfferCopies = 1 // one per other address family
+
+// copyOf handles a copy of the offer: it returns the answer to send now,
+// or queues the session for the first copy to answer.
+func (o *offerEntry) copyOf(s dht.SessionID) (answer []byte, now bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.answered >= maxOfferCopies {
+		return nil, false
+	}
+	o.answered++
+	select {
+	case <-o.done:
+		return o.answer, o.answer != nil
+	default:
+		o.pending = append(o.pending, s)
+		return nil, false
+	}
+}
+
+// publish sets the answer, once, and returns the queued copies to answer.
+func (o *offerEntry) publish(answer []byte) []dht.SessionID {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	select {
+	case <-o.done:
+		return nil
+	default:
+	}
+	o.answer = answer
+	close(o.done)
+	p := o.pending
+	o.pending = nil
+	if answer == nil {
+		return nil
+	}
+	return p
+}
+
+// publishOffer sets an offer's answer and sends it to queued copies.
+func (e *Endpoint) publishOffer(ctx context.Context, o *offerEntry, answer []byte) {
+	for _, s := range o.publish(answer) {
+		_ = e.node.Answer(ctx, s, answer)
+	}
 }
 
 // wantFamilies decides which legs a provider runs for an offer: IPv4 when
@@ -637,16 +684,12 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		// DHT; its secret identifies it. Punch and charge for it once, but
 		// answer this copy too, with the same answer, in case the other
 		// copy's answer is lost.
-		select {
-		case <-entry.done:
-			if entry.answer != nil {
-				_ = e.node.Answer(ctx, in.Session, entry.answer)
-			}
-		case <-ctx.Done():
+		if answer, now := entry.copyOf(in.Session); now {
+			_ = e.node.Answer(ctx, in.Session, answer)
 		}
 		return
 	}
-	defer entry.publish(nil) // any early return leaves copies unanswered
+	defer e.publishOffer(ctx, entry, nil) // any early return leaves copies unanswered
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.
 	has4, has6 := e.families()
@@ -656,7 +699,7 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		// instead of waiting out signaling.
 		empty := punch.Offer{}
 		b := empty.Marshal()
-		entry.publish(b)
+		e.publishOffer(ctx, entry, b)
 		_ = e.node.Answer(ctx, in.Session, b)
 		return
 	}
@@ -705,7 +748,7 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	answer := offerOf(legs)
 	ab := answer.Marshal()
-	entry.publish(ab)
+	e.publishOffer(ctx, entry, ab)
 	if err := e.node.Answer(ctx, in.Session, ab); err != nil {
 		abortAll(legs)
 		return
