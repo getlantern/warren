@@ -244,16 +244,19 @@ func TestFirstOfferDedupes(t *testing.T) {
 	if !first(bob, now.Add(time.Second)) {
 		t.Fatal("another caller's offer was blocked by the first caller's entry")
 	}
-	if !first(alice, now.Add(time.Minute)) {
-		t.Fatal("an offer was remembered long after any copy could arrive")
+	if first(alice, now.Add(dht.OfferWindow-time.Second)) {
+		t.Fatal("a copy arriving late in the DHT's offer window was treated as new")
+	}
+	if !first(alice, now.Add(dht.OfferWindow+time.Second)) {
+		t.Fatal("an offer was remembered after the DHT would no longer accept a copy")
 	}
 	for i := range 2 * maxRecentOffers {
-		first([32]byte{3, byte(i), byte(i >> 8)}, now.Add(time.Minute))
+		first([32]byte{3, byte(i), byte(i >> 8)}, now.Add(3*time.Minute))
 	}
 	if len(e.offers) > maxRecentOffers {
 		t.Fatalf("offer memory grew to %d", len(e.offers))
 	}
-	if !first([32]byte{4}, now.Add(time.Minute)) {
+	if !first([32]byte{4}, now.Add(3*time.Minute)) {
 		t.Fatal("a full table refused a new offer instead of evicting the oldest")
 	}
 }

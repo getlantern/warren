@@ -77,6 +77,10 @@ var (
 const (
 	MaxSignalPayload = 900
 	RecordEpoch      = time.Hour
+	// OfferWindow bounds how far apart two copies of one offer can be
+	// accepted: an offer is refused more than offerMaxSkew either side of
+	// its signing time, so any copy arrives within this of the first.
+	OfferWindow = 2 * offerMaxSkew * time.Second
 
 	signalAttemptTimeout = 4 * time.Second // answers wait on the provider gathering a fresh socket; dead holders are caught by the ack
 	offerMaxSkew         = 60              // seconds between signer and verifier clocks

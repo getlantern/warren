@@ -225,16 +225,17 @@ const maxRecentOffers = 4096
 
 // firstOffer returns the entry for this caller's offer with this secret,
 // reporting whether it is new. Entries are keyed by caller and secret, so
-// one caller can't touch another's, and remembered for twice a punch's
-// lifetime, longer than any copy of the same offer could still arrive
-// through another DHT. When full, the oldest entry makes way: a flood can't
+// one caller can't touch another's, and remembered for as long as the DHT
+// would still accept a copy of the offer (dht.OfferWindow). When full, the oldest entry makes way: a flood can't
 // make us refuse offers.
 func (e *Endpoint) firstOffer(caller [32]byte, secret []byte, now time.Time) (*offerEntry, bool) {
 	h := sha256.New()
 	h.Write(caller[:])
 	h.Write(secret)
 	key := [32]byte(h.Sum(nil))
-	ttl := 2 * (e.cfg.GatherWait + e.cfg.PunchDeadline)
+	// A copy can arrive as late as the DHT still accepts the offer: a
+	// slower family's signal keeps retrying after the first answer.
+	ttl := max(2*(e.cfg.GatherWait+e.cfg.PunchDeadline), dht.OfferWindow)
 	e.offersMu.Lock()
 	defer e.offersMu.Unlock()
 	if e.offers == nil {
