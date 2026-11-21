@@ -44,7 +44,9 @@ func main() {
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		enc.Encode(rep)
+		if err := enc.Encode(rep); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 	printReport(rep)

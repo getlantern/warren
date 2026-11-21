@@ -12,10 +12,12 @@ func setDontFragment(c *net.UDPConn) bool {
 		return false
 	}
 	ok := false
-	rc.Control(func(fd uintptr) {
+	if err := rc.Control(func(fd uintptr) {
 		v4 := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DO)
 		v6 := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MTU_DISCOVER, unix.IPV6_PMTUDISC_DO)
 		ok = v4 == nil || v6 == nil
-	})
+	}); err != nil {
+		return false
+	}
 	return ok
 }

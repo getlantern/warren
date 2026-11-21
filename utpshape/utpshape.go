@@ -263,7 +263,10 @@ func (c *Conn) ReadFrom(b []byte) (int, net.Addr, error) {
 		}
 		payload := buf[HeaderLen:n]
 		if len(payload) > len(b) {
-			return 0, nil, errShort
+			// Drop it, as a uTP stack would. Returning an error here would let
+			// one oversized datagram from anyone tear down the QUIC transport
+			// above, which treats read errors as fatal.
+			continue
 		}
 		c.xor(b[:len(payload)], payload, h)
 		return len(payload), addr, nil

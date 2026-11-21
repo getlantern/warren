@@ -263,6 +263,15 @@ open/consistent/random label:
 | independent | direct simultaneous open | **spray** the peer's predicted window (sequential), its block, or the full range |
 | dependent | **open** sockets toward the peer | **double birthday** when both ranges are known, otherwise relay |
 
+**Probe authentication.** Probe IDs are static per-session values derived
+from the secret, so an off-path attacker can't forge one. An on-path observer
+who sees a probe could race a copy from its own address and get that address
+nominated. That is accepted: an on-path attacker can already drop the
+packets, and impersonation still fails, because hysteria2 pins the provider's
+key and derives its password from the secret. Inbound punches are rate-limited
+per candidate /24 (or /48) and globally (`endpoint/limit.go`), so a forged
+offer naming a victim can't turn a listener into a probe reflector.
+
 **The initiator nominates** the first confirmed path. Responses are matched by
 **transaction ID, not source address**, as ICE does. Under dependent mapping a
 reply comes from a new port; nominating that port would mint fresh mappings on
@@ -393,6 +402,10 @@ infrastructure.
   congestion control backs off). An address relays one pair, pairs are fixed
   once formed so a third announcer can't join or hijack them, idle pairs expire
   after a minute, and read-only phones never relay.
+- **A relay-only listener accepts only a relay it already knows.** The
+  caller picks the relay, and a relay learns both addresses, so a relay-only
+  listener uses the caller's choice only if it is an authenticated contact in
+  its own routing table.
 - **Relay-only privacy mode** (`endpoint.Config.RelayOnly`, `punch.Config.RelayOnly`).
   The offer carries no candidates and the peer is never probed directly, so a
   peer sees only the relay, never your IP. The relay router still sees both

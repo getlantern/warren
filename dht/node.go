@@ -901,6 +901,9 @@ func (n *Node) maintain(now time.Time) {
 		if len(n.lookups) >= n.cfg.MaxLookups-4 {
 			break
 		}
+		if e, ok := n.recordEpoch(k); ok {
+			n.signRecord(now, e) // a fresh seq rebinds holders that lost us
+		}
 		o := n.owned[k]
 		o.next = now.Add(n.cfg.RepublishInterval)
 		if l := n.startInternal(now, n.primary, putItem, k, o.rec); l != nil && n.isRecord(k) {

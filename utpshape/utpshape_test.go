@@ -303,3 +303,17 @@ func BenchmarkRoundTripUDP(b *testing.B) {
 		c.ReadFrom(buf)
 	}
 }
+
+// An oversized datagram must be dropped, not surfaced as an error: QUIC
+// treats read errors as fatal, so one crafted packet would kill the transport.
+func TestOversizedDatagramDropped(t *testing.T) {
+	a, b, _, _ := pair(t)
+	a.WriteTo(make([]byte, 3000), b.LocalAddr())
+	a.WriteTo([]byte("after"), b.LocalAddr())
+	b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1500)
+	n, _, err := b.ReadFrom(buf)
+	if err != nil || string(buf[:n]) != "after" {
+		t.Fatalf("got %q, %v; want the oversized datagram skipped", buf[:n], err)
+	}
+}

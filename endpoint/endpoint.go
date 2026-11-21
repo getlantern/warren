@@ -69,13 +69,14 @@ func (c *Conn) Send(b []byte) error {
 }
 
 type Endpoint struct {
-	cfg    Config
-	node   *driver.Node
-	accept chan *Conn
-	slots  chan struct{}
-	done   chan struct{}
-	once   sync.Once
-	wg     sync.WaitGroup
+	cfg     Config
+	node    *driver.Node
+	limiter inboundLimiter
+	accept  chan *Conn
+	slots   chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	wg      sync.WaitGroup
 }
 
 func New(cfg Config) (*Endpoint, error) {
@@ -155,12 +156,15 @@ func (e *Endpoint) prepare(ctx context.Context, pc punch.Config) (*punch.Session
 	}
 	var reflections []dht.Reflection
 	var reflectors []netip.AddrPort
-	e.node.Inspect(ctx, func(d *dht.Node) {
+	if err := e.node.Inspect(ctx, func(d *dht.Node) {
 		reflections = d.Reflections()
 		for _, c := range d.Contacts(3) {
 			reflectors = append(reflectors, c.Addr)
 		}
-	})
+	}); err != nil {
+		conn.Close()
+		return nil, nil, nil, err
+	}
 	if pc.Initiator && len(reflectors) > 0 {
 		// Routers relay by default; our closest contact is the fallback.
 		pc.Relay = reflectors[0]
@@ -235,6 +239,20 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	offer, err := punch.UnmarshalOffer(in.Payload)
 	if err != nil || len(offer.Secret) < 16 {
 		return
+	}
+	// A caller can list anyone's address as its candidate; bound how often
+	// we will probe a network on a stranger's word.
+	if !e.limiter.allow(offer.Candidates, time.Now()) {
+		return
+	}
+	if e.cfg.RelayOnly && offer.Relay.IsValid() {
+		// The caller picks the relay, and a relay learns our address. Keeping
+		// that address from the caller means accepting only a router we
+		// already authenticated ourselves.
+		known := false
+		if err := e.node.Inspect(ctx, func(d *dht.Node) { known = d.Knows(offer.Relay) }); err != nil || !known {
+			offer.Relay = netip.AddrPort{}
+		}
 	}
 	sess, r, conn, err := e.prepare(ctx, punch.Config{})
 	if err != nil {

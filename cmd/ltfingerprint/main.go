@@ -124,23 +124,32 @@ func main() {
 	}()
 
 	// Exercise our client side against libtorrent: bootstrap, put, get.
-	ops <- func(now time.Time) { node.Bootstrap(now, peers) }
+	ops <- func(now time.Time) {
+		if _, err := node.Bootstrap(now, peers); err != nil {
+			log.Print(err)
+		}
+	}
 	time.Sleep(3 * time.Second)
-	ops <- func(now time.Time) { node.Put(now, dht.ImmutableValue([]byte("from the go node"))) }
+	ops <- func(now time.Time) {
+		if _, _, err := node.Put(now, dht.ImmutableValue([]byte("from the go node"))); err != nil {
+			log.Print(err)
+		}
+	}
 	time.Sleep(2 * time.Second)
-	ops <- func(now time.Time) { node.Get(now, krpc.NodeID{1, 2, 3}) }
-	cmd.Wait()
+	ops <- func(now time.Time) {
+		if _, err := node.Get(now, krpc.NodeID{1, 2, 3}); err != nil {
+			log.Print(err)
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		log.Printf("libtorrent peers: %v", err)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	if report(caps, ltVersion) > 0 {
 		os.Exit(1)
 	}
-}
-
-type shape struct {
-	impl, kind string
-	desc       string
 }
 
 func report(caps []capture, ltVersion string) int {

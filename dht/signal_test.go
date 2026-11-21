@@ -50,9 +50,20 @@ func TestBindingResistsReplay(t *testing.T) {
 	if dst, _ := f.offerDest(salt, t0.Add(110*time.Second)); dst != moved {
 		t.Fatalf("newer signed put did not rebind: %v", dst)
 	}
-	// A binding nobody refreshes stops forwarding.
-	if _, ok := f.offerDest(salt, t0.Add(110*time.Second+forwardTTL)); ok {
+	// A binding nobody refreshes stops forwarding, and a replay of the same
+	// signed put from elsewhere cannot take it over even then.
+	stale := t0.Add(110*time.Second + forwardTTL)
+	if _, ok := f.offerDest(salt, stale); ok {
 		t.Fatal("stale binding still forwards")
+	}
+	f.bind(target, attacker, 101, stale)
+	f.touch(target, attacker, stale)
+	if dst, ok := f.offerDest(salt, stale); ok && dst == attacker {
+		t.Fatal("replayed put captured a stale binding")
+	}
+	f.bind(target, moved, 102, stale.Add(time.Second))
+	if dst, _ := f.offerDest(salt, stale.Add(time.Second)); dst != moved {
+		t.Fatalf("provider's fresh put did not recover the binding: %v", dst)
 	}
 }
 

@@ -285,7 +285,7 @@ type boundConn struct {
 
 func (c *boundConn) Read(b []byte) (int, error) {
 	for {
-		n, from, err := c.PacketConn.ReadFrom(b)
+		n, from, err := c.ReadFrom(b)
 		if err != nil {
 			return 0, err
 		}
@@ -295,7 +295,7 @@ func (c *boundConn) Read(b []byte) (int, error) {
 	}
 }
 
-func (c *boundConn) Write(b []byte) (int, error) { return c.PacketConn.WriteTo(b, c.remote) }
+func (c *boundConn) Write(b []byte) (int, error) { return c.WriteTo(b, c.remote) }
 func (c *boundConn) RemoteAddr() net.Addr        { return c.remote }
 
 type handler struct{ h Handler }
@@ -311,7 +311,7 @@ func (h handler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr
 }
 
 func (handler) NewPacketConnectionEx(_ context.Context, conn N.PacketConn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
-	conn.Close()
+	_ = conn.Close() // rejecting the stream; nothing to do with the error
 	if onClose != nil {
 		onClose(errors.New("hy2: UDP relay disabled"))
 	}

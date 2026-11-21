@@ -78,6 +78,8 @@ func main() {
 			}
 		}
 	}()
-	v.Run(ctx)
+	if err := v.Run(ctx); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Println(v.Tally())
 }

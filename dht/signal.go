@@ -96,7 +96,7 @@ func RecordSalt(provider [32]byte, epoch int64) []byte {
 	h := sha256.New()
 	h.Write([]byte("warren/record/v1"))
 	h.Write(provider[:])
-	binary.Write(h, binary.LittleEndian, epoch)
+	h.Write(binary.LittleEndian.AppendUint64(nil, uint64(epoch)))
 	return h.Sum(nil)[:16]
 }
 
@@ -215,15 +215,17 @@ type forwarder struct {
 	answers map[string]pendingAnswer
 }
 
-// bind records the address a signed put for target came from. A newer
-// sequence number always rebinds; an equal one only refreshes the same
-// address, unless the binding has gone stale.
+// bind records the address a signed put for target came from. Only a
+// strictly newer sequence number moves a binding to a new address; an equal
+// one only refreshes the same address, even once stale, since anyone can
+// replay the provider's last put. Providers re-sign on every republish, so a
+// binding lost to a gap in keepalives recovers within one republish interval.
 func (f *forwarder) bind(target krpc.NodeID, addr netip.AddrPort, seq int64, now time.Time) {
 	if f.binds == nil {
 		f.binds = map[krpc.NodeID]*binding{}
 	}
 	b := f.binds[target]
-	if b != nil && seq <= b.seq && addr != b.addr && now.Sub(b.seen) < forwardTTL {
+	if b != nil && seq <= b.seq && addr != b.addr {
 		return
 	}
 	if b == nil && len(f.binds) >= maxBindings {
@@ -415,6 +417,19 @@ func (n *Node) resign(now time.Time) {
 	for e := range n.lst.records {
 		n.signRecord(now, e)
 	}
+}
+
+// recordEpoch reports the epoch of one of our record targets.
+func (n *Node) recordEpoch(target krpc.NodeID) (int64, bool) {
+	if n.lst == nil {
+		return 0, false
+	}
+	for e, t := range n.lst.records {
+		if t == target {
+			return e, true
+		}
+	}
+	return 0, false
 }
 
 func (n *Node) isRecord(target krpc.NodeID) bool {
