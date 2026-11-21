@@ -117,3 +117,16 @@ func TestLimiterRefusalsDoNotGrow(t *testing.T) {
 		t.Fatalf("refused attempts grew the tables from %d to %d entries", before, after)
 	}
 }
+
+// Relays are budgeted by exact address: independent routers in one /24
+// don't share a quota.
+func TestLimiterRelayExactAddress(t *testing.T) {
+	var l inboundLimiter
+	r1 := netip.MustParseAddrPort("2.176.0.9:6881")
+	for i := range perNetworkMax {
+		l.allow(caller(byte(i)), ap(fmtAddr(i)), r1, false, now)
+	}
+	if !l.allow(caller(70), ap("198.18.5.1:1"), netip.MustParseAddrPort("2.176.0.10:6881"), false, now) {
+		t.Fatal("a different router in the same /24 was refused")
+	}
+}

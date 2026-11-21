@@ -18,6 +18,7 @@ type packet struct {
 // Runner drives a Session over real UDP sockets. Socket 0 is the caller's;
 // the runner opens the rest on demand, on the same IP.
 type Runner struct {
+	once    sync.Once
 	relayed bool
 	s       *Session
 	conns   []*net.UDPConn
@@ -151,9 +152,19 @@ func (r *Runner) Punch(ctx context.Context, remote Offer) (*net.UDPConn, netip.A
 // Relayed reports whether Punch returned a relayed path.
 func (r *Runner) Relayed() bool { return r.relayed }
 
+// Abort stops the runner without punching, for callers that give up
+// between Gather and Punch: it stops the readers (which may be blocked
+// handing a packet to an inbox nobody drains) and closes the extra sockets.
+// Socket 0 stays open for the caller to close. Safe to call more than once.
+func (r *Runner) Abort() { r.close(-1) }
+
 // close stops all readers, closing every opened socket except keep. Socket
-// 0 belongs to the caller and is never closed here.
+// 0 belongs to the caller and is never closed here. Only the first call acts.
 func (r *Runner) close(keep int) {
+	r.once.Do(func() { r.closeOnce(keep) })
+}
+
+func (r *Runner) closeOnce(keep int) {
 	r.mu.Lock()
 	for i := range r.conns {
 		r.stopped[i] = true

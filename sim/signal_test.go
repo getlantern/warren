@@ -1,13 +1,16 @@
 package sim
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"net/netip"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/getlantern/warren/dht"
+	"github.com/getlantern/warren/krpc"
 )
 
 func key(seed string) ed25519.PrivateKey {
@@ -154,5 +157,49 @@ func TestSignalUnknownProvider(t *testing.T) {
 	res := signal(t, w, w.readersIR[0], w.readersIR[1], key("nobody"))
 	if res.failed == nil || res.failed.Err != dht.ErrNoRecord {
 		t.Fatalf("want ErrNoRecord, got %+v %+v", res.failed, res.answered)
+	}
+}
+
+// Listen before Bootstrap publishes into an empty table; the record must
+// reach holders soon after routing becomes available, not at the next
+// 30-minute republish.
+func TestListenBeforeBootstrap(t *testing.T) {
+	w := build(15, scenarios[0], sizes{ir: 60, abroad: 20, readers: 10})
+	w.join(20 * time.Minute)
+	n := w.s.Add(netip.MustParseAddrPort("2.190.1.1:6881"), true, dht.Config{
+		ID: farsi.Tag(krpc.SecureID(netip.MustParseAddr("2.190.1.1"), krpc.NodeID{1, 2, 3})), Community: &farsi, ReadOnly: true,
+	})
+	pk := key("early listener")
+	w.s.Do(n, func(now time.Time) { n.DHT.Listen(now, pk) })
+	w.s.RunUntil(w.s.Now.Add(time.Second))
+	w.s.Do(n, func(now time.Time) { n.DHT.Bootstrap(now, []netip.AddrPort{w.routersIR[0].Addr}) })
+	w.s.RunUntil(w.s.Now.Add(2 * time.Minute))
+	if len(n.DHT.Holders()) == 0 {
+		t.Fatal("record not stored within 2 minutes of bootstrapping")
+	}
+}
+
+// If the provider's answer is lost, the caller's retry through another
+// holder must still get it.
+func TestLostAnswerRecovered(t *testing.T) {
+	w := build(16, scenarios[0], sizes{ir: 80, abroad: 30, readers: 20})
+	w.join(30 * time.Minute)
+	provider, caller := w.readersIR[3], w.readersIR[11]
+	pk := key("provider-lost-answer")
+	listen(t, w, provider, pk)
+	dropped := false
+	w.s.OnSend = func(from *Node, to netip.AddrPort, data []byte) {
+		if from == provider && !dropped && bytes.Contains(data, []byte("3:put")) {
+			dropped = true
+			from.Offline = true // drop just this datagram
+			w.s.At(w.s.Now, func() { from.Offline = false })
+		}
+	}
+	res := signal(t, w, caller, provider, pk)
+	if !dropped {
+		t.Fatal("test did not drop the answer")
+	}
+	if res.answered == nil {
+		t.Fatalf("no answer after the first was lost: %+v", res.failed)
 	}
 }

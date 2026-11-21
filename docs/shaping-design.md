@@ -988,10 +988,14 @@ instead of `UTP{}`; nothing else in `transport/hy2` changes. P2P has its own nee
 - **There is no stock server.** Every P2P spec is effectively `engine` class.
   Injection specs barely matter, because there's no SNI-inspecting
   middlebox model between peers.
-- **The socket is shared with the DHT.** libtorrent runs DHT and uTP on one
-  socket, which is the cover. `WrapPacketConn` takes an `OnUnmatched(dgram,
-  addr)` callback, so datagrams that fail framing (bencoded KRPC starting with
-  `d`) go to warren's DHT demux instead of being dropped.
+- **Sockets.** Today warren's DHT runs on its own socket (`driver.Node`), and
+  each connection gets a fresh data socket (`endpoint.prepare`) that carries
+  the punch's KRPC pings and then the shaped hysteria2 traffic. So it's the
+  *data* socket that mixes KRPC and uTP-shaped datagrams, as libtorrent's
+  shared socket does. Leftover punch-control datagrams (first byte `d`) that
+  arrive after handoff must be dropped, as `utpshape` does, not delivered.
+  Moving the DHT onto the same socket as the data path would need a real
+  demultiplexer and reply path, and isn't planned.
 - **Punch probes.** Probes can be the spec's own `syn` message, so the first
   datagrams on a flow already match the cover.
 - **Keys and agreement.** The key comes from `hy2.FromSecret`. A signaling

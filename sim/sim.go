@@ -122,11 +122,22 @@ func (s *Sim) Do(n *Node, f func(now time.Time)) {
 	s.flush(n)
 }
 
+// At schedules f to run at t, in order with packet deliveries.
+func (s *Sim) At(t time.Time, f func()) { s.push(&event{at: t, fn: f}) }
+
+// RunUntil advances virtual time to t, processing every event before it.
+// Time never moves backwards: an earlier t panics, since rewinding the clock
+// without undoing state would silently corrupt measurements.
 func (s *Sim) RunUntil(t time.Time) {
+	if t.Before(s.Now) {
+		panic("sim: RunUntil moves time backwards")
+	}
 	for s.q.Len() > 0 && !s.q[0].at.After(t) {
 		ev := heap.Pop(&s.q).(*event)
 		s.Now = ev.at
 		switch {
+		case ev.fn != nil:
+			ev.fn()
 		case ev.data != nil:
 			s.deliver(ev)
 		case ev.sess != nil:
@@ -265,6 +276,7 @@ type event struct {
 	seq  uint64
 	to   *Node
 	sess *Session
+	fn   func()
 	from netip.AddrPort
 	dst  netip.AddrPort
 	data []byte

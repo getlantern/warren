@@ -174,3 +174,16 @@ func TestMTUDiscoveryRequiresDontFragment(t *testing.T) {
 		t.Log("Don't Fragment unsupported on this platform; MTU discovery stays off")
 	}
 }
+
+// The receive-window caps are what keep a transfer inside the iOS network
+// extension's budget; hysteria2's own defaults are 8 and 20 MiB.
+func TestReceiveWindowCaps(t *testing.T) {
+	q := (&Options{}).quic(nil, true)
+	if q.StreamReceiveWindow != 1<<20 || q.ConnectionReceiveWindow != 5<<19 {
+		t.Fatalf("default windows %d / %d, want 1 MiB / 2.5 MiB", q.StreamReceiveWindow, q.ConnectionReceiveWindow)
+	}
+	q = (&Options{StreamWindow: 3 << 20, ConnWindow: 6 << 20}).quic(nil, true)
+	if q.StreamReceiveWindow != 3<<20 || q.ConnectionReceiveWindow != 6<<20 {
+		t.Fatalf("explicit windows not honored: %d / %d", q.StreamReceiveWindow, q.ConnectionReceiveWindow)
+	}
+}

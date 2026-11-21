@@ -9,16 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/getlantern/warren/punch"
 	"github.com/getlantern/warren/transport/hy2"
 )
 
-// hardPhone claims a NAT with no direct strategy and keeps its addresses
-// from peers, forcing the relay even on loopback.
+// hardPhone keeps its addresses from peers. On loopback a direct punch would
+// succeed, so a relayed result proves RelayOnly is honored end to end.
 func hardPhone(t *testing.T, seed netip.AddrPort) *Endpoint {
 	t.Helper()
-	random := punch.Profile{Mapping: punch.MappingDependent, Allocation: punch.AllocRandom}
-	e, err := New(Config{DHT: member(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1), Profile: &random, RelayOnly: true})
+	e, err := New(Config{DHT: member(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1), RelayOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -98,3 +98,22 @@ func TestRelayNeededFailsFast(t *testing.T) {
 		t.Errorf("relay-needed took %v; should fail without probing", time.Since(start))
 	}
 }
+
+// Abort must stop a runner whose reader is blocked handing packets to an
+// inbox nobody drains (between Gather and Punch).
+func TestAbortUnblocksReader(t *testing.T) {
+	c := loopbackConn(t)
+	r := NewRunner(New(Config{Rand: rand.New(rand.NewPCG(4, 4))}), c)
+	flood := loopbackConn(t)
+	for range 400 {
+		flood.WriteToUDPAddrPort([]byte("x"), addrOf(c))
+	}
+	time.Sleep(100 * time.Millisecond) // let the reader fill the inbox and block
+	done := make(chan struct{})
+	go func() { r.Abort(); r.Abort(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Abort did not stop a blocked reader")
+	}
+}

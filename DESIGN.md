@@ -29,12 +29,15 @@ deliberately incompatible with BitTorrent.
 - **Every resource is bounded:** routing entries, candidates per lookup, in-flight
   RPCs, stored items, sockets per punch, probes per punch.
 - **Admission diversity:** one identity per IP, at most 2 per /24 (or /64) per
-  bucket, and 8 per prefix per table. Lookups also track provenance, with per-origin
-  candidate quotas.
+  bucket, and 8 per prefix per table; lookups admit at most 8 candidates per
+  prefix. Rust warren also tracks lookup provenance with per-origin quotas;
+  that is planned here, not built.
 - **Value retrieval during traversal** (BEP 44 `get` lookups return on the first
   verified value).
-- **Blinded, rotating keys:** `H(key ‖ epoch)` with current+next announce and
-  current+previous lookup.
+- **Blinded, rotating keys:** `H(key ‖ epoch)`. Providers publish the
+  current epoch's record and keep the previous one until it ages out; callers
+  try the current epoch, then the previous. Pre-publishing the next epoch is
+  planned.
 
 ## Wire: Mainline as-is
 
@@ -45,7 +48,7 @@ deliberately incompatible with BitTorrent.
 | 42 | Secure node IDs for server nodes, plus the `ip` field (our free reflector, see below) |
 | 43 | `ro=1` for phones: query-only, never in routing tables, no storage |
 | 44 | Signed mutable items: records and signaling |
-| 51 | Answer `sample_infohashes` like a normal node |
+| 51 | Planned: answer `sample_infohashes` like a normal node (today it gets `204 Method Unknown`) |
 
 Security moves up a layer, because BEP 5 is plaintext and unauthenticated:
 
@@ -123,11 +126,15 @@ domestic routers go offline after the cut.
 
 | After cut | plain | + domestic copies | + partition detection | + isolation mode |
 |---|---|---|---|---|
-| +1 min | 100 / 78 | 100 / 100 | 100 / 100 | 100 / 100 |
+| +1 min | 91 / 88 | 99 / 100 | 99 / 100 | 100 / 100 |
 | +15 min | 100 / 90 | 100 / 100 | 100 / 100 | 100 / 100 |
-| +2 h | 91 / 0 | 93 / 0 | 100 / 0 | 100 / 100 |
-| +3 h | 86 / 0 | 83 / 0 | 79 / 0 | 100 / 100 |
-| 30 min after reopening | 80 / 0 | 84 / 0 | 76 / 0 | 99 / 100 |
+| +2 h | 96 / 0 | 94 / 0 | 100 / 0 | 100 / 100 |
+| +3 h | 84 / 0 | 80 / 0 | 82 / 0 | 100 / 100 |
+| 30 min after reopening | 83 / 0 | 81 / 0 | 84 / 0 | 99 / 100 |
+
+(An earlier version of this table came from a run whose churn schedule moved
+simulated time backwards, so early rows saw later state. Departures are now
+scheduled events and the simulator refuses to rewind time.)
 
 Findings:
 
@@ -318,20 +325,27 @@ Cone ↔ random matches the budget's prediction: 2,400 spray probes against 64
 sockets give 1 − (1 − 64/64512)^2400 ≈ 91%. A faster spray reaches 99% at the
 cost of more traffic.
 
-The zeros need one of:
-- a relay fallback: Unbounded volunteers or Lantern proxies;
-- filtering measurements, so we skip doomed double birthdays;
-- IPv6 or port mapping (PCP/UPnP), not built yet.
+In this standalone matrix the zeros have no relay. The full stack sends them
+through a router relay (see *Relay fallback*). Filtering measurements would let
+the planner skip doomed double birthdays, and IPv6 and port mapping (PCP/UPnP)
+would avoid the relay for some of them; neither is built yet.
 
 Times to connect in the model: 0.24–0.5 s for direct and spray, 1.6 s for
 cone ↔ random, 0.28 s for the double birthday. The real-UDP runner is tested on
 loopback for direct and open strategies; relay-needed pairs fail fast without
 probing.
 
+**Handoff.** Once connected, the socket belongs to the application, which
+can't answer punch traffic. The responder sends its final acknowledgement
+three times. On a direct path, the initiator connects after five unanswered
+nominations, provided the peer already answered one of its own probes on that
+pair (so the path is known to work both ways). A few stray control datagrams
+can reach the application afterwards; layers above drop them, and
+`endpoint.Conn.Recv` skips them.
+
 **Still to come:** IPv6 candidates; PCP/NAT-PMP/UPnP (Tailscale's `portmapper` is
-a candidate); low-TTL priming; filtering-aware planning; the relay fallback; and
-the connection itself (QUIC with iOS-capped windows) over the nominated socket.
-Check the iOS `RLIMIT_NOFILE` soft limit before relying on 64-socket fans.
+a candidate); low-TTL priming; filtering-aware planning. Check the iOS
+`RLIMIT_NOFILE` soft limit before relying on 64-socket fans.
 
 ## Connecting by public key (`endpoint/`)
 
@@ -562,9 +576,9 @@ and carrier allocator. The design therefore splits measurement in two:
 | 2b | UDP driver | `driver/` built: one goroutine owns the node. Loopback tests cover put/get, mutable, a read-only phone, restart from snapshot with no bootstrap server, and Close unblocking callers. Race-clean over 20 runs. IPv4 only for now |
 | 2c | libtorrent wire matching | `cmd/ltfingerprint` built; 0 shape differences against 2.1.1. Next: timing comparison, and `announce_peer`'s `seed` flag once we announce |
 | 3 | Signaling over BEP 44 | `dht/signal.go` built: provider records on hourly blinded salts, holder binding and forwarding, encrypted offer and answer, ack-based failover; exposed through `driver`. Simulation tests cover phone to phone, a dead holder, a shutdown, and an unknown provider. Mapping-timeout probe built. Next: keepalive-answer delivery as an option, and a store-and-poll fallback |
-| 4 | Punch engine | `punch/` built: sans-IO session, planner, real-UDP runner, `sim/nat.go` RFC 4787 model. Success matrix above, with a port-quota budget. Next: IPv6, port mapping, filtering-aware planning, relay fallback |
+| 4 | Punch engine | `punch/` built: sans-IO session, planner, real-UDP runner, `sim/nat.go` RFC 4787 model. Success matrix above, with a port-quota budget. Next: IPv6, port mapping, filtering-aware planning |
 | 4b | Connect by public key | `endpoint/` built: signaling plus punch, a passive NAT profile, authorization, and bounded inbound. Full-stack simulation through modeled NATs passes |
 | 4c | Relay fallback | Router relays via `announce_peer` binding and blind forwarding with volunteer limits, plus relay-only privacy mode. Every simulated NAT pairing connects |
-| 5a | Configurable shaping (glamour) | Designed in `docs/shaping-design.md`: spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Built in a separate session |
+| 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
 | 6 | iOS integration, memory budget, network-change rebind | |

@@ -343,6 +343,9 @@ type session struct {
 	answerSalt []byte
 	key        []byte
 	expires    time.Time
+	// answer is kept after Answer: if it is lost, the caller retries the same
+	// offer through another holder, and we resend rather than drop it.
+	answer *MutableItem
 }
 
 type listener struct {
@@ -354,6 +357,7 @@ type listener struct {
 	nextKA   time.Time
 	sessions map[SessionID]*session
 	seen     map[string]time.Time
+	retry    time.Duration // publication backoff while nothing stores our record
 }
 
 // Listen publishes a signaling record for priv's key and keeps it reachable.
@@ -446,10 +450,20 @@ func (n *Node) isRecord(target krpc.NodeID) bool {
 
 // recordStored adopts the nodes that acknowledged a record put as holders:
 // the closest few, plus a domestic one when domestic copies are on.
-func (n *Node) recordStored(l *lookup) {
+func (n *Node) recordStored(now time.Time, l *lookup) {
 	if n.lst == nil {
 		return
 	}
+	if len(l.acked) == 0 {
+		// Nothing stored it, e.g. Listen before Bootstrap or every contact
+		// briefly unreachable: retry soon rather than at the next republish.
+		n.lst.retry = min(max(2*n.lst.retry, 5*time.Second), time.Minute)
+		if o := n.owned[l.target]; o != nil {
+			o.next = now.Add(n.lst.retry)
+		}
+		return
+	}
+	n.lst.retry = 0
 	var picked []*holder
 	dom := 0
 	for _, a := range l.acked {
@@ -550,6 +564,9 @@ func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) b
 		return matched
 	}
 	if _, dup := l.seen[string(m.Salt)]; dup {
+		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil && s.answer != nil {
+			n.sendAnswer(now, from, s.answer)
+		}
 		return true
 	}
 	sealed, ok := decodeString(m.V)
@@ -588,7 +605,7 @@ func (n *Node) Answer(now time.Time, id SessionID, payload []byte) error {
 		return ErrPayloadTooLarge
 	}
 	s := n.lst.sessions[id]
-	if s == nil || !now.Before(s.expires) {
+	if s == nil || !now.Before(s.expires) || s.answer != nil {
 		return ErrUnknownSession
 	}
 	var token []byte
@@ -607,8 +624,21 @@ func (n *Node) Answer(now time.Time, id SessionID, payload []byte) error {
 	a := m.args()
 	a.Token = token
 	n.send(now, s.via, "put", a, &txn{kind: txPing})
-	delete(n.lst.sessions, id)
+	s.answer = &m
 	return nil
+}
+
+// sendAnswer resends a kept answer through the holder that relayed a retried
+// offer, if we hold a write token for it.
+func (n *Node) sendAnswer(now time.Time, via netip.AddrPort, m *MutableItem) {
+	for _, h := range n.lst.holders {
+		if h.addr == via && h.token != nil {
+			a := m.args()
+			a.Token = h.token
+			n.send(now, via, "put", a, &txn{kind: txPing})
+			return
+		}
+	}
 }
 
 // ---- caller ----

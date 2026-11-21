@@ -74,8 +74,8 @@ func (w *fullWorld) phone(nt natType) *Node {
 // as endpoint does on a real phone.
 func inferred(n *Node) punch.Profile {
 	var obs []natprobe.Observation
-	for i, r := range n.DHT.Reflections() {
-		obs = append(obs, natprobe.Observation{Order: i, Local: n.Local, Dest: r.From, Mapped: r.Mapped})
+	for _, r := range n.DHT.Reflections() {
+		obs = append(obs, natprobe.Observation{Order: r.Order, Local: n.Local, Dest: r.From, Mapped: r.Mapped})
 	}
 	return endpoint.ProfileOf(natprobe.Analyze(n.Local, obs))
 }

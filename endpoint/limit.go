@@ -85,12 +85,18 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 	seen := map[netip.Prefix]bool{}
 	var nets []netip.Prefix
 	var netTs [][]time.Time
-	targets := append([]netip.AddrPort(nil), cands...)
-	if relay.IsValid() {
-		targets = append(targets, relay)
+	keys := make([]netip.Prefix, 0, len(cands)+1)
+	for _, c := range cands {
+		keys = append(keys, networkOf(c.Addr()))
 	}
-	for _, c := range targets {
-		p := networkOf(c.Addr())
+	if relay.IsValid() {
+		// A relay is one router, budgeted by exact address: routers sharing
+		// a /24 are independent volunteers.
+		a := relay.Addr().Unmap()
+		p, _ := a.Prefix(a.BitLen())
+		keys = append(keys, p)
+	}
+	for _, p := range keys {
 		if !p.IsValid() || seen[p] {
 			continue
 		}

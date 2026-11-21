@@ -93,7 +93,9 @@ func (s *Session) relayData(socket int, from netip.AddrPort, b []byte) {
 	}
 	switch {
 	case !s.cfg.Initiator && hmac.Equal(b, s.peerProbe):
-		s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayAck})
+		for range finalAckCopies { // the socket is handed off after this
+			s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayAck})
+		}
 		if !s.done {
 			s.connectRelayed()
 		}

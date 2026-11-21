@@ -66,6 +66,10 @@ type Reflection struct {
 	From   netip.AddrPort
 	Mapped netip.AddrPort
 	At     time.Time
+	// Order is when we first sent to From among our destinations, which is
+	// when the NAT created this mapping; replies can arrive in any order.
+	// -1 if unknown.
+	Order int
 }
 
 type txnKind uint8
@@ -131,11 +135,14 @@ type Node struct {
 	owned map[krpc.NodeID]*owned
 
 	secret, prevSecret [8]byte
-	rotated            time.Time
-	nextMaint          time.Time
-	health             health
-	iso                isolation
-	reflections        []Reflection
+	// destOrder numbers destinations in first-contact order, for NAT
+	// analysis; bounded like reflections.
+	destOrder   map[netip.AddrPort]int
+	rotated     time.Time
+	nextMaint   time.Time
+	health      health
+	iso         isolation
+	reflections []Reflection
 
 	sends  []Send
 	events []Event
@@ -248,6 +255,7 @@ func (n *Node) send(now time.Time, to netip.AddrPort, q string, a krpc.Args, t *
 	n.nextTID++
 	t.to, t.sent = to, now
 	t.tracked = n.primary.contains(to) || n.main.contains(to)
+	n.noteDestination(to)
 	n.txns[tid] = t
 	a.ID = n.cfg.ID
 	var tb [2]byte
@@ -295,12 +303,15 @@ func (n *Node) Get(now time.Time, target krpc.NodeID) (OpID, error) {
 // hold a newer sequence number.
 func (n *Node) GetMutable(now time.Time, key [32]byte, salt []byte) (OpID, error) {
 	k := key
-	op, err := n.start(now, n.primary, getItem, MutableTarget(key, salt), record{}, nil, false)
-	if err == nil {
-		l := n.lookups[len(n.lookups)-1]
-		l.key, l.salt = &k, salt
+	// Configure before the first step: with no candidates, step finishes
+	// and removes the lookup synchronously.
+	l := n.startLookup(now, n.primary, getItem, MutableTarget(key, salt), record{}, nil, false)
+	if l == nil {
+		return 0, ErrBusy
 	}
-	return op, err
+	l.key, l.salt = &k, salt
+	n.step(now, l)
+	return l.op, nil
 }
 
 // PutMutable stores a signed item once. cas, if set, makes each storing node
@@ -309,11 +320,13 @@ func (n *Node) PutMutable(now time.Time, m MutableItem, cas *int64) (OpID, error
 	if !m.Verify() {
 		return 0, errors.New("dht: mutable item signature invalid")
 	}
-	op, err := n.start(now, n.primary, putItem, m.Target(), record{v: m.V, mut: &m}, nil, false)
-	if err == nil {
-		n.lookups[len(n.lookups)-1].cas = cas
+	l := n.startLookup(now, n.primary, putItem, m.Target(), record{v: m.V, mut: &m}, nil, false)
+	if l == nil {
+		return 0, ErrBusy
 	}
-	return op, err
+	l.cas = cas
+	n.step(now, l)
+	return l.op, nil
 }
 
 // PublishMutable keeps a signed item stored like Publish. Publishing a newer
@@ -541,9 +554,7 @@ func (n *Node) handleReply(now time.Time, from netip.AddrPort, m *krpc.Msg) {
 		if !m.RO {
 			n.tableFor(m.R.ID).heard(m.R.ID, from, now)
 		}
-		if m.IP.IsValid() && len(n.reflections) < 64 {
-			n.reflections = append(n.reflections, Reflection{From: from, Mapped: m.IP, At: now})
-		}
+		n.reflect(from, m.IP, now)
 	}
 	switch t.kind {
 	case txLookup:
@@ -625,13 +636,13 @@ func (n *Node) handleQuery(now time.Time, from netip.AddrPort, q *krpc.Msg) {
 			n.reject(from, q, krpc.ErrProtocol, "missing target")
 			return
 		}
-		r.R.Nodes = t.closest(*q.A.Target, n.cfg.K)
+		r.R.Nodes, r.R.Nodes6 = n.referrals(t, *q.A.Target, from, q.A.Want)
 	case "get_peers":
 		if q.A.InfoHash == nil {
 			n.reject(from, q, krpc.ErrProtocol, "missing info_hash")
 			return
 		}
-		r.R.Nodes = t.closest(*q.A.InfoHash, n.cfg.K)
+		r.R.Nodes, r.R.Nodes6 = n.referrals(t, *q.A.InfoHash, from, q.A.Want)
 		r.R.Token = n.token(from.Addr(), n.secret)
 	case "announce_peer":
 		if !n.validToken(from.Addr(), q.A.Token) {
@@ -646,7 +657,7 @@ func (n *Node) handleQuery(now time.Time, from netip.AddrPort, q *krpc.Msg) {
 			n.reject(from, q, krpc.ErrProtocol, "missing target")
 			return
 		}
-		r.R.Nodes = t.closest(*q.A.Target, n.cfg.K)
+		r.R.Nodes, r.R.Nodes6 = n.referrals(t, *q.A.Target, from, q.A.Want)
 		r.R.Token = n.token(from.Addr(), n.secret)
 		n.fwd.touch(*q.A.Target, from, now)
 		if it := n.items[*q.A.Target]; it != nil && now.Before(it.expires) {
@@ -906,9 +917,15 @@ func (n *Node) maintain(now time.Time) {
 		}
 		o := n.owned[k]
 		o.next = now.Add(n.cfg.RepublishInterval)
-		if l := n.startInternal(now, n.primary, putItem, k, o.rec); l != nil && n.isRecord(k) {
-			l.onDone = func(_ time.Time, l *lookup) { n.recordStored(l) }
+		if n.isRecord(k) {
+			// Configure before the first step, which can finish synchronously.
+			if l := n.startLookup(now, n.primary, putItem, k, o.rec, nil, true); l != nil {
+				l.onDone = n.recordStored
+				n.step(now, l)
+			}
+			continue
 		}
+		n.startInternal(now, n.primary, putItem, k, o.rec)
 	}
 }
 
@@ -988,3 +1005,58 @@ func ImmutableValue(s []byte) []byte { return bencode.AppendBytes(nil, s) }
 // Contacts returns up to n live routing contacts closest to our own ID,
 // for example to reflect a fresh socket's public address.
 func (n *Node) Contacts(k int) []krpc.NodeInfo { return n.primary.closest(n.cfg.ID, k) }
+
+const maxReflections = 64
+
+// noteDestination numbers a destination the first time we send to it: under
+// endpoint-dependent mapping, that is when our NAT creates its mapping.
+func (n *Node) noteDestination(to netip.AddrPort) {
+	if n.destOrder == nil {
+		n.destOrder = map[netip.AddrPort]int{}
+	}
+	if _, ok := n.destOrder[to]; !ok && len(n.destOrder) < 4*maxReflections {
+		n.destOrder[to] = len(n.destOrder)
+	}
+}
+
+// reflect records one observation per destination, ordered by mapping
+// creation rather than reply arrival.
+func (n *Node) reflect(from, mapped netip.AddrPort, now time.Time) {
+	if !mapped.IsValid() || len(n.reflections) >= maxReflections {
+		return
+	}
+	for _, r := range n.reflections {
+		if r.From == from {
+			return // a reused mapping adds no allocation information
+		}
+	}
+	order, ok := n.destOrder[from]
+	if !ok {
+		order = -1
+	}
+	n.reflections = append(n.reflections, Reflection{From: from, Mapped: mapped, At: now, Order: order})
+}
+
+// referrals returns the closest contacts split by address family, since
+// "nodes" holds only 26-byte IPv4 entries and "nodes6" only 38-byte IPv6
+// ones (BEP 32). It returns the families the querier asked for with "want",
+// or by default its own.
+func (n *Node) referrals(t *table, target krpc.NodeID, from netip.AddrPort, want []string) (v4, v6 []krpc.NodeInfo) {
+	wantV4, wantV6 := from.Addr().Unmap().Is4(), !from.Addr().Unmap().Is4()
+	if len(want) > 0 {
+		wantV4, wantV6 = slices.Contains(want, "n4"), slices.Contains(want, "n6")
+	}
+	for _, ni := range t.closest(target, 4*n.cfg.K) {
+		if ni.Addr.Addr().Unmap().Is4() {
+			if wantV4 && len(v4) < n.cfg.K {
+				v4 = append(v4, ni)
+			}
+		} else if wantV6 && len(v6) < n.cfg.K {
+			v6 = append(v6, ni)
+		}
+	}
+	if wantV4 && v4 == nil {
+		v4 = []krpc.NodeInfo{}
+	}
+	return v4, v6
+}

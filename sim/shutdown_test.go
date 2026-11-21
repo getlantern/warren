@@ -208,13 +208,17 @@ func runShutdown(seed uint64, sc scenario, sz sizes) []row {
 	measure("before")
 	cut := w.s.Now
 	w.s.Border = true
+	// Departures are spread over the first half hour as scheduled events, so
+	// they happen at their times even while a measurement is running.
 	leaving := w.s.Rand().Perm(len(w.routersIR))[:int(sz.churn*float64(len(w.routersIR)))]
 	for i, idx := range leaving {
-		w.s.RunUntil(cut.Add(time.Duration(i+1) * 30 * time.Minute / time.Duration(len(leaving)+1)))
-		w.routersIR[idx].Offline = true
+		n := w.routersIR[idx]
+		w.s.At(cut.Add(time.Duration(i+1)*30*time.Minute/time.Duration(len(leaving)+1)), func() { n.Offline = true })
 	}
 	for _, after := range []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 3 * time.Hour} {
-		w.s.RunUntil(cut.Add(after))
+		if at := cut.Add(after); at.After(w.s.Now) {
+			w.s.RunUntil(at)
+		}
 		measure("+" + after.String())
 	}
 	w.s.Border = false

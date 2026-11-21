@@ -48,7 +48,11 @@ type Config struct {
 	GatherWait    time.Duration
 }
 
-// Conn is a punched path to a peer.
+// Conn is a punched path to a peer. Just after connecting, the socket can
+// still receive a few hole-punching control datagrams (KRPC, first byte
+// 'd'), such as duplicate final acknowledgements. Protocols layered above
+// drop them (uTP shaping and QUIC both reject them); raw users should read
+// with Recv, which skips them.
 type Conn struct {
 	*net.UDPConn
 	Remote netip.AddrPort
@@ -66,6 +70,22 @@ type Conn struct {
 func (c *Conn) Send(b []byte) error {
 	_, err := c.WriteToUDPAddrPort(b, c.Remote)
 	return err
+}
+
+// Recv reads the next datagram from the peer, skipping datagrams from other
+// addresses and leftover hole-punching control traffic.
+func (c *Conn) Recv(b []byte) (int, error) {
+	for {
+		n, from, err := c.ReadFromUDPAddrPort(b)
+		if err != nil {
+			return 0, err
+		}
+		from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
+		if from != c.Remote || (n > 0 && b[0] == 'd') {
+			continue
+		}
+		return n, nil
+	}
 }
 
 type Endpoint struct {
@@ -105,7 +125,15 @@ func (e *Endpoint) Close() error {
 	e.once.Do(func() { close(e.done) })
 	err := e.node.Close()
 	e.wg.Wait()
-	return err
+	// Connections punched but never accepted are still ours to close.
+	for {
+		select {
+		case c := <-e.accept:
+			c.Close()
+		default:
+			return err
+		}
+	}
 }
 
 // Listen makes this endpoint reachable under priv's key; accept connections
@@ -136,11 +164,13 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	offer := sess.Offer(locals(conn))
 	payload, err := e.node.Signal(ctx, identity, peer, offer.Marshal())
 	if err != nil {
+		r.Abort()
 		conn.Close()
 		return nil, err
 	}
 	answer, err := punch.UnmarshalOffer(payload)
 	if err != nil {
+		r.Abort()
 		conn.Close()
 		return nil, err
 	}
@@ -178,6 +208,7 @@ func (e *Endpoint) prepare(ctx context.Context, pc punch.Config) (*punch.Session
 	sess := punch.New(pc)
 	r := punch.NewRunner(sess, conn)
 	if err := r.Gather(ctx, reflectors, e.cfg.GatherWait); err != nil {
+		r.Abort()
 		conn.Close()
 		return nil, nil, nil, err
 	}
@@ -266,6 +297,7 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	}
 	answer := sess.Offer(locals(conn))
 	if err := e.node.Answer(ctx, in.Session, answer.Marshal()); err != nil {
+		r.Abort()
 		conn.Close()
 		return
 	}
@@ -288,8 +320,8 @@ func (e *Endpoint) profile(refl []dht.Reflection) punch.Profile {
 	}
 	local := e.node.Addr()
 	var obs []natprobe.Observation
-	for i, r := range refl {
-		obs = append(obs, natprobe.Observation{Order: i, Local: local, Dest: r.From, Mapped: r.Mapped})
+	for _, r := range refl {
+		obs = append(obs, natprobe.Observation{Order: r.Order, Local: local, Dest: r.From, Mapped: r.Mapped})
 	}
 	return ProfileOf(natprobe.Analyze(local, obs))
 }

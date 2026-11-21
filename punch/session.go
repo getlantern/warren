@@ -90,6 +90,11 @@ const (
 	openTick     = 250 * time.Millisecond
 	nominateTick = 100 * time.Millisecond
 
+	// nominateAttempts unanswered nominations on a proven pair mean the
+	// responder's final acks were lost after it handed off its socket.
+	nominateAttempts = 5
+	finalAckCopies   = 3
+
 	maxBirthdayPairs = 256
 	birthdayPerTick  = 64
 )
@@ -127,6 +132,8 @@ type Session struct {
 	// reply's source would mint a fresh mapping on every round trip.
 	sentTo     map[uint16]pair
 	nomTids    map[uint16]bool
+	nomSent    int
+	proven     bool // the nominated pair carried a reply to our own probe
 	probes     int
 	nominating bool
 	nominated  pair
@@ -312,7 +319,17 @@ func (s *Session) Tick(now time.Time) {
 	s.tickRelay(now)
 	if s.nominating {
 		if !now.Before(s.nextNom) {
+			if s.nomSent >= nominateAttempts && s.proven {
+				// The peer answered one of our probes on this pair, so the
+				// path works both ways; repeated silence means its final ack
+				// was lost after it handed the socket to the application,
+				// which can no longer answer. A wrong guess fails loudly in
+				// the authenticated handshake that follows.
+				s.connect(s.nominated)
+				return
+			}
 			s.nomTids[s.query(s.nominated.socket, s.nominated.addr, s.nomID)] = true
+			s.nomSent++
 			s.nextNom = now.Add(nominateTick)
 		}
 		return
@@ -437,12 +454,20 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 		case s.done:
 		case s.nominating && s.nomTids[t] && socket == s.nominated.socket:
 			s.connect(s.nominated)
+		case s.nominating:
+			// A reply to one of our own probes on the nominated socket, even
+			// one that lands after an inbound probe triggered the nomination,
+			// proves our packets reach the peer too.
+			if sent, ok := s.sentTo[t]; ok && sent.socket == s.nominated.socket {
+				s.proven = true
+			}
 		case s.cfg.Initiator && !s.nominating:
 			p := pair{socket, from}
 			if sent, ok := s.sentTo[t]; ok && sent.socket == socket {
 				p = sent
 			}
 			s.nominate(now, p)
+			s.proven = true // a reply to our own probe: both directions work
 		}
 	case krpc.Query:
 		if !s.started || m.Q != "ping" {
@@ -459,7 +484,12 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 			if s.cfg.Initiator || (s.done && socket != s.selected.socket) {
 				return
 			}
-			s.reply(socket, from, &m)
+			// Once connected the socket belongs to the application, which
+			// cannot answer a retried nomination, so send the final ack in
+			// triplicate to make losing all of it unlikely.
+			for range finalAckCopies {
+				s.reply(socket, from, &m)
+			}
 			if !s.done {
 				s.connect(p)
 			}
@@ -470,6 +500,7 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 func (s *Session) nominate(now time.Time, p pair) {
 	s.nominating, s.nominated = true, p
 	s.nomTids[s.query(p.socket, p.addr, s.nomID)] = true
+	s.nomSent = 1
 	s.nextNom = now.Add(nominateTick)
 }
 

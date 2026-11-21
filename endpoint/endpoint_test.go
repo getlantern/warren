@@ -104,9 +104,9 @@ func roundTrip(t *testing.T, from, to *Conn, msg string) {
 	}
 	to.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 128)
-	n, src, err := to.ReadFromUDPAddrPort(buf)
-	if err != nil || string(buf[:n]) != msg || src != to.Remote {
-		t.Fatalf("read: %v %q from %s (want %s)", err, buf[:n], src, to.Remote)
+	n, err := to.Recv(buf)
+	if err != nil || string(buf[:n]) != msg {
+		t.Fatalf("read: %v %q", err, buf[:n])
 	}
 }
 
@@ -245,5 +245,57 @@ func TestAuthorizeRejects(t *testing.T) {
 		t.Fatalf("authorized caller: %v", err)
 	} else {
 		c.Close()
+	}
+}
+
+// A punched connection nobody accepted is closed with the endpoint.
+func TestCloseClosesUnaccepted(t *testing.T) {
+	seed := network(t, 10)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("unaccepted")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := caller.Connect(ctx, key("c"), pub(pk)); err != nil {
+		t.Fatal(err)
+	}
+	var pending *Conn
+	for deadline := time.Now().Add(5 * time.Second); pending == nil; {
+		select {
+		case pending = <-provider.accept:
+			provider.accept <- pending
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("no inbound connection queued")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	provider.Close()
+	if _, err := pending.WriteToUDPAddrPort([]byte("x"), pending.Remote); err == nil {
+		t.Fatal("unaccepted connection still open after Close")
+	}
+}
+
+func TestRecvSkipsControlAndStrangers(t *testing.T) {
+	a, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	peer, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	stranger, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	defer peer.Close()
+	defer stranger.Close()
+	c := &Conn{UDPConn: a, Remote: peer.LocalAddr().(*net.UDPAddr).AddrPort()}
+	to := a.LocalAddr().(*net.UDPAddr)
+	peer.WriteTo([]byte("d1:rd2:id20:aaaaaaaaaaaaaaaaaaaae1:t2:aa1:y1:re"), to)
+	stranger.WriteTo([]byte("not from the peer"), to)
+	peer.WriteTo([]byte("payload"), to)
+	a.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 128)
+	n, err := c.Recv(buf)
+	if err != nil || string(buf[:n]) != "payload" {
+		t.Fatalf("Recv = %q, %v", buf[:n], err)
 	}
 }
