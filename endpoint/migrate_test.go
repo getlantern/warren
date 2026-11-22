@@ -125,3 +125,21 @@ func TestResumeNeedsTheSameCaller(t *testing.T) {
 		t.Fatalf("an inbound connection migrated itself: %v", err)
 	}
 }
+
+// A repeat of a live connection's secret from the same caller can't take
+// over its registry slot, and inbound and outbound slots never mix.
+func TestRegistrySlotsCantBeTakenOver(t *testing.T) {
+	e := &Endpoint{}
+	a, b := &net.UDPConn{}, &net.UDPConn{}
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	caller := [32]byte{1}
+	first := e.newConn(punched{sock: a}, caller, secret, nil)
+	e.newConn(punched{sock: b}, caller, secret, nil) // same caller, same secret
+	if e.resumable(first.resume[:], caller) != first {
+		t.Fatal("a repeated secret took over a live connection's slot")
+	}
+	out := e.newConn(punched{sock: b}, caller, secret, key("me")) // an outbound one, same key and secret
+	if e.resumable(first.resume[:], caller) != first || e.outConns[out.key()] != out {
+		t.Fatal("inbound and outbound slots mixed")
+	}
+}

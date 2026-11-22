@@ -111,7 +111,11 @@ type Endpoint struct {
 	routes func() [2]netip.Addr
 
 	connsMu sync.Mutex
-	conns   map[[16]byte]*Conn // live connections, by resume ID
+	// Live connections by peer key and resume ID, inbound and outbound
+	// apart: an inbound resume ID derives from a secret the caller chose, so
+	// it must never select an outbound slot, or another peer's.
+	inConns  map[connKey]*Conn
+	outConns map[connKey]*Conn
 
 	offersMu sync.Mutex
 	offers   map[[32]byte]*offerEntry // recent offers, by caller and secret
@@ -342,10 +346,8 @@ func (e *Endpoint) Rebind(ctx context.Context) error {
 	}
 	e.connsMu.Lock()
 	var out []*Conn
-	for _, c := range e.conns {
-		if c.outbound {
-			out = append(out, c)
-		}
+	for _, c := range e.outConns {
+		out = append(out, c)
 	}
 	e.connsMu.Unlock()
 	errs := make([]error, len(out))
@@ -480,6 +482,13 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	return e.newConn(pd, peer, secret, identity), nil
 }
 
+type connKey struct {
+	peer   [32]byte
+	resume [16]byte
+}
+
+func (c *Conn) key() connKey { return connKey{c.PeerKey, c.resume} }
+
 // punched is a freshly punched path: its socket and the peer's address.
 type punched struct {
 	sock    *net.UDPConn
@@ -497,10 +506,18 @@ func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed
 		outbound: identity != nil, identity: identity,
 	}
 	e.connsMu.Lock()
-	if e.conns == nil {
-		e.conns = map[[16]byte]*Conn{}
+	m := &e.inConns
+	if c.outbound {
+		m = &e.outConns
 	}
-	e.conns[c.resume] = c
+	if *m == nil {
+		*m = map[connKey]*Conn{}
+	}
+	if _, taken := (*m)[c.key()]; !taken {
+		// A live connection keeps its slot: a repeat of its secret from the
+		// same peer gets a connection that just can't be resumed.
+		(*m)[c.key()] = c
+	}
 	e.connsMu.Unlock()
 	return c
 }
@@ -508,8 +525,12 @@ func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed
 func (e *Endpoint) forget(c *Conn) {
 	e.connsMu.Lock()
 	defer e.connsMu.Unlock()
-	if e.conns[c.resume] == c {
-		delete(e.conns, c.resume)
+	m := e.inConns
+	if c.outbound {
+		m = e.outConns
+	}
+	if m[c.key()] == c {
+		delete(m, c.key())
 	}
 }
 
@@ -521,11 +542,7 @@ func (e *Endpoint) resumable(id []byte, caller [32]byte) *Conn {
 	}
 	e.connsMu.Lock()
 	defer e.connsMu.Unlock()
-	c := e.conns[[16]byte(id)]
-	if c == nil || c.outbound || c.PeerKey != caller {
-		return nil
-	}
-	return c
+	return e.inConns[connKey{caller, [16]byte(id)}]
 }
 
 // Migrate moves an outbound connection onto a freshly punched path, for
