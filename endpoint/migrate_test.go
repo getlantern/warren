@@ -544,3 +544,46 @@ func TestUnknownResumeAnsweredWithoutSlot(t *testing.T) {
 		t.Fatalf("the empty answer took %v", took)
 	}
 }
+
+// An explicit Migrate that is canceled leaves its request outstanding
+// without setting migratePending; the watcher still retries it on an
+// unchanged route.
+func TestWatcherRetriesCanceledExplicitMigrate(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("explicit-provider")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() {
+		c, _ := provider.Accept(ctx)
+		if c != nil {
+			defer c.Close()
+			<-ctx.Done()
+		}
+	}()
+	out, err := caller.Connect(ctx, key("explicit-caller"), pub(pk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	canceled, stop := context.WithCancel(ctx)
+	stop()
+	if err := out.Migrate(canceled); err == nil {
+		t.Fatal("a canceled Migrate succeeded")
+	}
+	if !out.unmoved() || caller.migratePending.Load() {
+		t.Fatalf("setup: unmoved=%v pending=%v", out.unmoved(), caller.migratePending.Load())
+	}
+	before := out.LocalAddr().String()
+	caller.routes = func() [2]netip.Addr { return [2]netip.Addr{netip.MustParseAddr("192.168.1.5")} }
+	go caller.WatchNetwork(ctx, 10*time.Millisecond)
+	for deadline := time.Now().Add(10 * time.Second); out.unmoved(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the watcher never retried the canceled Migrate")
+		}
+	}
+	if out.LocalAddr().String() == before {
+		t.Fatal("the retry didn't move the connection")
+	}
+}

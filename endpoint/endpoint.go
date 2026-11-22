@@ -456,6 +456,19 @@ func (e *Endpoint) lockRebind(ctx context.Context) error {
 
 func (e *Endpoint) unlockRebind() { <-e.rebinding }
 
+// anyUnmoved reports whether an outbound connection has a migration request
+// no migration has served yet.
+func (e *Endpoint) anyUnmoved() bool {
+	e.connsMu.Lock()
+	defer e.connsMu.Unlock()
+	for _, c := range e.outConns {
+		if c.unmoved() {
+			return true
+		}
+	}
+	return false
+}
+
 // migrateAll moves outbound connections onto fresh paths: every one, or
 // with onlyUnmoved just those whose last attempt failed, so a retry leaves
 // connections that already moved alone.
@@ -512,15 +525,20 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 			_ = e.Rebind(ctx) // whatever fails is retried below
 		} else if e.rebindDone.Load() < e.rebindReqs.Load() {
 			_ = e.Rebind(ctx) // a requested rebind never completed
-		} else if e.migratePending.Load() {
+		} else if e.migratePending.Load() || e.anyUnmoved() {
+			// anyUnmoved catches an explicit Migrate that failed or was
+			// canceled: it leaves its request outstanding without setting
+			// migratePending.
 			if e.lockRebind(ctx) != nil {
 				return
 			}
 			var dhtErr error
-			stale, err := e.node.Stale(ctx)
-			dhtErr = err // a failed check (canceled, say) keeps the retry pending
-			if err == nil && stale {
-				dhtErr = e.node.RebindStale(ctx)
+			if e.migratePending.Load() {
+				stale, err := e.node.Stale(ctx)
+				dhtErr = err // a failed check (canceled, say) keeps the retry pending
+				if err == nil && stale {
+					dhtErr = e.node.RebindStale(ctx)
+				}
 			}
 			migErr := e.migrateAll(ctx, true)
 			e.migratePending.Store(dhtErr != nil || migErr != nil)
