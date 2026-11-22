@@ -654,6 +654,16 @@ A provider that moves can't migrate its inbound connections itself (the
 caller may not be listening): the caller calls `Migrate` when its session
 stalls.
 
+Each migration carries a sequence number, and the provider installs only a
+newer one, so a slow resume can't overwrite a later path. A write that
+picked a socket just as a swap closed it follows the path to the new one,
+since QUIC treats a write error as fatal. Because QUIC never sees the path
+change, it can't reset what it learned about the old one, so a migratable
+connection keeps it from path MTU discovery (packets stay at QUIC's safe
+1200-byte initial size): a size found on one network would be dropped on a
+smaller-MTU network after a move. Rebind migrates even when a DHT family
+failed to rebind, and `WatchNetwork` retries what's left.
+
 This works below QUIC rather than with QUIC's own connection migration:
 that lets only the client move, needs the peer's NAT to admit the new
 address anyway (a new punch either way), and would need the QUIC connection

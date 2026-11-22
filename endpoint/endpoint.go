@@ -14,6 +14,7 @@ import (
 	"crypto/ed25519"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -86,12 +87,29 @@ type Conn struct {
 	// the peer, used when no direct path could be punched.
 	Relayed bool
 
-	p         *path
-	e         *Endpoint
-	resume    [16]byte
-	outbound  bool
-	identity  ed25519.PrivateKey // signs resume offers; outbound only
-	migrating atomic.Bool
+	p          *path
+	e          *Endpoint
+	resume     [16]byte
+	outbound   bool
+	identity   ed25519.PrivateKey // signs resume offers; outbound only
+	migrating  atomic.Bool
+	migrations uint64 // outbound: the last migration's sequence number
+}
+
+// resumeOffer encodes a migration request: the session's resume ID and the
+// migration's sequence number, which orders commits on the provider.
+func resumeOffer(id [16]byte, seq uint64) []byte {
+	b := make([]byte, 24)
+	copy(b, id[:])
+	binary.BigEndian.PutUint64(b[16:], seq)
+	return b
+}
+
+func parseResume(b []byte) (id [16]byte, seq uint64, ok bool) {
+	if len(b) != 24 {
+		return id, 0, false
+	}
+	return [16]byte(b[:16]), binary.BigEndian.Uint64(b[16:]), true
 }
 
 type Endpoint struct {
@@ -109,6 +127,11 @@ type Endpoint struct {
 	// routes reports the local addresses the default routes use; tests
 	// replace it. WatchNetwork rebinds when they change.
 	routes func() [2]netip.Addr
+	// rebindDHT rebinds the DHT sockets; tests replace it.
+	rebindDHT func(context.Context) error
+	// migratePending: the last rebind left a DHT family or a connection
+	// unmoved; WatchNetwork retries.
+	migratePending atomic.Bool
 
 	connsMu sync.Mutex
 	// Live connections by peer key and resume ID, inbound and outbound
@@ -341,9 +364,20 @@ func (e *Endpoint) Close() error {
 // failed. An inbound connection can't migrate itself (its caller may not be
 // listening): it carries on once its caller migrates it.
 func (e *Endpoint) Rebind(ctx context.Context) error {
-	if err := e.node.Rebind(ctx); err != nil {
-		return err
+	rebind := e.rebindDHT
+	if rebind == nil {
+		rebind = e.node.Rebind
 	}
+	// Migrate even if a family failed to rebind: the others may carry the
+	// new paths. Whatever fails is retried by WatchNetwork.
+	dhtErr := rebind(ctx)
+	migErr := e.migrateAll(ctx)
+	e.migratePending.Store(dhtErr != nil || migErr != nil)
+	return errors.Join(dhtErr, migErr)
+}
+
+// migrateAll moves every outbound connection onto a fresh path.
+func (e *Endpoint) migrateAll(ctx context.Context) error {
 	e.connsMu.Lock()
 	var out []*Conn
 	for _, c := range e.outConns {
@@ -391,9 +425,14 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 		}
 		if cur := probe(); cur != last {
 			last = cur
-			_ = e.Rebind(ctx) // a family that fails is retried below
-		} else if stale, _ := e.node.Stale(ctx); stale {
-			_ = e.node.RebindStale(ctx)
+			_ = e.Rebind(ctx) // whatever fails is retried below
+		} else if e.migratePending.Load() {
+			var dhtErr error
+			if stale, _ := e.node.Stale(ctx); stale {
+				dhtErr = e.node.RebindStale(ctx)
+			}
+			migErr := e.migrateAll(ctx)
+			e.migratePending.Store(dhtErr != nil || migErr != nil)
 		}
 	}
 }
@@ -534,15 +573,12 @@ func (e *Endpoint) forget(c *Conn) {
 	}
 }
 
-// resumable returns the live inbound connection a resume offer names, if
-// the offer comes from that connection's caller.
-func (e *Endpoint) resumable(id []byte, caller [32]byte) *Conn {
-	if len(id) != 16 {
-		return nil
-	}
+// resumable returns the live inbound connection a resume ID names, if the
+// offer comes from that connection's caller.
+func (e *Endpoint) resumable(id [16]byte, caller [32]byte) *Conn {
 	e.connsMu.Lock()
 	defer e.connsMu.Unlock()
-	return e.inConns[connKey{caller, [16]byte(id)}]
+	return e.inConns[connKey{caller, id}]
 }
 
 // Migrate moves an outbound connection onto a freshly punched path, for
@@ -584,8 +620,10 @@ func (c *Conn) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.migrations++
+	seq := c.migrations
 	offer := offerOf(legs)
-	offer.Resume = c.resume[:]
+	offer.Resume = resumeOffer(c.resume, seq)
 	payload, err := e.node.Signal(ctx, c.identity, c.PeerKey, offer.Marshal())
 	if err != nil {
 		abortAll(legs)
@@ -600,7 +638,7 @@ func (c *Conn) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !c.p.swap(pd.sock, pd.remote) {
+	if !c.p.swap(seq, pd.sock, pd.remote) {
 		pd.sock.Close()
 		return errConnClosed
 	}
@@ -946,8 +984,13 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 	// punches. One that names no such connection gets an empty answer, so
 	// the caller fails at once rather than punching for nothing.
 	var resumed *Conn
+	var resumeSeq uint64
 	if len(offer.Resume) > 0 {
-		if resumed = e.resumable(offer.Resume, in.Caller); resumed == nil {
+		id, seq, ok := parseResume(offer.Resume)
+		if ok {
+			resumed, resumeSeq = e.resumable(id, in.Caller), seq
+		}
+		if resumed == nil {
 			e.answerEmpty(ctx, in, entry)
 			return
 		}
@@ -1026,8 +1069,8 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 		return
 	}
 	if resumed != nil {
-		if !resumed.p.swap(pd.sock, pd.remote) {
-			pd.sock.Close() // closed by the application meanwhile
+		if !resumed.p.swap(resumeSeq, pd.sock, pd.remote) {
+			pd.sock.Close() // closed meanwhile, or a newer migration got there first
 		}
 		return
 	}

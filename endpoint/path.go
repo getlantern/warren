@@ -23,28 +23,34 @@ type path struct {
 	sock          *net.UDPConn
 	real          netip.AddrPort // the peer's address on sock
 	gen           int            // bumped on every swap
+	seq           uint64         // the migration that installed this path
 	closed        bool
-	df            bool
 	readDeadline  time.Time
 	writeDeadline time.Time
+	// testHookWrite, if set, runs between a write choosing its socket and
+	// sending, so tests can swap the path in that window.
+	testHookWrite func()
 }
 
 func newPath(sock *net.UDPConn, real netip.AddrPort) *path {
-	return &path{sock: sock, real: real, df: utpshape.SetDontFragment(sock)}
+	utpshape.SetDontFragment(sock)
+	return &path{sock: sock, real: real}
 }
 
-// swap moves the path onto sock, closing the old socket. A read blocked on
-// the old socket wakes and continues on the new one.
-func (p *path) swap(sock *net.UDPConn, real netip.AddrPort) bool {
+// swap moves the path onto sock, closing the old socket, if seq is newer
+// than the migration that installed the current path: a slow resume can't
+// overwrite a newer one. A read blocked on the old socket wakes and
+// continues on the new one.
+func (p *path) swap(seq uint64, sock *net.UDPConn, real netip.AddrPort) bool {
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || seq <= p.seq {
 		p.mu.Unlock()
 		return false
 	}
 	old := p.sock
-	p.sock, p.real = sock, real
+	p.sock, p.real, p.seq = sock, real, seq
 	p.gen++
-	p.df = utpshape.SetDontFragment(sock)
+	utpshape.SetDontFragment(sock)
 	_ = sock.SetReadDeadline(p.readDeadline)
 	_ = sock.SetWriteDeadline(p.writeDeadline)
 	p.mu.Unlock()
@@ -80,9 +86,26 @@ func (p *path) read(b []byte) (int, error) {
 	}
 }
 
+// write sends b to the peer's real address, following the path across a
+// swap: a closed-socket error from a socket swapped out mid-write would
+// otherwise reach QUIC, which treats a write error as fatal.
 func (p *path) write(b []byte) (int, error) {
-	sock, real, _ := p.current()
-	return sock.WriteToUDPAddrPort(b, real)
+	for {
+		sock, real, gen := p.current()
+		if p.testHookWrite != nil {
+			p.testHookWrite()
+		}
+		n, err := sock.WriteToUDPAddrPort(b, real)
+		if err != nil {
+			p.mu.Lock()
+			swapped, closed := p.gen != gen, p.closed
+			p.mu.Unlock()
+			if swapped && !closed {
+				continue
+			}
+		}
+		return n, err
+	}
 }
 
 func (p *path) close() error {
@@ -169,14 +192,12 @@ func (c *Conn) LocalAddr() net.Addr {
 	return sock.LocalAddr()
 }
 
-// DontFragment reports whether the current socket drops oversized datagrams
-// rather than fragmenting them (see utpshape); layers above use it to allow
-// path MTU discovery.
-func (c *Conn) DontFragment() bool {
-	c.p.mu.Lock()
-	defer c.p.mu.Unlock()
-	return c.p.df
-}
+// DontFragment reports false, though the sockets underneath set it: layers
+// above use it to decide on path MTU discovery, and a migration can move
+// the connection onto a path with a smaller MTU without QUIC noticing (the
+// peer address it sees never changes), so a size discovered on one network
+// would be dropped on the next. Packets stay at QUIC's safe initial size.
+func (c *Conn) DontFragment() bool { return false }
 
 func (c *Conn) SetDeadline(t time.Time) error {
 	if err := c.SetReadDeadline(t); err != nil {
