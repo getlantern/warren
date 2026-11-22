@@ -389,21 +389,64 @@ func TestReboundResignsRecords(t *testing.T) {
 	}
 }
 
-// A reply to a query sent before a rebind doesn't count as a reflection:
-// it reports the old network's mapping.
+// A reply to a query sent before a rebind is dropped, even when the rebind
+// carries the same timestamp, while a query sent after it (same timestamp
+// again) is reflected normally.
 func TestPreRebindReplyNotReflected(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(93)), Rand: rng(94)})
-	peer := addr(7)
-	n.send(t0, peer, "ping", krpc.Args{}, &txn{kind: txPing})
-	sends, _ := n.Drain()
-	var q krpc.Msg
-	if len(sends) != 1 || krpc.Unmarshal(sends[0].Data, &q) != nil {
-		t.Fatal("no ping sent")
+	ping := func(peer netip.AddrPort) krpc.Msg {
+		n.send(t0, peer, "ping", krpc.Args{}, &txn{kind: txPing})
+		sends, _ := n.Drain()
+		var q krpc.Msg
+		if len(sends) != 1 || krpc.Unmarshal(sends[0].Data, &q) != nil {
+			t.Fatal("no ping sent")
+		}
+		return q
 	}
-	n.Rebound(t0.Add(time.Second))
-	r := krpc.Msg{T: q.T, Y: krpc.Response, IP: addr(50), R: krpc.Return{ID: outsiderID(rng(95))}}
-	n.HandlePacket(t0.Add(2*time.Second), peer, krpc.AppendMarshal(nil, &r))
+	reply := func(peer netip.AddrPort, q krpc.Msg, mapped netip.AddrPort) {
+		r := krpc.Msg{T: q.T, Y: krpc.Response, IP: mapped, R: krpc.Return{ID: outsiderID(rng(95))}}
+		n.HandlePacket(t0, peer, krpc.AppendMarshal(nil, &r))
+	}
+	old := ping(addr(7))
+	n.Rebound(t0) // same instant as the query
+	reply(addr(7), old, addr(50))
 	if len(n.Reflections()) != 0 {
 		t.Fatalf("a pre-rebind reply was recorded as a reflection: %v", n.Reflections())
+	}
+	fresh := ping(addr(8))
+	reply(addr(8), fresh, addr(51))
+	if r := n.Reflections(); len(r) != 1 || r[0].Mapped != addr(51) {
+		t.Fatalf("a post-rebind reply at the same instant wasn't reflected: %v", r)
+	}
+}
+
+// Rebound drops write tokens bound to our old address, and a publication
+// that started before it can't install its holders afterwards.
+func TestReboundDropsStaleTokensAndPublications(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(96)), Rand: rng(97), ReadOnly: true})
+	n.main.heard(outsiderID(rng(98)), addr(1), t0)
+	if err := n.Listen(t0, ed25519.NewKeyFromSeed(make([]byte, 32))); err != nil {
+		t.Fatal(err)
+	}
+	n.lst.holders = []*holder{{addr: addr(2), token: []byte("old")}}
+	n.lst.sessions[SessionID{1}] = &session{expires: t0.Add(time.Hour), tokens: map[netip.AddrPort][]byte{addr(3): []byte("old")}}
+	var target krpc.NodeID
+	for _, tg := range n.lst.records {
+		target = tg
+	}
+	oldPub := &lookup{gen: n.gen, target: target, acked: []ackedReplica{{addr: addr(4), token: []byte("old")}}}
+	n.Rebound(t0.Add(time.Second))
+	for _, h := range n.lst.holders {
+		if h.token != nil {
+			t.Fatalf("holder %v kept a token bound to the old address", h.addr)
+		}
+	}
+	if n.lst.sessions[SessionID{1}].tokens != nil {
+		t.Fatal("a session kept tokens bound to the old address")
+	}
+	n.lst.holders = nil
+	n.recordStored(t0.Add(2*time.Second), oldPub)
+	if len(n.lst.holders) != 0 {
+		t.Fatal("a publication from before the rebind installed its holders")
 	}
 }

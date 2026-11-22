@@ -626,7 +626,10 @@ callers can't reach it.
   didn't change), stored items, records and tokens. An ephemeral port gets a
   new one; a fixed port is reused when it can be, else falls back to
   ephemeral.
-- **`dht.Node.Rebound`** then forgets the old network's reflections, and when
+- **`dht.Node.Rebound`** then forgets the old network's reflections, abandons
+  queries in flight from the old socket (without counting them against the
+  peers), so a late reply can't restore an old mapping or finish an old
+  publication, drops write tokens bound to the old address, and when
   listening marks its records due, so they are re-signed with a newer seq
   and republished at once, and polls its holders. Holders move a forwarding
   binding only on a strictly newer signed put, so republishing the old seq

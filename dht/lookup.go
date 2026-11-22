@@ -42,6 +42,7 @@ type cand struct {
 // closest live nodes overall and, when domestic copies are on, the K closest
 // live domestic nodes, so a single traversal finds both replica sets.
 type lookup struct {
+	gen      uint64 // the node's network generation when it started
 	op       OpID
 	kind     lookupKind
 	internal bool
