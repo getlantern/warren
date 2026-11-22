@@ -54,12 +54,25 @@ func TestWatchNetworkRebindsOnChange(t *testing.T) {
 	e := phone(t, seed)
 	var route atomic.Value
 	route.Store([2]netip.Addr{netip.MustParseAddr("192.168.1.5")})
-	e.routes = func() [2]netip.Addr { return route.Load().([2]netip.Addr) }
+	probed := make(chan struct{}, 100)
+	e.routes = func() [2]netip.Addr {
+		select {
+		case probed <- struct{}{}:
+		default:
+		}
+		return route.Load().([2]netip.Addr)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go e.WatchNetwork(ctx, 10*time.Millisecond)
 	before := e.DHT().Addr()
-	time.Sleep(100 * time.Millisecond)
+	for range 3 { // the watcher's baseline and a couple of unchanged checks
+		select {
+		case <-probed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the watcher never checked the route")
+		}
+	}
 	if e.DHT().Addr() != before {
 		t.Fatal("rebound with no network change")
 	}

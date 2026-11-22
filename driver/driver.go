@@ -36,6 +36,7 @@ var listenUDP = net.ListenUDP
 
 type packet struct {
 	fam  int
+	conn *net.UDPConn // the socket it arrived on
 	from netip.AddrPort
 	data []byte
 }
@@ -212,7 +213,7 @@ func (n *Node) read(fam int, conn *net.UDPConn) {
 				continue
 			}
 		}
-		p := packet{fam: fam, from: netip.AddrPortFrom(from.Addr().Unmap(), from.Port()), data: append([]byte(nil), buf[:sz]...)}
+		p := packet{fam: fam, conn: conn, from: netip.AddrPortFrom(from.Addr().Unmap(), from.Port()), data: append([]byte(nil), buf[:sz]...)}
 		select {
 		case n.inbox <- p:
 		default:
@@ -236,7 +237,9 @@ func (n *Node) loop() {
 		case <-n.done:
 			return
 		case p := <-n.inbox:
-			n.fams[p.fam].node.HandlePacket(time.Now(), p.from, p.data)
+			if n.current(p) {
+				n.fams[p.fam].node.HandlePacket(time.Now(), p.from, p.data)
+			}
 		case f := <-n.ops:
 			f(time.Now())
 		case <-timer.C:
@@ -257,6 +260,12 @@ func (n *Node) loop() {
 		}
 	}
 }
+
+// current reports whether p arrived on its family's present socket. A
+// packet from a socket Rebind replaced belongs to the old network: a reply
+// to a query sent before the change would put an old-network mapping back
+// among the fresh reflections.
+func (n *Node) current(p packet) bool { return p.conn == n.fams[p.fam].conn }
 
 // flush sends one family's datagrams and routes its events.
 func (n *Node) flush(fam int, f *family) {

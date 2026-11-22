@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 
@@ -480,15 +481,24 @@ func TestRebindKeepsProviderReachable(t *testing.T) {
 
 // A fixed port is reused on rebind; a dual-stack node rebinds both families.
 func TestRebindPorts(t *testing.T) {
-	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
+	var n *Node
+	var fixed netip.AddrPort
+	for range 10 { // another socket may take the probed port first
+		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixed = probe.LocalAddr().(*net.UDPAddr).AddrPort()
+		probe.Close()
+		if n, err = Listen(fixed.String(), memberConfig(false)); err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatal(err)
+		}
 	}
-	fixed := probe.LocalAddr().(*net.UDPAddr).AddrPort()
-	probe.Close()
-	n, err := Listen(fixed.String(), memberConfig(false))
-	if err != nil {
-		t.Fatal(err)
+	if n == nil {
+		t.Skip("couldn't hold a fixed port")
 	}
 	defer n.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -564,5 +574,18 @@ func TestStaleRebindRetried(t *testing.T) {
 	n.Close()
 	if err := n.Rebind(ctx); err == nil {
 		t.Fatal("rebind after Close succeeded")
+	}
+}
+
+// A packet from a socket that Rebind replaced is dropped: it belongs to the
+// old network.
+func TestPacketsFromReplacedSocketDropped(t *testing.T) {
+	old, cur := &net.UDPConn{}, &net.UDPConn{}
+	n := &Node{fams: []*family{{conn: cur}}}
+	if n.current(packet{fam: 0, conn: old}) {
+		t.Fatal("a packet from the replaced socket was accepted")
+	}
+	if !n.current(packet{fam: 0, conn: cur}) {
+		t.Fatal("a packet from the present socket was dropped")
 	}
 }
