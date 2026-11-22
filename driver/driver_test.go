@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -223,5 +224,186 @@ func TestEventsClosedOnShutdown(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Events consumer still blocked after Close")
+	}
+}
+
+func memberConfig6(ro bool) dht.Config {
+	c := memberConfig(ro)
+	var id krpc.NodeID
+	rand.Read(id[:])
+	c.ID = farsi.Tag(krpc.SecureID(netip.MustParseAddr("::1"), id))
+	return c
+}
+
+// A dual-stack network: each node runs an IPv4 and an IPv6 node as
+// siblings. A provider listening on both is reachable by an IPv4-only
+// caller and by an IPv6-only one, and each answer goes back through the
+// node that delivered the offer.
+func TestDualStackSignal(t *testing.T) {
+	probe, err := ListenDual("256.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	probe.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	dual := func(ro bool) *Node {
+		n, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(ro), memberConfig6(ro))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { n.Close() })
+		if len(n.Addrs()) != 2 {
+			t.Fatalf("dual node bound %v", n.Addrs())
+		}
+		return n
+	}
+	var nodes []*Node
+	for i := range 12 {
+		n := dual(false)
+		if i > 0 {
+			if _, err := n.Bootstrap(ctx, nodes[0].Addrs()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		nodes = append(nodes, n)
+	}
+	for _, n := range nodes {
+		n.Bootstrap(ctx, nodes[len(nodes)-1].Addrs())
+	}
+
+	provider := dual(true)
+	mapped := nodes[3].Addrs()
+	mapped[0] = netip.AddrPortFrom(netip.AddrFrom16(mapped[0].Addr().As16()), mapped[0].Port()) // ::ffff:127.0.0.1
+	if _, err := provider.Bootstrap(ctx, mapped); err != nil {
+		t.Fatal(err)
+	}
+	var size4 int
+	provider.InspectEach(ctx, func(a netip.AddrPort, d *dht.Node) {
+		if a.Addr().Is4() {
+			c, m := d.RoutingSize()
+			size4 = c + m
+		}
+	})
+	if size4 == 0 {
+		t.Fatal("an IPv4-mapped seed didn't bootstrap the IPv4 node")
+	}
+	if _, err := provider.Bootstrap(ctx, nil); err != nil {
+		t.Fatalf("bootstrapping a dual node from its own tables: %v", err)
+	}
+	pk := ed25519.NewKeyFromSeed([]byte("provider-seed-provider-seed-0123"))
+	if err := provider.Listen(ctx, pk); err != nil {
+		t.Fatal(err)
+	}
+	var keys [][32]byte
+	provider.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) { keys = append(keys, d.SignalKey()) })
+	if len(keys) != 2 || keys[0] != keys[1] || keys[0] == ([32]byte{}) {
+		t.Fatal("the two families listen with different signaling keys, so their records conflict")
+	}
+	go func() {
+		for e := range provider.Events() {
+			if in, ok := e.(dht.Incoming); ok {
+				provider.Answer(ctx, in.Session, append([]byte("re: "), in.Payload...))
+			}
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		withHolders := 0
+		provider.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+			if len(d.Holders()) > 0 {
+				withHolders++
+			}
+		})
+		if withHolders == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("records reached holders on %d of 2 families", withHolders)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	only4, err := Listen("127.0.0.1:0", memberConfig(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { only4.Close() })
+	only6, err := ListenDual("256.0.0.1:0", "[::1]:0", memberConfig(true), memberConfig6(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { only6.Close() })
+	if a := only6.Addrs(); len(a) != 1 || a[0].Addr().Is4() {
+		t.Fatalf("IPv6-only node bound %v", a)
+	}
+	for name, caller := range map[string]*Node{"IPv4-only": only4, "IPv6-only": only6} {
+		if _, err := caller.Bootstrap(ctx, nodes[5].Addrs()); err != nil {
+			t.Fatalf("%s bootstrap: %v", name, err)
+		}
+		got, err := caller.Signal(ctx, ed25519.NewKeyFromSeed(make([]byte, 32)), [32]byte(pk.Public().(ed25519.PublicKey)), []byte(name))
+		if err != nil || string(got) != "re: "+name {
+			t.Fatalf("%s caller: %v %q", name, err, got)
+		}
+	}
+}
+
+// An offer seen through one family is not delivered again through the
+// other, an answer to an unknown session fails instead of guessing a
+// family, and a flood evicts the oldest sessions rather than all of them.
+func TestSessionsDedupedAcrossFamilies(t *testing.T) {
+	n := &Node{sessions: map[dht.SessionID]int{}}
+	in := dht.Incoming{Session: dht.SessionID{1}}
+	delivered := 0
+	for _, fam := range []int{0, 1} {
+		if n.admitSession(fam, in) {
+			delivered++
+		}
+	}
+	if delivered != 1 {
+		t.Fatalf("the same offer through both families was delivered %d times", delivered)
+	}
+	if n.sessions[in.Session] != 0 {
+		t.Fatal("the replay through the other family moved the answer route")
+	}
+	for i := range maxSessions {
+		n.admitSession(0, dht.Incoming{Session: dht.SessionID{2, byte(i), byte(i >> 8)}})
+	}
+	if _, ok := n.sessions[in.Session]; ok {
+		t.Fatal("the oldest session survived a full table")
+	}
+	if len(n.sessions) != maxSessions {
+		t.Fatalf("sessions holds %d, want %d", len(n.sessions), maxSessions)
+	}
+}
+
+func TestAnswerUnknownSessionFails(t *testing.T) {
+	n, err := Listen("127.0.0.1:0", memberConfig(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	if err := n.Answer(context.Background(), dht.SessionID{9}, []byte("x")); !errors.Is(err, ErrUnknownSession) {
+		t.Fatalf("answer to an unknown session: %v", err)
+	}
+}
+
+// An offer dropped on a full events channel isn't recorded, so its copy
+// through the other family is still delivered and answerable.
+func TestDroppedOfferStillDeliverable(t *testing.T) {
+	n := &Node{sessions: map[dht.SessionID]int{}, events: make(chan dht.Event)} // nobody reading: full
+	in := dht.Incoming{Session: dht.SessionID{7}}
+	n.deliverIncoming(0, in)
+	n.events = make(chan dht.Event, 1)
+	n.deliverIncoming(1, in)
+	if len(n.events) != 1 || n.sessions[in.Session] != 1 {
+		t.Fatalf("the copy through the other family wasn't delivered: %d queued, route %v", len(n.events), n.sessions)
+	}
+}
+
+func TestPutAcknowledgementsAddUp(t *testing.T) {
+	got := sumPuts([]dht.Event{dht.PutDone{Stored: 0}, dht.PutDone{Stored: 5, Domestic: 2}})
+	if got.Stored != 5 || got.Domestic != 2 {
+		t.Fatalf("summed acknowledgements %+v, want 5 stored, 2 domestic", got)
 	}
 }

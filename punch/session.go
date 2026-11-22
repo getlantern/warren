@@ -44,7 +44,15 @@ type Config struct {
 	// candidates and we never probe the peer directly, so it only ever sees
 	// the relay router. It requires a relay.
 	RelayOnly bool
+	// Claim, if set, is asked by an initiator before it commits to a path
+	// (a nomination or a relay probe), and it commits only if Claim
+	// reports true. An initiator punching several sessions at once (one
+	// per address family) shares one claim among them, so the responder
+	// is only ever nominated on one and both sides keep the same path.
+	Claim func() bool
 }
+
+func (s *Session) claim() bool { return s.cfg.Claim == nil || s.cfg.Claim() }
 
 func (c *Config) defaults() {
 	if c.Deadline == 0 {
@@ -156,6 +164,12 @@ type Session struct {
 	relayT     map[uint16]relayQuery
 	nextRelay  time.Time // next bind step or probe
 	relayFrom  time.Time // when probing starts
+	// relayDeferred holds relay probing until halfway to the deadline even
+	// when this session has no direct strategy (see DeferRelay).
+	relayDeferred bool
+	// committed: as initiator, we nominated a pair or probed a relay, so
+	// the responder may already have connected on this session's path.
+	committed  bool
 	relayProbe []byte
 	relayAck   []byte
 	peerProbe  []byte
@@ -287,6 +301,12 @@ func probeID(secret []byte, label string) krpc.NodeID {
 	h.Write(secret)
 	return krpc.NodeID(h.Sum(nil))
 }
+
+// DeferRelay, called before Start, holds relay probing until halfway to the
+// deadline even when this session has no direct strategy of its own: a
+// session for another address family is racing alongside and may find a
+// direct path, and an initiator's relay probe commits the responder.
+func (s *Session) DeferRelay() { s.relayDeferred = true }
 
 // Start begins punching toward the peer's offer.
 func (s *Session) Start(now time.Time, remote Offer) {
@@ -535,7 +555,7 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 			if sent, ok := s.sentTo[t]; ok && sent.socket == s.nominated.socket {
 				s.proven = true
 			}
-		case s.cfg.Initiator && !s.nominating:
+		case s.cfg.Initiator && !s.nominating && s.claim():
 			p := pair{socket, from}
 			if sent, ok := s.sentTo[t]; ok && sent.socket == socket {
 				p = sent
@@ -551,7 +571,7 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 		switch m.A.ID {
 		case s.peerID:
 			s.reply(socket, from, &m)
-			if s.cfg.Initiator && !s.nominating && !s.done {
+			if s.cfg.Initiator && !s.nominating && !s.done && s.claim() {
 				s.nominate(now, p)
 			}
 		case s.nomID:
@@ -571,8 +591,13 @@ func (s *Session) HandlePacket(now time.Time, socket int, from netip.AddrPort, d
 	}
 }
 
+// Committed reports whether this initiator nominated a pair or probed its
+// relay: from then on the responder may hand off on this path, so a shared
+// Claim must stay with this session even if it fails.
+func (s *Session) Committed() bool { return s.committed }
+
 func (s *Session) nominate(now time.Time, p pair) {
-	s.nominating, s.nominated = true, p
+	s.nominating, s.nominated, s.committed = true, p, true
 	s.nomTids[s.query(p.socket, p.addr, s.nomID)] = true
 	s.nomSent = 1
 	s.nextNom = now.Add(nominateTick)

@@ -329,3 +329,33 @@ func TestOfferRoundTrip(t *testing.T) {
 		t.Errorf("offer is %d bytes; it must fit easily in a signaling payload", len(o.Marshal()))
 	}
 }
+
+// A dual-stack offer carries an IPv6 profile, and each family's session
+// sees only its own candidates and profile; relays stay with IPv4.
+func TestOfferFamilies(t *testing.T) {
+	p6 := punch.Profile{Mapping: punch.MappingIndependent}
+	o := punch.Offer{
+		Secret:     []byte("secret-secret-secret"),
+		Candidates: []netip.AddrPort{netip.MustParseAddrPort("2.10.0.1:40000"), netip.MustParseAddrPort("[2001:db8::1]:5")},
+		Profile:    punch.Profile{Mapping: punch.MappingDependent, Allocation: punch.AllocRandom},
+		Profile6:   &p6,
+		Relays:     []netip.AddrPort{netip.MustParseAddrPort("2.176.0.9:6881")},
+	}
+	back := roundTrip(o)
+	if back.Profile6 == nil || *back.Profile6 != p6 {
+		t.Fatalf("IPv6 profile lost in transit: %+v", back.Profile6)
+	}
+	v4, v6 := back.Family(false), back.Family(true)
+	if len(v4.Candidates) != 1 || !v4.Candidates[0].Addr().Is4() || v4.Profile != o.Profile || len(v4.Relays) != 1 {
+		t.Fatalf("IPv4 family: %+v", v4)
+	}
+	if len(v6.Candidates) != 1 || v6.Candidates[0].Addr().Is4() || v6.Profile != p6 || len(v6.Relays) != 0 {
+		t.Fatalf("IPv6 family: %+v", v6)
+	}
+	if string(v6.Secret) != string(o.Secret) {
+		t.Fatal("IPv6 family lost the secret")
+	}
+	if back := roundTrip(punch.Offer{Profile: o.Profile}); back.Profile6 != nil {
+		t.Fatal("an IPv4-only offer grew an IPv6 profile")
+	}
+}

@@ -330,8 +330,9 @@ cost of more traffic.
 
 In this standalone matrix the zeros have no relay. The full stack sends them
 through a router relay (see *Relay fallback*). Filtering measurements would let
-the planner skip doomed double birthdays, and IPv6 and port mapping (PCP/UPnP)
-would avoid the relay for some of them; neither is built yet.
+the planner skip doomed double birthdays, and port mapping (PCP/UPnP) would
+avoid the relay for some of them; neither is built yet. IPv6 (see *IPv6*)
+avoids it for peers with public IPv6 addresses.
 
 Times to connect in the model: 0.24–0.5 s for direct and spray, 1.6 s for
 cone ↔ random, 0.28 s for the double birthday. The real-UDP runner is tested on
@@ -346,7 +347,7 @@ pair (so the path is known to work both ways). A few stray control datagrams
 can reach the application afterwards; layers above drop them, and
 `endpoint.Conn.Recv` skips them.
 
-**Still to come:** IPv6 candidates; PCP/NAT-PMP/UPnP (Tailscale's `portmapper` is
+**Still to come:** PCP/NAT-PMP/UPnP (Tailscale's `portmapper` is
 a candidate); low-TTL priming; filtering-aware planning. Check the iOS
 `RLIMIT_NOFILE` soft limit before relying on 64-socket fans.
 
@@ -557,6 +558,62 @@ well. The client side slots into hysteria2x's dialer hook, as `pre_initial_junk`
 does today. The server needs a hysteria2x inbound that wraps its listener
 before `Service.Start`, since a stock hysteria2 server can't unwrap uTP.
 
+## IPv6 (built)
+
+Large mobile networks (China Mobile above all, and increasingly carriers in
+Russia and Iran) give phones public IPv6 addresses. Two such peers usually
+connect directly: there is no address translation, only a stateful firewall,
+which a simultaneous open passes. That raises the success rate and takes load
+off relays, so IPv6 comes before network-change rebind, which must handle a
+family change anyway.
+
+To look like libtorrent, IPv6 is a second DHT node, not more entries in one
+table. libtorrent runs one node per listen socket and address family, each
+with its own BEP 42 ID (derived from that family's external address), its
+own routing table, and `nodes` or `nodes6` in its replies. A query whose
+`want` asks for the other family is answered from the sibling node's table
+(libtorrent's `get_foreign_node`). Warren does the same:
+
+- **DHT (`dht/`).** A node can be given a sibling. Referrals for the other
+  family come from the sibling's table of the same personality (community or
+  Mainline). Everything else stays per node: IDs, tables, storage, tokens.
+- **Driver (`driver/`).** `ListenDual` binds an IPv4 and an IPv6 socket and
+  runs both nodes on the one loop goroutine, so the core stays
+  single-threaded and siblings can call each other directly. Operations go to
+  both nodes: bootstrap and publish on each, and the first successful get
+  wins. A host that can't bind IPv6 runs the IPv4 node alone; one that
+  binds IPv6 but has no IPv6 peers skips the IPv6 leg when connecting.
+- **Signaling.** A provider listens on both nodes, so it has a record under
+  each family. A caller signals over every family it has and takes the first
+  answer.
+- **Endpoint and punching (`endpoint/`, `punch/`).** Each family gets its own
+  data socket and punch session (a leg). Offers carry candidates of both
+  families plus an IPv6 profile (`p6`). The caller races the legs, IPv6
+  first with a 200 ms head start (happy eyeballs, `HeadStart`), and the
+  first connected path wins; the other leg stops and releases its sockets.
+  IPv6 peers with public addresses plan as endpoint-independent, so the
+  common case is a direct simultaneous open. The caller's legs share one
+  claim, so only one family is ever nominated and both sides keep the same
+  path, and the provider punches a dual-stack caller's offer once though it
+  arrives through both DHTs. While IPv6 races, the IPv4 leg on both sides
+  waits out the head start and holds IPv4 relay probes until halfway to the
+  deadline, since the caller's relay probe commits the responder. The
+  provider runs an IPv4 leg only for an offer with IPv4 candidates or
+  relays. The endpoint negotiates relays for its IPv4 leg
+  only (an IPv6 DHT node still volunteers as a router), and a relay-only
+  endpoint never opens an IPv6 leg, since that leg punches directly and
+  would reveal its address; it refuses to start without an IPv4 socket.
+
+Loopback tests cover a provider listening on both families signaled by an
+IPv4-only and an IPv6-only caller, two dual-stack endpoints connecting over
+IPv6 and running hysteria2 over uTP through it, a dual-stack caller falling
+back to IPv4 against an IPv4-only provider (with one limiter charge per
+dual-stack connect), and a relay-only endpoint keeping IPv6 out of its
+offers. Unit tests cover the driver's session table (a session admitted
+once across families) and two sessions sharing a claim in lockstep. Gaps: `Snapshot` saves only the primary
+node, so a restart rejoins the IPv6 DHT by bootstrapping; relays don't
+carry IPv6 yet; and the NAT simulation models IPv4 only.
+
 ## Phase 0: measure first (`natprobe/`, built)
 
 `natprobe` uses **public Mainline nodes as reflectors**: BEP 42 responses carry the
@@ -604,12 +661,13 @@ and carrier allocator. The design therefore splits measurement in two:
 | 1 | Bounded bencode + KRPC (BEP 5/32/42/43/44) | `bencode/`, `krpc/` built, fuzzed, matching spec vectors |
 | 1b | Community membership tags | `overlay/` built |
 | 2 | Sans-IO DHT core and deterministic simulator | `dht/`, `sim/` built: two personalities, BEP 42/43/44 (immutable and mutable, matching spec vectors, CAS and seq rules), domestic copies, partition detection, isolation mode, snapshots and `Rejoin`. Regression tests cover idle traffic, determinism, and mutable records surviving shutdown |
-| 2b | UDP driver | `driver/` built: one goroutine owns the node. Loopback tests cover put/get, mutable, a read-only phone, restart from snapshot with no bootstrap server, and Close unblocking callers. Race-clean over 20 runs. IPv4 only for now |
+| 2b | UDP driver | `driver/` built: one goroutine owns the node, or an IPv4 and IPv6 pair. Loopback tests cover put/get, mutable, a read-only phone, restart from snapshot with no bootstrap server, Close unblocking callers, and dual-stack signaling. Race-clean |
 | 2c | libtorrent wire matching | `cmd/ltfingerprint` built; 0 shape differences against 2.1.1. Next: timing comparison, and `announce_peer`'s `seed` flag once we announce |
 | 3 | Signaling over BEP 44 | `dht/signal.go` built: provider records on hourly blinded salts, holder binding and forwarding, encrypted offer and answer, ack-based failover; exposed through `driver`. Simulation tests cover phone to phone, a dead holder, a shutdown, and an unknown provider. Mapping-timeout probe built. Next: keepalive-answer delivery as an option, and a store-and-poll fallback |
-| 4 | Punch engine | `punch/` built: sans-IO session, planner, real-UDP runner, `sim/nat.go` RFC 4787 model. Success matrix above, with a port-quota budget. Next: IPv6, port mapping, filtering-aware planning |
+| 4 | Punch engine | `punch/` built: sans-IO session, planner, real-UDP runner, `sim/nat.go` RFC 4787 model. Success matrix above, with a port-quota budget. Next: port mapping, filtering-aware planning |
 | 4b | Connect by public key | `endpoint/` built: signaling plus punch, a passive NAT profile, authorization, and bounded inbound. Full-stack simulation through modeled NATs passes |
 | 4c | Relay fallback | Router relays via `announce_peer` binding and blind forwarding with volunteer limits, plus relay-only privacy mode. Every simulated NAT pairing connects |
 | 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
+| 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
 | 6 | iOS integration, memory budget, network-change rebind | |

@@ -77,6 +77,10 @@ var (
 const (
 	MaxSignalPayload = 900
 	RecordEpoch      = time.Hour
+	// OfferWindow bounds how far apart two copies of one offer can be
+	// accepted: an offer is refused more than offerMaxSkew either side of
+	// its signing time, so any copy arrives within this of the first.
+	OfferWindow = 2 * offerMaxSkew * time.Second
 
 	signalAttemptTimeout = 4 * time.Second // answers wait on the provider gathering a fresh socket; dead holders are caught by the ack
 	offerMaxSkew         = 60              // seconds between signer and verifier clocks
@@ -376,6 +380,14 @@ func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
 	if err != nil {
 		return err
 	}
+	return n.ListenKey(now, priv, x)
+}
+
+// ListenKey is Listen with a given signaling key. Sibling nodes listening
+// for one identity must share it: they publish the same record target, and
+// a holder that keeps one store across families would otherwise reject one
+// record, or hand callers a key the receiving node can't decrypt with.
+func (n *Node) ListenKey(now time.Time, priv ed25519.PrivateKey, x *ecdh.PrivateKey) error {
 	// A new identity replaces the old one entirely: its records stop being
 	// republished, since their offers could no longer be decrypted.
 	n.Unlisten()
@@ -386,6 +398,15 @@ func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
 	n.ensureRecords(now)
 	n.maintain(now)
 	return nil
+}
+
+// SignalKey is the X25519 key callers encrypt offers to, zero when not
+// listening.
+func (n *Node) SignalKey() (k [32]byte) {
+	if n.lst != nil {
+		copy(k[:], n.lst.x.PublicKey().Bytes())
+	}
+	return k
 }
 
 func (n *Node) Unlisten() {

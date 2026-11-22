@@ -43,8 +43,9 @@ func (s *Session) startRelay(now time.Time, secret []byte, me, peer string) {
 	s.relayProbe, s.relayAck = relayMAC(secret, "probe "+me, 4), relayMAC(secret, "ack "+me, 2)
 	s.peerProbe, s.peerAck = relayMAC(secret, "probe "+peer, 4), relayMAC(secret, "ack "+peer, 2)
 	s.relayFrom = now
-	if s.strategy != Relay {
-		// A direct path wins if one exists; fall back halfway to the deadline.
+	if s.strategy != Relay || s.relayDeferred {
+		// A direct path wins if one exists, here or on another session
+		// racing alongside; fall back halfway to the deadline.
 		s.relayFrom = now.Add(s.cfg.Deadline / 2)
 	}
 	s.nextRelay = now
@@ -86,10 +87,17 @@ func (s *Session) tickRelay(now time.Time) {
 		// answer. A wrong guess fails loudly in the authenticated handshake
 		// that follows.
 		s.connectRelayed()
+	case s.cfg.Initiator && !s.claim():
+		// Another session holds the claim. The responder connects on our
+		// first probe, so probing would commit it to this path.
+		s.nextRelay = now.Add(relayProbeEvery)
 	default:
 		// Both sides probe: the initiator's probe is what the responder
 		// acks, and the responder's tells the initiator the path works.
 		s.sends = append(s.sends, Send{Socket: 0, To: s.relay, Data: s.relayProbe})
+		if s.cfg.Initiator {
+			s.committed = true // the responder connects on this probe
+		}
 		if s.cfg.Initiator && s.relayProven {
 			s.relayUnanswered++
 		}

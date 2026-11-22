@@ -13,11 +13,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/warren/dht"
@@ -34,6 +36,16 @@ type Config struct {
 	DHTAddr string
 	// DataIP is the IP data sockets bind on; empty means all interfaces.
 	DataIP net.IP
+	// DHTAddr6, when set (e.g. "[::]:6881"), also runs an IPv6 DHT node
+	// with config DHT6, paired with the IPv4 one as libtorrent pairs its
+	// per-family nodes, and connections race IPv6 against IPv4. DataIP6
+	// is the IP IPv6 data sockets bind on.
+	DHTAddr6 string
+	DHT6     dht.Config
+	DataIP6  net.IP
+	// HeadStart is how long both sides give an IPv6 path before also
+	// punching IPv4 (happy eyeballs); the first connected path wins.
+	HeadStart time.Duration
 	// Profile overrides the NAT profile otherwise inferred from the DHT
 	// socket's BEP 42 reflections.
 	Profile *punch.Profile
@@ -100,6 +112,158 @@ type Endpoint struct {
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	closed  bool // guards wg.Add for outbound Connects against Close's Wait
+
+	offersMu sync.Mutex
+	offers   map[[32]byte]*offerEntry // recent offers, by caller and secret
+	dupes    atomic.Int64             // repeat copies seen, for tests
+}
+
+// offerEntry is one offer being answered. A copy of it through the other
+// family's DHT gets the same answer through its own session, sent at once
+// if the answer is ready or by the first copy when it is. Copies never
+// wait, so they hold no inbound slot, and only one is answered: a caller
+// replaying its own offer gets nothing more.
+type offerEntry struct {
+	at       time.Time
+	mu       sync.Mutex
+	done     chan struct{} // closed once answer is set
+	answer   []byte        // nil when there is no answer
+	answered int           // copies answered or queued
+	pending  []dht.SessionID
+}
+
+const maxOfferCopies = 1 // one per other address family
+
+// copyOf handles a copy of the offer: it returns the answer to send now,
+// or queues the session for the first copy to answer.
+func (o *offerEntry) copyOf(s dht.SessionID) (answer []byte, now bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.answered >= maxOfferCopies {
+		return nil, false
+	}
+	o.answered++
+	select {
+	case <-o.done:
+		return o.answer, o.answer != nil
+	default:
+		o.pending = append(o.pending, s)
+		return nil, false
+	}
+}
+
+// publish sets the answer, once, and returns the queued copies to answer.
+func (o *offerEntry) publish(answer []byte) []dht.SessionID {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	select {
+	case <-o.done:
+		return nil
+	default:
+	}
+	o.answer = answer
+	close(o.done)
+	p := o.pending
+	o.pending = nil
+	if answer == nil {
+		return nil
+	}
+	return p
+}
+
+// publishOffer sets an offer's answer and sends it to queued copies,
+// returning how many it delivered.
+func (e *Endpoint) publishOffer(ctx context.Context, o *offerEntry, answer []byte) int {
+	delivered := 0
+	for _, s := range o.publish(answer) {
+		if e.node.Answer(ctx, s, answer) == nil {
+			delivered++
+		}
+	}
+	return delivered
+}
+
+// deliverQueued sends answer to copies queued so far without making it
+// visible to later ones, returning how many it delivered.
+func (e *Endpoint) deliverQueued(ctx context.Context, o *offerEntry, answer []byte) int {
+	o.mu.Lock()
+	queued := o.pending
+	o.pending = nil
+	o.mu.Unlock()
+	delivered := 0
+	for _, s := range queued {
+		if e.node.Answer(ctx, s, answer) == nil {
+			delivered++
+		}
+	}
+	return delivered
+}
+
+// wantFamilies decides which legs a provider runs for an offer: IPv4 when
+// the caller offered IPv4 candidates or relays, IPv6 when it offered IPv6
+// candidates and we may punch directly.
+func wantFamilies(o punch.Offer, has4, has6, relayOnly bool) (v4, v6 bool) {
+	f4 := o.Family(false)
+	v4 = has4 && (len(f4.Candidates) > 0 || len(f4.Relays) > 0 || f4.Relay.IsValid() || relayOnly)
+	v6 = has6 && !relayOnly && len(o.Family(true).Candidates) > 0
+	return v4, v6
+}
+
+// probeable filters candidates to the families we'll run a leg for.
+func probeable(cands []netip.AddrPort, v4, v6 bool) []netip.AddrPort {
+	var out []netip.AddrPort
+	for _, c := range cands {
+		if is4 := c.Addr().Is4(); is4 && v4 || !is4 && v6 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// maxRecentOffers bounds the offer-secret memory under a flood.
+const maxRecentOffers = 4096
+
+// firstOffer returns the entry for this caller's offer with this secret,
+// reporting whether it is new. Entries are keyed by caller and secret, so
+// one caller can't touch another's, and remembered for as long as the DHT
+// would still accept a copy of the offer (dht.OfferWindow). When full, the oldest entry makes way: a flood can't
+// make us refuse offers.
+func (e *Endpoint) firstOffer(caller [32]byte, secret []byte, now time.Time) (*offerEntry, bool) {
+	h := sha256.New()
+	h.Write(caller[:])
+	h.Write(secret)
+	key := [32]byte(h.Sum(nil))
+	// A copy can arrive as late as the DHT still accepts the offer: a
+	// slower family's signal keeps retrying after the first answer.
+	ttl := max(2*(e.cfg.GatherWait+e.cfg.PunchDeadline), dht.OfferWindow)
+	e.offersMu.Lock()
+	defer e.offersMu.Unlock()
+	if e.offers == nil {
+		e.offers = map[[32]byte]*offerEntry{}
+	}
+	if o, ok := e.offers[key]; ok && now.Sub(o.at) < ttl {
+		e.dupes.Add(1)
+		return o, false
+	}
+	if len(e.offers) >= maxRecentOffers {
+		var oldest [32]byte
+		var at time.Time
+		for k, o := range e.offers {
+			if now.Sub(o.at) >= ttl {
+				delete(e.offers, k)
+				continue
+			}
+			if at.IsZero() || o.at.Before(at) {
+				oldest, at = k, o.at
+			}
+		}
+		if len(e.offers) >= maxRecentOffers {
+			delete(e.offers, oldest)
+		}
+	}
+	o := &offerEntry{at: now, done: make(chan struct{})}
+	e.offers[key] = o
+	return o, true
 }
 
 func New(cfg Config) (*Endpoint, error) {
@@ -112,9 +276,30 @@ func New(cfg Config) (*Endpoint, error) {
 	if cfg.GatherWait == 0 {
 		cfg.GatherWait = time.Second
 	}
-	node, err := driver.Listen(cfg.DHTAddr, cfg.DHT)
+	if cfg.HeadStart == 0 {
+		cfg.HeadStart = 200 * time.Millisecond
+	}
+	var node *driver.Node
+	var err error
+	if cfg.DHTAddr6 != "" {
+		node, err = driver.ListenDual(cfg.DHTAddr, cfg.DHTAddr6, cfg.DHT, cfg.DHT6)
+	} else {
+		node, err = driver.Listen(cfg.DHTAddr, cfg.DHT)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if cfg.RelayOnly {
+		// Relays only run over IPv4, and a relay-only endpoint never punches
+		// IPv6 directly, so without an IPv4 socket it can't connect at all.
+		has4 := false
+		for _, a := range node.Addrs() {
+			has4 = has4 || a.Addr().Is4()
+		}
+		if !has4 {
+			_ = node.Close()
+			return nil, errors.New("endpoint: relay-only needs an IPv4 socket")
+		}
 	}
 	e := &Endpoint{cfg: cfg, node: node, accept: make(chan *Conn, cfg.MaxInbound), slots: make(chan struct{}, cfg.MaxInbound), done: make(chan struct{})}
 	e.wg.Go(e.events)
@@ -182,51 +367,268 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	}()
 	secret := make([]byte, 32)
 	crand.Read(secret)
-	sess, r, conn, err := e.prepare(ctx, punch.Config{Initiator: true, Secret: secret})
+	// The legs share one claim, so only one family is ever nominated and
+	// both sides keep the same path.
+	legs, err := e.legs(ctx, punch.Config{Initiator: true, Secret: secret}, true, true, new(atomic.Int32))
 	if err != nil {
 		return nil, err
 	}
-	offer := sess.Offer(locals(conn))
+	offer := offerOf(legs)
 	payload, err := e.node.Signal(ctx, identity, peer, offer.Marshal())
 	if err != nil {
-		r.Abort()
-		conn.Close()
+		abortAll(legs)
 		return nil, err
 	}
 	answer, err := punch.UnmarshalOffer(payload)
 	if err != nil {
-		r.Abort()
-		conn.Close()
+		abortAll(legs)
 		return nil, err
 	}
-	return e.finish(ctx, r, conn, answer, peer, secret)
+	return e.race(ctx, legs, answer, peer, secret, e.cfg.HeadStart)
 }
 
-// prepare binds a fresh data socket and learns its public address from DHT
-// contacts, which answer pings with the BEP 42 ip field.
-func (e *Endpoint) prepare(ctx context.Context, pc punch.Config) (*punch.Session, *punch.Runner, *net.UDPConn, error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: e.cfg.DataIP})
+// leg is one address family's data socket and punch session.
+type leg struct {
+	v6    bool
+	sess  *punch.Session
+	r     *punch.Runner
+	conn  *net.UDPConn
+	id    int32         // this leg's claim token, when claim is set
+	claim *atomic.Int32 // shared by a caller's legs; nil for a responder
+}
+
+// release gives up this leg's claim, so another family can commit, unless
+// this leg already committed: the responder may have connected on it.
+func (l *leg) release() {
+	if l.claim != nil && !l.sess.Committed() {
+		l.claim.CompareAndSwap(l.id, 0)
+	}
+}
+
+func claimer(owner *atomic.Int32, id int32) func() bool {
+	return func() bool { return owner.CompareAndSwap(0, id) || owner.Load() == id }
+}
+
+func (l *leg) abort() { l.r.Abort(); l.conn.Close() }
+
+func abortAll(legs []*leg) {
+	for _, l := range legs {
+		l.abort()
+	}
+}
+
+// families reports which address families have a running DHT node.
+func (e *Endpoint) families() (v4, v6 bool) {
+	for _, a := range e.node.Addrs() {
+		if a.Addr().Is4() {
+			v4 = true
+		} else {
+			v6 = true
+		}
+	}
+	return v4, v6
+}
+
+// legs prepares a leg per family: IPv4 when we have it and wantV4 is set,
+// and IPv6 when we have it, wantV6 is set, we aren't relay-only (an IPv6
+// leg punches directly, revealing our address), and the IPv6 DHT node has
+// contacts. A caller passes claim, which its legs
+// share so that only one commits to a path. It fails only if no leg could
+// be prepared.
+func (e *Endpoint) legs(ctx context.Context, pc punch.Config, wantV4, wantV6 bool, claim *atomic.Int32) ([]*leg, error) {
+	has4, has6 := e.families()
+	type prepared struct {
+		l   *leg
+		err error
+	}
+	// The legs gather in parallel, so a second family costs no extra time
+	// before punching starts.
+	var wg sync.WaitGroup
+	out := make([]prepared, 2)
+	add := func(i int, pc punch.Config, v6 bool, id int32) {
+		if claim != nil {
+			pc.Claim = claimer(claim, id)
+		}
+		wg.Go(func() {
+			l, err := e.prepare(ctx, pc, v6)
+			if l != nil {
+				l.id, l.claim = id, claim
+			}
+			out[i] = prepared{l, err}
+		})
+	}
+	if has4 && wantV4 {
+		add(0, pc, false, 1)
+	}
+	if has6 && wantV6 && !e.cfg.RelayOnly {
+		pc6 := pc
+		pc6.Relay, pc6.Relays = netip.AddrPort{}, nil
+		add(1, pc6, true, 2)
+	}
+	wg.Wait()
+	var legs []*leg
+	var firstErr error
+	for _, p := range out {
+		switch {
+		case p.l != nil:
+			legs = append(legs, p.l)
+		case p.err != nil && firstErr == nil:
+			firstErr = p.err
+		}
+	}
+	if len(legs) == 0 {
+		if firstErr == nil {
+			firstErr = errors.New("endpoint: no address family to connect over")
+		}
+		return nil, firstErr
+	}
+	return legs, nil
+}
+
+// offerOf merges the legs' offers into one: candidates of both families,
+// the IPv4 profile and relays, and the IPv6 profile as Profile6.
+func offerOf(legs []*leg) punch.Offer {
+	var o punch.Offer
+	var cands6 []netip.AddrPort
+	for _, l := range legs {
+		lo := l.sess.Offer(locals(l.conn))
+		if o.Secret == nil {
+			o.Secret = lo.Secret
+		}
+		if l.v6 {
+			p := lo.Profile
+			o.Profile6 = &p
+			cands6 = lo.Candidates
+			continue
+		}
+		o.Candidates, o.Profile, o.Relays, o.Relay = lo.Candidates, lo.Profile, lo.Relays, lo.Relay
+	}
+	o.Candidates = append(o.Candidates, cands6...)
+	return o
+}
+
+// race punches every leg against the remote's matching family and returns
+// the first connected path, closing the others. IPv4 waits headStart when
+// an IPv6 leg is racing too.
+func (e *Endpoint) race(ctx context.Context, legs []*leg, remote punch.Offer, peer [32]byte, secret []byte, headStart time.Duration) (*Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		v6  bool
+		c   *Conn
+		err error
+	}
+	v6Racing := false
+	for _, l := range legs {
+		if l.v6 && len(remote.Family(true).Candidates) > 0 {
+			v6Racing = true
+		}
+	}
+	results := make(chan result, len(legs))
+	running := 0
+	for _, l := range legs {
+		fr := remote.Family(l.v6)
+		if len(fr.Candidates) == 0 && !fr.Relay.IsValid() && len(fr.Relays) == 0 {
+			l.abort() // the peer offered no path of this family
+			continue
+		}
+		var delay time.Duration
+		if !l.v6 && v6Racing {
+			delay = headStart
+			l.sess.DeferRelay() // a relay probe would commit the path before IPv6 has had its chance
+		}
+		running++
+		go func() {
+			if delay > 0 {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					l.abort()
+					results <- result{l.v6, nil, ctx.Err()}
+					return
+				}
+			}
+			c, err := e.finish(ctx, l.r, l.conn, fr, peer, secret)
+			if err != nil {
+				l.release() // a failed leg mustn't block the other family
+			}
+			results <- result{l.v6, c, err}
+		}()
+	}
+	if running == 0 {
+		return nil, errors.New("endpoint: no address family in common with the peer")
+	}
+	var won *Conn
+	var err4, err6 error
+	for range running {
+		r := <-results
+		switch {
+		case r.err == nil && won == nil:
+			won = r.c
+			cancel() // the other family stops and releases its sockets
+		case r.err == nil:
+			r.c.Close()
+		case r.v6:
+			err6 = r.err
+		default:
+			err4 = r.err
+		}
+	}
+	if won != nil {
+		return won, nil
+	}
+	if err4 != nil {
+		return nil, err4
+	}
+	return nil, err6
+}
+
+// prepare binds a fresh data socket for one family and learns its public
+// address from that family's DHT contacts, which answer pings with the
+// BEP 42 ip field.
+func (e *Endpoint) prepare(ctx context.Context, pc punch.Config, v6 bool) (*leg, error) {
+	network, ip := "udp4", e.cfg.DataIP
+	if v6 {
+		network, ip = "udp6", e.cfg.DataIP6
+	}
+	conn, err := net.ListenUDP(network, &net.UDPAddr{IP: ip})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	var reflections []dht.Reflection
 	var contacts []netip.AddrPort
-	if err := e.node.Inspect(ctx, func(d *dht.Node) {
+	var local netip.AddrPort
+	found := false
+	if err := e.node.InspectEach(ctx, func(addr netip.AddrPort, d *dht.Node) {
+		if addr.Addr().Is4() == v6 || found {
+			return
+		}
+		found, local = true, addr
 		reflections = d.Reflections()
 		for _, c := range d.Contacts(maxRelayCandidates) {
 			contacts = append(contacts, c.Addr)
 		}
 	}); err != nil {
 		conn.Close()
-		return nil, nil, nil, err
+		return nil, err
+	}
+	if !found {
+		conn.Close()
+		return nil, errors.New("endpoint: no DHT node for this address family")
+	}
+	if v6 && len(contacts) == 0 {
+		// A host with an IPv6 stack but no IPv6 peers (no route, or none
+		// bootstrapped) has nothing to reflect off or reach.
+		conn.Close()
+		return nil, errors.New("endpoint: no IPv6 DHT contacts")
 	}
 	reflectors := contacts[:min(3, len(contacts))]
-	if pc.Initiator {
+	if pc.Initiator && !v6 {
 		// Routers relay by default. Offer several, so a provider that only
 		// trusts routers it knows can likely find one among them.
 		pc.Relays = contacts
 	}
-	pc.Local = e.profile(reflections)
+	pc.Local = e.profile(reflections, local, v6)
 	pc.RelayOnly = e.cfg.RelayOnly
 	pc.Deadline = e.cfg.PunchDeadline
 	var seed [32]byte
@@ -237,9 +639,9 @@ func (e *Endpoint) prepare(ctx context.Context, pc punch.Config) (*punch.Session
 	if err := r.Gather(ctx, reflectors, e.cfg.GatherWait); err != nil {
 		r.Abort()
 		conn.Close()
-		return nil, nil, nil, err
+		return nil, err
 	}
-	return sess, r, conn, nil
+	return &leg{v6: v6, sess: sess, r: r, conn: conn}, nil
 }
 
 func (e *Endpoint) finish(ctx context.Context, r *punch.Runner, conn *net.UDPConn, remote punch.Offer, peer [32]byte, secret []byte) (*Conn, error) {
@@ -264,27 +666,49 @@ func (e *Endpoint) events() {
 			if !ok {
 				return
 			}
-			in, ok := ev.(dht.Incoming)
-			if !ok {
-				continue
+			if in, ok := ev.(dht.Incoming); ok {
+				e.incoming(in)
 			}
-			if e.cfg.Authorize != nil && !e.cfg.Authorize(in.Caller) {
-				continue
-			}
-			select {
-			case e.slots <- struct{}{}:
-			default:
-				continue // at capacity; the caller times out or retries
-			}
-			e.wg.Go(func() {
-				defer func() { <-e.slots }()
-				e.inbound(in)
-			})
 		}
 	}
 }
 
-func (e *Endpoint) inbound(in dht.Incoming) {
+// incoming admits one offer. Copies of an offer through the other family's
+// DHT are handled before taking a slot: they never punch, and the DHT won't
+// deliver a dropped one again. A new offer gets a slot and its own worker,
+// or is dropped at capacity.
+func (e *Endpoint) incoming(in dht.Incoming) {
+	if e.cfg.Authorize != nil && !e.cfg.Authorize(in.Caller) {
+		return
+	}
+	offer, err := punch.UnmarshalOffer(in.Payload)
+	if err != nil || len(offer.Secret) < 16 {
+		return
+	}
+	entry, first := e.firstOffer(in.Caller, offer.Secret, time.Now())
+	if !first {
+		if answer, now := entry.copyOf(in.Session); now {
+			e.wg.Go(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), e.cfg.GatherWait)
+				defer cancel()
+				_ = e.node.Answer(ctx, in.Session, answer)
+			})
+		}
+		return
+	}
+	select {
+	case e.slots <- struct{}{}:
+	default:
+		entry.publish(nil) // at capacity: no answer, so queued copies get none
+		return             // the caller times out or retries
+	}
+	e.wg.Go(func() {
+		defer func() { <-e.slots }()
+		e.inbound(in, offer, entry)
+	})
+}
+
+func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.GatherWait+e.cfg.PunchDeadline+2*time.Second)
 	defer cancel()
 	go func() {
@@ -294,18 +718,35 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 		case <-ctx.Done():
 		}
 	}()
-	offer, err := punch.UnmarshalOffer(in.Payload)
-	if err != nil || len(offer.Secret) < 16 {
-		return
-	}
+	// A dual-stack caller signals the same offer through each family's DHT;
+	// its secret identifies it. events() answered any copy that arrived
+	// first; this, the first copy, punches and charges once.
+	defer e.publishOffer(ctx, entry, nil) // any early return leaves copies unanswered
 	// A caller can list anyone's address as its candidate; bound how often
 	// we will probe a network on a stranger's word.
-	var refl []dht.Reflection
-	if err := e.node.Inspect(ctx, func(d *dht.Node) { refl = d.Reflections() }); err != nil {
+	has4, has6 := e.families()
+	want4, wantV6 := wantFamilies(offer, has4, has6, e.cfg.RelayOnly)
+	if !want4 && !wantV6 {
+		// No family in common: an empty answer lets the caller fail at once
+		// instead of waiting out signaling.
+		empty := punch.Offer{}
+		b := empty.Marshal()
+		e.publishOffer(ctx, entry, b)
+		_ = e.node.Answer(ctx, in.Session, b)
 		return
 	}
-	strategy, _, _ := punch.Plan(e.profile(refl), offer.Profile, offer.Candidates, true)
-	heavy := strategy == punch.Spray || strategy == punch.Open || strategy == punch.DoubleBirthday
+	heavy := false
+	if err := e.node.InspectEach(ctx, func(addr netip.AddrPort, d *dht.Node) {
+		v6 := !addr.Addr().Is4()
+		if v6 && !wantV6 || !v6 && !want4 {
+			return
+		}
+		fo := offer.Family(v6)
+		strategy, _, _ := punch.Plan(e.profile(d.Reflections(), addr, v6), fo.Profile, fo.Candidates, true)
+		heavy = heavy || strategy == punch.Spray || strategy == punch.Open || strategy == punch.DoubleBirthday
+	}); err != nil {
+		return
+	}
 	offered := offer.Relays
 	if len(offered) == 0 && offer.Relay.IsValid() {
 		offered = []netip.AddrPort{offer.Relay}
@@ -323,22 +764,37 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 	if e.cfg.RelayOnly && !relay.IsValid() {
 		return // no router we trust to relay through: refuse rather than leak
 	}
-	if !e.limiter.allow(in.Caller, offer.Candidates, charged, heavy, time.Now()) {
+	// Charge only what a leg we'll run can probe.
+	probed := probeable(offer.Candidates, want4, wantV6)
+	if !want4 {
+		charged = netip.AddrPort{} // relays only run over IPv4
+	}
+	if !e.limiter.allow(in.Caller, probed, charged, heavy, time.Now()) {
 		return
 	}
-	// The relay chosen here is final: the session uses exactly this one (or
-	// none).
-	sess, r, conn, err := e.prepare(ctx, punch.Config{Relay: relay})
+	// The relay chosen here is final: the IPv4 session uses exactly this
+	// one (or none).
+	legs, err := e.legs(ctx, punch.Config{Relay: relay}, want4, wantV6, nil)
 	if err != nil {
 		return
 	}
-	answer := sess.Offer(locals(conn))
-	if err := e.node.Answer(ctx, in.Session, answer.Marshal()); err != nil {
-		r.Abort()
-		conn.Close()
+	answer := offerOf(legs)
+	ab := answer.Marshal()
+	// Answer our own session first, then the queued copy. Keep the legs if
+	// either delivery worked. Until one has, the answer isn't visible to
+	// later copies, which mustn't send the caller toward legs we close.
+	if err := e.node.Answer(ctx, in.Session, ab); err == nil {
+		e.publishOffer(ctx, entry, ab)
+	} else if e.deliverQueued(ctx, entry, ab) == 0 {
+		e.publishOffer(ctx, entry, nil)
+		abortAll(legs)
 		return
+	} else {
+		e.publishOffer(ctx, entry, ab)
 	}
-	c, err := e.finish(ctx, r, conn, offer, in.Caller, offer.Secret)
+	// The IPv4 leg waits out the same head start as the caller's, so when
+	// IPv6 wins quickly a heavy IPv4 strategy is canceled before it sprays.
+	c, err := e.race(ctx, legs, offer, in.Caller, offer.Secret, e.cfg.HeadStart)
 	if err != nil {
 		return
 	}
@@ -351,11 +807,10 @@ func (e *Endpoint) inbound(in dht.Incoming) {
 
 // profile infers our NAT profile from the DHT socket's reflections: the
 // same NAT maps the data sockets.
-func (e *Endpoint) profile(refl []dht.Reflection) punch.Profile {
-	if e.cfg.Profile != nil {
+func (e *Endpoint) profile(refl []dht.Reflection, local netip.AddrPort, v6 bool) punch.Profile {
+	if e.cfg.Profile != nil && !v6 {
 		return *e.cfg.Profile
 	}
-	local := e.node.Addr()
 	var obs []natprobe.Observation
 	for _, r := range refl {
 		obs = append(obs, natprobe.Observation{Order: r.Order, Local: local, Dest: r.From, Mapped: r.Mapped})
@@ -387,7 +842,11 @@ func locals(c *net.UDPConn) []netip.AddrPort {
 	a := c.LocalAddr().(*net.UDPAddr).AddrPort()
 	ip := a.Addr()
 	if ip.IsUnspecified() {
-		probe, err := net.Dial("udp4", "192.0.2.1:9") // no packets sent
+		network, dst := "udp4", "192.0.2.1:9"
+		if !ip.Unmap().Is4() {
+			network, dst = "udp6", "[2001:db8::1]:9"
+		}
+		probe, err := net.Dial(network, dst) // no packets sent
 		if err != nil {
 			return nil
 		}

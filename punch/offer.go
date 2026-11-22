@@ -48,6 +48,9 @@ type Offer struct {
 	Secret     []byte
 	Candidates []netip.AddrPort
 	Profile    Profile
+	// Profile6, when set, is the IPv6 profile; Profile is then the IPv4
+	// one. Candidates of both families share Candidates.
+	Profile6 *Profile
 	// Relays are the initiator's relay candidates, in preference order.
 	Relays []netip.AddrPort
 	// Relay, in the responder's answer, is the relay it chose (one of Relays,
@@ -58,9 +61,41 @@ type Offer struct {
 
 const maxRelays = 8
 
-const maxCandidates = 8
+const maxCandidates = 12 // room for both families
 
 var ErrBadOffer = errors.New("punch: malformed offer")
+
+func (p Profile) bytes() []byte {
+	return []byte{byte(p.Mapping), byte(p.Allocation), byte(p.Step >> 8), byte(p.Step),
+		byte(p.BlockLo >> 8), byte(p.BlockLo), byte(p.BlockHi >> 8), byte(p.BlockHi)}
+}
+
+func parseProfile(s []byte) Profile {
+	return Profile{
+		Mapping: Mapping(s[0]), Allocation: Allocation(s[1]),
+		Step:    uint16(s[2])<<8 | uint16(s[3]),
+		BlockLo: uint16(s[4])<<8 | uint16(s[5]), BlockHi: uint16(s[6])<<8 | uint16(s[7]),
+	}
+}
+
+// Family returns the part of o that one address family's punch session
+// uses: that family's candidates and profile. Relays stay with IPv4 only.
+func (o Offer) Family(v6 bool) Offer {
+	f := Offer{Secret: o.Secret, Profile: o.Profile}
+	for _, c := range o.Candidates {
+		if c.Addr().Is4() != v6 {
+			f.Candidates = append(f.Candidates, c)
+		}
+	}
+	if v6 {
+		if o.Profile6 != nil {
+			f.Profile = *o.Profile6
+		}
+		return f
+	}
+	f.Relays, f.Relay = o.Relays, o.Relay
+	return f
+}
 
 func (o *Offer) Marshal() []byte {
 	b := []byte{'d'}
@@ -73,9 +108,11 @@ func (o *Offer) Marshal() []byte {
 	b = append(b, c...)
 	b = append(b, 'e')
 	b = bencode.AppendString(b, "p")
-	p := o.Profile
-	b = bencode.AppendBytes(b, []byte{byte(p.Mapping), byte(p.Allocation), byte(p.Step >> 8), byte(p.Step),
-		byte(p.BlockLo >> 8), byte(p.BlockLo), byte(p.BlockHi >> 8), byte(p.BlockHi)})
+	b = bencode.AppendBytes(b, o.Profile.bytes())
+	if o.Profile6 != nil {
+		b = bencode.AppendString(b, "p6")
+		b = bencode.AppendBytes(b, o.Profile6.bytes())
+	}
 	if o.Relay.IsValid() {
 		b = bencode.AppendString(b, "r")
 		b = bencode.AppendBytes(b, krpc.AppendCompactAddr(nil, o.Relay))
@@ -123,11 +160,10 @@ func UnmarshalOffer(b []byte) (Offer, error) {
 	if !ok || len(p.Str) != 8 {
 		return o, ErrBadOffer
 	}
-	s := p.Str
-	o.Profile = Profile{
-		Mapping: Mapping(s[0]), Allocation: Allocation(s[1]),
-		Step:    uint16(s[2])<<8 | uint16(s[3]),
-		BlockLo: uint16(s[4])<<8 | uint16(s[5]), BlockHi: uint16(s[6])<<8 | uint16(s[7]),
+	o.Profile = parseProfile(p.Str)
+	if p6, ok := v.Get("p6"); ok && len(p6.Str) == 8 {
+		pr := parseProfile(p6.Str)
+		o.Profile6 = &pr
 	}
 	if r, ok := v.Get("r"); ok && r.Kind == bencode.String {
 		o.Relay, _ = parseAddr(r.Str)

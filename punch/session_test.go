@@ -420,3 +420,138 @@ func TestUnmarshalOfferCanonicalAddresses(t *testing.T) {
 		t.Fatalf("a port-0 relay %v was accepted", o.Relay)
 	}
 }
+
+// Two initiator sessions sharing a claim (one per address family) punch two
+// responders in lockstep: only one responder is ever nominated, and it is
+// the path the initiator keeps.
+func TestSharedClaimCommitsOnePath(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	open := Profile{Mapping: MappingIndependent}
+	owner := 0
+	claim := func(id int) func() bool {
+		return func() bool {
+			if owner == 0 {
+				owner = id
+			}
+			return owner == id
+		}
+	}
+	type pairT struct {
+		a, b         *Session
+		addrA, addrB netip.AddrPort
+		evA, evB     Event
+	}
+	mk := func(id int, addrA, addrB string) *pairT {
+		p := &pairT{
+			a:     New(Config{Initiator: true, Secret: secret, Local: open, Claim: claim(id), Rand: rand.New(rand.NewPCG(uint64(id), 1))}),
+			b:     New(Config{Local: open, Rand: rand.New(rand.NewPCG(uint64(id), 2))}),
+			addrA: netip.MustParseAddrPort(addrA), addrB: netip.MustParseAddrPort(addrB),
+		}
+		now := time.Unix(1_800_000_000, 0)
+		p.b.Start(now, Offer{Secret: secret, Candidates: []netip.AddrPort{p.addrA}, Profile: open})
+		p.a.Start(now, Offer{Candidates: []netip.AddrPort{p.addrB}, Profile: open})
+		return p
+	}
+	pairs := []*pairT{mk(1, "198.51.100.1:40000", "203.0.113.1:40000"), mk(2, "[2001:db8::a]:40000", "[2001:db8::b]:40000")}
+	now := time.Unix(1_800_000_000, 0)
+	for range 400 {
+		now = now.Add(10 * time.Millisecond)
+		for _, p := range pairs {
+			p.a.Tick(now)
+			p.b.Tick(now)
+		}
+		for range 3 {
+			for _, p := range pairs { // both families exchange in the same instant
+				sa, ea := p.a.Drain()
+				sb, eb := p.b.Drain()
+				for _, e := range ea {
+					if _, ok := e.(Connected); ok {
+						p.evA = e
+					}
+				}
+				for _, e := range eb {
+					if _, ok := e.(Connected); ok {
+						p.evB = e
+					}
+				}
+				for _, s := range sa {
+					if s.To == p.addrB {
+						p.b.HandlePacket(now, 0, p.addrA, s.Data)
+					}
+				}
+				for _, s := range sb {
+					if s.To == p.addrA {
+						p.a.HandlePacket(now, 0, p.addrB, s.Data)
+					}
+				}
+			}
+		}
+	}
+	responders, kept := 0, -1
+	for i, p := range pairs {
+		if p.evB != nil {
+			responders++
+		}
+		if p.evA != nil {
+			kept = i
+		}
+	}
+	if responders != 1 {
+		t.Fatalf("%d responders were nominated, want exactly one", responders)
+	}
+	if kept < 0 || pairs[kept].evB == nil {
+		t.Fatalf("the initiator kept pair %d, which its responder never connected on", kept)
+	}
+}
+
+// A deferred relay session holds its probes until halfway to the deadline,
+// even when relaying is its only strategy, so a racing IPv6 session gets
+// its chance before the relay commits the responder.
+func TestDeferRelayHoldsProbes(t *testing.T) {
+	router := netip.MustParseAddrPort("2.176.0.9:6881")
+	s := New(Config{Initiator: true, Secret: []byte("0123456789abcdef0123456789abcdef"), RelayOnly: true, Relays: []netip.AddrPort{router}, Rand: rand.New(rand.NewPCG(11, 11))})
+	s.DeferRelay()
+	now := time.Unix(1_800_000_000, 0)
+	s.Start(now, Offer{Relay: router})
+	s.relayToken, s.relayBound = []byte("tokn"), true // bound at once
+	probe := relayMAC([]byte("0123456789abcdef0123456789abcdef"), "probe initiator", 4)
+	probed := false
+	for t2 := now; t2.Before(now.Add(s.cfg.Deadline/2 + 200*time.Millisecond)); t2 = t2.Add(10 * time.Millisecond) {
+		s.Tick(t2)
+		sends, _ := s.Drain()
+		for _, snd := range sends {
+			if !bytes.Equal(snd.Data, probe) {
+				continue
+			}
+			if t2.Before(now.Add(s.cfg.Deadline / 2)) {
+				t.Fatalf("relay probe sent %v after start, before half the deadline", t2.Sub(now))
+			}
+			probed = true
+		}
+	}
+	if !probed {
+		t.Fatal("a deferred relay session never probed once half the deadline passed")
+	}
+	if !s.Committed() {
+		t.Fatal("an initiator's relay probe didn't commit it: the responder connects on that probe")
+	}
+}
+
+// An initiator is committed once it nominates: before that it may give up
+// a shared claim, after it may not.
+func TestCommittedAfterNomination(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	open := Profile{Mapping: MappingIndependent}
+	a := New(Config{Initiator: true, Secret: secret, Local: open, Rand: rand.New(rand.NewPCG(13, 1))})
+	b := New(Config{Local: open, Rand: rand.New(rand.NewPCG(13, 2))})
+	now := time.Unix(1_800_000_000, 0)
+	b.Start(now, Offer{Secret: secret, Candidates: []netip.AddrPort{netip.MustParseAddrPort("198.51.100.1:40000")}, Profile: open})
+	a.Start(now, Offer{Candidates: []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:40000")}, Profile: open})
+	if a.Committed() {
+		t.Fatal("committed before any nomination")
+	}
+	runPair(t, a, b, now, func(Send) bool { return false })
+	if !a.Committed() {
+		t.Fatal("not committed after connecting through a nomination")
+	}
+}
