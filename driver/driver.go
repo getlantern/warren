@@ -45,8 +45,8 @@ type packet struct {
 // Rebind, on the loop goroutine, under Node.mu; Close and Addr read them
 // under Node.mu, the loop without it.
 type family struct {
-	network  string // "udp4" or "udp6"
-	bindAddr string // as given to Listen, for rebinding
+	network  string       // "udp4" or "udp6"
+	bindAddr *net.UDPAddr // resolved once at Listen: rebinding mustn't block the loop on DNS
 	conn     *net.UDPConn
 	addr     netip.AddrPort
 	node     *dht.Node
@@ -115,19 +115,15 @@ func ListenDual(addr4, addr6 string, cfg4, cfg6 dht.Config) (*Node, error) {
 }
 
 func bind(network, addr string, cfg dht.Config) (*family, error) {
-	conn, err := listen(network, addr)
-	if err != nil {
-		return nil, err
-	}
-	return &family{network: network, bindAddr: addr, conn: conn, addr: localAddr(conn), node: dht.New(cfg)}, nil
-}
-
-func listen(network, addr string) (*net.UDPConn, error) {
 	ua, err := net.ResolveUDPAddr(network, addr)
 	if err != nil {
 		return nil, err
 	}
-	return listenUDP(network, ua)
+	conn, err := listenUDP(network, ua)
+	if err != nil {
+		return nil, err
+	}
+	return &family{network: network, bindAddr: ua, conn: conn, addr: localAddr(conn), node: dht.New(cfg)}, nil
 }
 
 func localAddr(c *net.UDPConn) netip.AddrPort {
@@ -518,22 +514,20 @@ func (n *Node) rebind(ctx context.Context, which func(*family) bool) error {
 // rebindFamily binds a fresh socket for f, installs it, and closes the old
 // one. Runs on the loop goroutine.
 func (n *Node) rebindFamily(f *family) (*net.UDPConn, error) {
-	ua, err := net.ResolveUDPAddr(f.network, f.bindAddr)
-	if err != nil {
-		return nil, err
-	}
+	ua := *f.bindAddr // a copy: the ephemeral fallback changes its port
 	var conn *net.UDPConn
+	var err error
 	if ua.Port == 0 {
 		// An ephemeral port: bind the new socket before closing the old.
-		if conn, err = listenUDP(f.network, ua); err != nil {
+		if conn, err = listenUDP(f.network, &ua); err != nil {
 			return nil, err
 		}
 	} else {
 		// A fixed port must be released first.
 		n.swap(f, nil)
-		if conn, err = listenUDP(f.network, ua); err != nil {
+		if conn, err = listenUDP(f.network, &ua); err != nil {
 			ua.Port = 0
-			if conn, err = listenUDP(f.network, ua); err != nil {
+			if conn, err = listenUDP(f.network, &ua); err != nil {
 				return nil, err
 			}
 		}

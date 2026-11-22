@@ -410,7 +410,7 @@ func (n *Node) ListenKey(now time.Time, priv ed25519.PrivateKey, x *ecdh.Private
 // mappings on the new network. Routing contacts stay: their addresses
 // didn't change.
 func (n *Node) Rebound(now time.Time) {
-	n.reflections, n.destOrder = nil, nil
+	n.reflections, n.destOrder, n.reboundAt = nil, nil, now
 	if l := n.lst; l != nil {
 		for _, t := range l.records {
 			if o := n.owned[t]; o != nil {

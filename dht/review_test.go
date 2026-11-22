@@ -388,3 +388,22 @@ func TestReboundResignsRecords(t *testing.T) {
 		}
 	}
 }
+
+// A reply to a query sent before a rebind doesn't count as a reflection:
+// it reports the old network's mapping.
+func TestPreRebindReplyNotReflected(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(93)), Rand: rng(94)})
+	peer := addr(7)
+	n.send(t0, peer, "ping", krpc.Args{}, &txn{kind: txPing})
+	sends, _ := n.Drain()
+	var q krpc.Msg
+	if len(sends) != 1 || krpc.Unmarshal(sends[0].Data, &q) != nil {
+		t.Fatal("no ping sent")
+	}
+	n.Rebound(t0.Add(time.Second))
+	r := krpc.Msg{T: q.T, Y: krpc.Response, IP: addr(50), R: krpc.Return{ID: outsiderID(rng(95))}}
+	n.HandlePacket(t0.Add(2*time.Second), peer, krpc.AppendMarshal(nil, &r))
+	if len(n.Reflections()) != 0 {
+		t.Fatalf("a pre-rebind reply was recorded as a reflection: %v", n.Reflections())
+	}
+}

@@ -159,6 +159,9 @@ type Node struct {
 	// sibling is the node for the other address family, whose table answers
 	// queries that want that family (libtorrent's get_foreign_node).
 	sibling *Node
+	// reboundAt is when the socket was last rebound; replies to queries
+	// sent before it don't count as reflections.
+	reboundAt time.Time
 }
 
 func New(cfg Config) *Node {
@@ -568,7 +571,11 @@ func (n *Node) handleReply(now time.Time, from netip.AddrPort, m *krpc.Msg) {
 		if !m.RO {
 			n.tableFor(m.R.ID).heard(m.R.ID, from, now)
 		}
-		n.reflect(from, m.IP, now)
+		if !t.sent.Before(n.reboundAt) {
+			// A reply to a query sent before a rebind reports the old
+			// network's mapping, which would skew NAT analysis.
+			n.reflect(from, m.IP, now)
+		}
 	}
 	switch t.kind {
 	case txLookup:

@@ -507,7 +507,13 @@ func TestRebindPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n.Addr() != fixed {
-		t.Fatalf("fixed port %v became %v after rebind", fixed, n.Addr())
+		// The documented fallback when another socket took the port in the
+		// window between releasing and rebinding it; anything else is a bug.
+		if c, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(fixed)); err == nil {
+			c.Close()
+			t.Fatalf("fixed port %v became %v after rebind, though the port is free", fixed, n.Addr())
+		}
+		t.Skip("another socket took the fixed port during rebind")
 	}
 	d, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
 	if err != nil || len(d.Addrs()) != 2 {
