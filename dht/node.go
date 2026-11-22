@@ -159,6 +159,9 @@ type Node struct {
 	// sibling is the node for the other address family, whose table answers
 	// queries that want that family (libtorrent's get_foreign_node).
 	sibling *Node
+	// gen counts rebinds. Lookups record the generation they started in, so
+	// one from before a network change can't overwrite fresher state.
+	gen uint64
 }
 
 func New(cfg Config) *Node {
@@ -398,7 +401,8 @@ func (n *Node) startLookup(now time.Time, t *table, kind lookupKind, target krpc
 	}
 	n.nextOp++
 	l := &lookup{
-		op: n.nextOp, kind: kind, internal: internal, target: target, t: t,
+		gen: n.gen,
+		op:  n.nextOp, kind: kind, internal: internal, target: target, t: t,
 		deadline: now.Add(n.cfg.LookupTimeout),
 		domestic: kind == putItem && n.cfg.DomesticCopies && n.cfg.Domestic != nil,
 		ips:      map[netip.AddrPort]bool{}, pfx: map[ipPrefix]int{}, rec: rec,
@@ -836,6 +840,24 @@ func (n *Node) expire(now time.Time) {
 			n.finish(now, l)
 		}
 	}
+}
+
+// abandon settles a transaction sent from a socket that was since replaced,
+// like a timeout but without counting it against the peer: the failure is
+// ours. Its reply, if one still arrives, finds no transaction and is
+// dropped, so it can't report the old network's mapping.
+func (n *Node) abandon(now time.Time, t *txn) {
+	switch t.kind {
+	case txLookup:
+		l := t.lookup
+		if c := l.byAddr(t.to); c != nil && c.state == inflight {
+			c.state = failed
+		}
+		n.step(now, l)
+	case txPut:
+		n.putResolved(now, t.lookup, t, false)
+	}
+	// Keepalives are re-sent by Rebound; signaling ops have their own timers.
 }
 
 func (n *Node) timedOut(now time.Time, t *txn) {

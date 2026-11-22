@@ -400,6 +400,52 @@ func (n *Node) ListenKey(now time.Time, priv ed25519.PrivateKey, x *ecdh.Private
 	return nil
 }
 
+// Rebound tells the node its socket was rebound after a network change
+// (Wi-Fi to cellular, say): our address changed, so every NAT mapping and
+// every holder's binding points at the old one. It forgets the old
+// network's reflections, and when listening re-signs its records with a
+// newer seq and republishes them at once (holders move a forwarding
+// binding only on a strictly newer signed put, so a plain republish would
+// leave offers going to the dead address), then polls its holders to open
+// mappings on the new network. Routing contacts stay: their addresses
+// didn't change.
+func (n *Node) Rebound(now time.Time) {
+	n.reflections, n.destOrder = nil, nil
+	n.gen++
+	// Queries in flight went out from the old socket: abandon them, so a
+	// late reply can neither report the old mapping nor finish an old
+	// publication with tokens bound to the old address.
+	var tids []uint16
+	for tid := range n.txns {
+		tids = append(tids, tid)
+	}
+	slices.Sort(tids)
+	for _, tid := range tids {
+		if t := n.txns[tid]; t != nil {
+			delete(n.txns, tid)
+			n.abandon(now, t)
+		}
+	}
+	if l := n.lst; l != nil {
+		// Write tokens are bound to our old source IP; holders would reject
+		// answers carrying them. Keepalives and answer-token fetches get
+		// fresh ones.
+		for _, h := range l.holders {
+			h.token = nil
+		}
+		for _, s := range l.sessions {
+			s.tokens = nil
+		}
+		for _, t := range l.records {
+			if o := n.owned[t]; o != nil {
+				o.next = now // maintain re-signs due records with a fresh seq
+			}
+		}
+		l.nextKA = now
+	}
+	n.maintain(now)
+}
+
 // SignalKey is the X25519 key callers encrypt offers to, zero when not
 // listening.
 func (n *Node) SignalKey() (k [32]byte) {
@@ -504,6 +550,9 @@ func (n *Node) isRecord(target krpc.NodeID) bool {
 func (n *Node) recordStored(now time.Time, l *lookup) {
 	if n.lst == nil || !n.isRecord(l.target) {
 		return // a publication started by a listener since replaced
+	}
+	if l.gen != n.gen {
+		return // started before a network change: its holders' tokens are stale
 	}
 	if len(l.acked) == 0 {
 		// Nothing stored it, e.g. Listen before Bootstrap or every contact

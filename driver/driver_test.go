@@ -5,7 +5,10 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
+	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 
@@ -405,5 +408,198 @@ func TestPutAcknowledgementsAddUp(t *testing.T) {
 	got := sumPuts([]dht.Event{dht.PutDone{Stored: 0}, dht.PutDone{Stored: 5, Domestic: 2}})
 	if got.Stored != 5 || got.Domestic != 2 {
 		t.Fatalf("summed acknowledgements %+v, want 5 stored, 2 domestic", got)
+	}
+}
+
+// After a network change the provider rebinds onto a new address, and
+// callers still reach it: its records are re-signed and republished, so
+// holders forward offers to the new address instead of the dead one.
+func TestRebindKeepsProviderReachable(t *testing.T) {
+	nodes := network(t, 12)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	phone := func() *Node {
+		n, err := Listen("127.0.0.1:0", memberConfig(true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { n.Close() })
+		if _, err := n.Bootstrap(ctx, []netip.AddrPort{nodes[4].Addr()}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	provider, caller := phone(), phone()
+	pk := ed25519.NewKeyFromSeed([]byte("provider-seed-provider-seed-0123"))
+	if err := provider.Listen(ctx, pk); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for e := range provider.Events() {
+			if in, ok := e.(dht.Incoming); ok {
+				provider.Answer(ctx, in.Session, append([]byte("re: "), in.Payload...))
+			}
+		}
+	}()
+	waitHolders := func() {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+			var holders int
+			provider.Inspect(ctx, func(d *dht.Node) { holders = len(d.Holders()) })
+			if holders > 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("record never reached holders")
+			}
+		}
+	}
+	signal := func(msg string) error {
+		sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
+		defer scancel()
+		got, err := caller.Signal(sctx, ed25519.NewKeyFromSeed(make([]byte, 32)), [32]byte(pk.Public().(ed25519.PublicKey)), []byte(msg))
+		if err == nil && string(got) != "re: "+msg {
+			return fmt.Errorf("got %q", got)
+		}
+		return err
+	}
+	waitHolders()
+	if err := signal("before"); err != nil {
+		t.Fatalf("before rebind: %v", err)
+	}
+	before := provider.Addr()
+	if err := provider.Rebind(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after := provider.Addr(); after == before {
+		t.Fatalf("rebind kept address %v", after)
+	}
+	if err := signal("after"); err != nil {
+		t.Fatalf("after rebind, the provider was unreachable: %v", err)
+	}
+}
+
+// A fixed port is reused on rebind; a dual-stack node rebinds both families.
+func TestRebindPorts(t *testing.T) {
+	var n *Node
+	var fixed netip.AddrPort
+	for range 10 { // another socket may take the probed port first
+		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixed = probe.LocalAddr().(*net.UDPAddr).AddrPort()
+		probe.Close()
+		if n, err = Listen(fixed.String(), memberConfig(false)); err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatal(err)
+		}
+	}
+	if n == nil {
+		t.Skip("couldn't hold a fixed port")
+	}
+	defer n.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := n.Rebind(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n.Addr() != fixed {
+		// The documented fallback when another socket took the port in the
+		// window between releasing and rebinding it; anything else is a bug.
+		if c, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(fixed)); err == nil {
+			c.Close()
+			t.Fatalf("fixed port %v became %v after rebind, though the port is free", fixed, n.Addr())
+		}
+		t.Skip("another socket took the fixed port during rebind")
+	}
+	d, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil {
+		t.Skip("no loopback to bind:", err)
+	}
+	defer d.Close() // before any skip: a single-family node is still running
+	if len(d.Addrs()) != 2 {
+		t.Skip("no dual-stack loopback")
+	}
+	before := d.Addrs()
+	if err := d.Rebind(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after := d.Addrs()
+	for i := range before {
+		if before[i] == after[i] {
+			t.Fatalf("family %d kept address %v across rebind", i, after[i])
+		}
+	}
+}
+
+// Rebinding right after Listen, before the first reader has run, mustn't
+// hand a reader the replaced (or nil) socket.
+func TestRebindRightAfterListen(t *testing.T) {
+	for range 50 {
+		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixed := probe.LocalAddr().String()
+		probe.Close()
+		n, err := Listen(fixed, memberConfig(false))
+		if err != nil {
+			continue // the port was taken meanwhile
+		}
+		if err := n.Rebind(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		n.Close()
+	}
+}
+
+// A family whose rebind fails is stale until RebindStale binds it, and a
+// rebind after Close installs nothing.
+func TestStaleRebindRetried(t *testing.T) {
+	n, err := Listen("127.0.0.1:0", memberConfig(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	listenUDP = func(string, *net.UDPAddr) (*net.UDPConn, error) { return nil, errors.New("no network yet") }
+	err = n.Rebind(ctx)
+	listenUDP = net.ListenUDP
+	if err == nil {
+		t.Fatal("a failed bind reported success")
+	}
+	if stale, _ := n.Stale(ctx); !stale {
+		t.Fatal("the family whose rebind failed isn't marked stale")
+	}
+	socketless := make(chan bool, 1)
+	n.do(ctx, func(time.Time) { socketless <- n.fams[0].conn == nil })
+	if !<-socketless {
+		t.Fatal("a failed rebind left the old network's socket in use")
+	}
+	before := n.Addr()
+	if err := n.RebindStale(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if stale, _ := n.Stale(ctx); stale || n.Addr() == before {
+		t.Fatalf("RebindStale didn't repair the family (stale=%v, addr %v)", stale, n.Addr())
+	}
+	n.Close()
+	if err := n.Rebind(ctx); err == nil {
+		t.Fatal("rebind after Close succeeded")
+	}
+}
+
+// A packet from a socket that Rebind replaced is dropped: it belongs to the
+// old network.
+func TestPacketsFromReplacedSocketDropped(t *testing.T) {
+	old, cur := &net.UDPConn{}, &net.UDPConn{}
+	n := &Node{fams: []*family{{conn: cur}}}
+	if n.current(packet{fam: 0, conn: old}) {
+		t.Fatal("a packet from the replaced socket was accepted")
+	}
+	if !n.current(packet{fam: 0, conn: cur}) {
+		t.Fatal("a packet from the present socket was dropped")
 	}
 }

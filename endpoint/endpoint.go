@@ -113,6 +113,10 @@ type Endpoint struct {
 	mu      sync.Mutex
 	closed  bool // guards wg.Add for outbound Connects against Close's Wait
 
+	// routes reports the local addresses the default routes use; tests
+	// replace it. WatchNetwork rebinds when they change.
+	routes func() [2]netip.Addr
+
 	offersMu sync.Mutex
 	offers   map[[32]byte]*offerEntry // recent offers, by caller and secret
 	dupes    atomic.Int64             // repeat copies seen, for tests
@@ -325,6 +329,68 @@ func (e *Endpoint) Close() error {
 			return err
 		}
 	}
+}
+
+// Rebind tells the endpoint the network changed (Wi-Fi to cellular, a new
+// address). The DHT sockets are replaced and, when listening, our records
+// are republished so callers reach the new address. Connections punched
+// before the change are bound to the old network and stop working:
+// reconnect with Connect.
+func (e *Endpoint) Rebind(ctx context.Context) error { return e.node.Rebind(ctx) }
+
+// WatchNetwork rebinds whenever the local address of the default IPv4 or
+// IPv6 route changes, checking every interval (5 seconds if zero), until
+// ctx ends, and retries any family whose rebind failed on each check until
+// it binds. Checking sends no packets. Apps whose platform reports network
+// changes (iOS NWPathMonitor, Android ConnectivityManager) should call
+// Rebind from those instead, which is faster and costs nothing between
+// changes.
+func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
+	if interval == 0 {
+		interval = 5 * time.Second
+	}
+	probe := e.routes
+	if probe == nil {
+		probe = defaultRoutes
+	}
+	last := probe()
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-e.done:
+			return
+		case <-tick.C:
+		}
+		if cur := probe(); cur != last {
+			last = cur
+			_ = e.Rebind(ctx) // a family that fails is retried below
+		} else if stale, _ := e.node.Stale(ctx); stale {
+			_ = e.node.RebindStale(ctx)
+		}
+	}
+}
+
+// defaultRoutes returns the local address the kernel would use for each
+// family's default route, or the zero address when there is none. Dialing
+// UDP only picks a route; no packet is sent.
+func defaultRoutes() [2]netip.Addr {
+	var out [2]netip.Addr
+	for i, dst := range []string{"192.0.2.1:9", "[2001:db8::1]:9"} {
+		network := "udp4"
+		if i == 1 {
+			network = "udp6"
+		}
+		c, err := net.Dial(network, dst)
+		if err != nil {
+			continue
+		}
+		out[i] = c.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Unmap()
+		c.Close()
+	}
+	return out
 }
 
 // Listen makes this endpoint reachable under priv's key; accept connections

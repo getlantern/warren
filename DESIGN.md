@@ -614,6 +614,43 @@ once across families) and two sessions sharing a claim in lockstep. Gaps: `Snaps
 node, so a restart rejoins the IPv6 DHT by bootstrapping; relays don't
 carry IPv6 yet; and the NAT simulation models IPv4 only.
 
+## Network changes (`Rebind`, built)
+
+A phone moves between Wi-Fi and cellular, or gets a new address, many times
+a day. Its DHT sockets, every NAT mapping, and every record holder's
+forwarding binding then point at an address that no longer exists, so
+callers can't reach it.
+
+- **`driver.Node.Rebind`** replaces each family's socket on the loop
+  goroutine and keeps everything else: routing tables (contacts' addresses
+  didn't change), stored items, records and tokens. An ephemeral port gets a
+  new one; a fixed port is reused when it can be, else falls back to
+  ephemeral.
+- **`dht.Node.Rebound`** then forgets the old network's reflections, abandons
+  queries in flight from the old socket (without counting them against the
+  peers), so a late reply can't restore an old mapping or finish an old
+  publication, drops write tokens bound to the old address, and when
+  listening marks its records due, so they are re-signed with a newer seq
+  and republished at once, and polls its holders. Holders move a forwarding
+  binding only on a strictly newer signed put, so republishing the old seq
+  would leave offers going to the dead address.
+- **`endpoint.Endpoint.Rebind`** exposes it. Apps call it from the platform's
+  change notification (iOS `NWPathMonitor`, Android `ConnectivityManager`).
+  `WatchNetwork` is a fallback that checks the default routes' local
+  addresses every few seconds without sending a packet.
+
+Connections punched before the change are bound to the old network and
+stop working; the app reconnects with `Connect`. Carrying a hysteria2
+session across the change with QUIC connection migration is a follow-up.
+Full (non-read-only) nodes keep their node ID across the change, though
+BEP 42 derives it from the external address; phones are read-only, so this
+only matters for routers that move, which are rare.
+
+Tests cover a provider signaled before and after a rebind onto a new port
+(without the republish it is unreachable), a fixed port reused, both
+families rebinding, a fresh `Connect` after the provider rebinds, and
+`WatchNetwork` rebinding on a route change and not otherwise.
+
 ## Phase 0: measure first (`natprobe/`, built)
 
 `natprobe` uses **public Mainline nodes as reflectors**: BEP 42 responses carry the
@@ -670,4 +707,4 @@ and carrier allocator. The design therefore splits measurement in two:
 | 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
 | 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
-| 6 | iOS integration, memory budget, network-change rebind | |
+| 6 | iOS integration, memory budget, network-change rebind | Rebind built (see *Network changes*). Next: QUIC connection migration for live sessions, and iOS integration and memory budget |
