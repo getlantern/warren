@@ -27,6 +27,8 @@ const (
 	eventsSize  = 32
 	maxPacket   = 2048
 	maxSessions = 1024 // incoming signaling sessions remembered for Answer
+	// writeTimeout bounds how long the loop waits on a full send buffer.
+	writeTimeout = 200 * time.Millisecond
 )
 
 var ErrClosed = errors.New("driver: closed")
@@ -266,8 +268,12 @@ func (n *Node) current(p packet) bool { return p.conn == n.fams[p.fam].conn }
 // flush sends one family's datagrams and routes its events.
 func (n *Node) flush(fam int, f *family) {
 	sends, events := f.node.Drain()
-	for _, s := range sends {
-		if f.conn != nil { // nil only if a rebind couldn't bind this family
+	if f.conn != nil && len(sends) > 0 { // nil only if a rebind couldn't bind this family
+		// A full send buffer must not stall the loop (and with it Rebind,
+		// timers and inbound packets): a datagram that can't go out in time
+		// is dropped, as the network might have dropped it.
+		_ = f.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		for _, s := range sends {
 			f.conn.WriteToUDPAddrPort(s.Data, s.To)
 		}
 	}
