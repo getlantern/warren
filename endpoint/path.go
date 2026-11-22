@@ -1,0 +1,206 @@
+package endpoint
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"errors"
+	"net"
+	"net/netip"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/getlantern/warren/utpshape"
+)
+
+// path is a Conn's view of the network: one socket and the peer's real
+// address on it, both of which Migrate can replace. Everything above (the
+// application, hysteria2, QUIC) sees a fixed peer address, the Conn's
+// Remote, so a session survives moving onto a new punched path without
+// knowing it moved.
+type path struct {
+	mu            sync.Mutex
+	sock          *net.UDPConn
+	real          netip.AddrPort // the peer's address on sock
+	gen           int            // bumped on every swap
+	closed        bool
+	df            bool
+	readDeadline  time.Time
+	writeDeadline time.Time
+}
+
+func newPath(sock *net.UDPConn, real netip.AddrPort) *path {
+	return &path{sock: sock, real: real, df: utpshape.SetDontFragment(sock)}
+}
+
+// swap moves the path onto sock, closing the old socket. A read blocked on
+// the old socket wakes and continues on the new one.
+func (p *path) swap(sock *net.UDPConn, real netip.AddrPort) bool {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return false
+	}
+	old := p.sock
+	p.sock, p.real = sock, real
+	p.gen++
+	p.df = utpshape.SetDontFragment(sock)
+	_ = sock.SetReadDeadline(p.readDeadline)
+	_ = sock.SetWriteDeadline(p.writeDeadline)
+	p.mu.Unlock()
+	old.Close()
+	return true
+}
+
+func (p *path) current() (*net.UDPConn, netip.AddrPort, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sock, p.real, p.gen
+}
+
+// read returns the next datagram from the peer's real address, skipping
+// strangers, and follows the path across swaps.
+func (p *path) read(b []byte) (int, error) {
+	for {
+		sock, real, gen := p.current()
+		n, from, err := sock.ReadFromUDPAddrPort(b)
+		if err != nil {
+			p.mu.Lock()
+			swapped, closed := p.gen != gen, p.closed
+			p.mu.Unlock()
+			if swapped && !closed {
+				continue // the socket was replaced under us
+			}
+			return 0, err
+		}
+		if netip.AddrPortFrom(from.Addr().Unmap(), from.Port()) != real {
+			continue
+		}
+		return n, nil
+	}
+}
+
+func (p *path) write(b []byte) (int, error) {
+	sock, real, _ := p.current()
+	return sock.WriteToUDPAddrPort(b, real)
+}
+
+func (p *path) close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	sock := p.sock
+	p.mu.Unlock()
+	return sock.Close()
+}
+
+// resumeID names a session to its two ends, derived from the secret only
+// they hold, so a resume offer can find the session to move.
+func resumeID(secret []byte) [16]byte {
+	m := hmac.New(sha256.New, secret)
+	m.Write([]byte("warren/endpoint/v1 resume"))
+	return [16]byte(m.Sum(nil))
+}
+
+var (
+	ErrNotCaller  = errors.New("endpoint: only the caller can migrate a connection")
+	errWrongPeer  = errors.New("endpoint: datagram for an address other than the peer")
+	errMigrating  = errors.New("endpoint: a migration is already running")
+	errConnClosed = errors.New("endpoint: connection closed")
+)
+
+// The Conn methods below make it a net.PacketConn whose only peer is
+// Remote, so it can carry hysteria2 or any datagram protocol.
+
+// ReadFrom reads the next datagram from the peer, which is always reported
+// as Remote whatever path it came over.
+func (c *Conn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, err := c.p.read(b)
+	if err != nil {
+		return 0, nil, err
+	}
+	return n, net.UDPAddrFromAddrPort(c.Remote), nil
+}
+
+// WriteTo sends b to the peer; addr must be Remote.
+func (c *Conn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if ua, ok := addr.(*net.UDPAddr); !ok || netip.AddrPortFrom(ua.AddrPort().Addr().Unmap(), ua.AddrPort().Port()) != c.Remote {
+		return 0, errWrongPeer
+	}
+	return c.p.write(b)
+}
+
+// Send writes b to the peer.
+func (c *Conn) Send(b []byte) error {
+	_, err := c.p.write(b)
+	return err
+}
+
+// Recv reads the next datagram from the peer, skipping leftover
+// hole-punching control traffic (KRPC, first byte 'd').
+func (c *Conn) Recv(b []byte) (int, error) {
+	for {
+		n, err := c.p.read(b)
+		if err != nil {
+			return 0, err
+		}
+		if n > 0 && b[0] == 'd' {
+			continue
+		}
+		return n, nil
+	}
+}
+
+// Close closes the connection and its current socket.
+func (c *Conn) Close() error {
+	if c.e != nil {
+		c.e.forget(c)
+	}
+	return c.p.close()
+}
+
+// LocalAddr is the current socket's address; it changes when the
+// connection migrates.
+func (c *Conn) LocalAddr() net.Addr {
+	sock, _, _ := c.p.current()
+	return sock.LocalAddr()
+}
+
+// DontFragment reports whether the current socket drops oversized datagrams
+// rather than fragmenting them (see utpshape); layers above use it to allow
+// path MTU discovery.
+func (c *Conn) DontFragment() bool {
+	c.p.mu.Lock()
+	defer c.p.mu.Unlock()
+	return c.p.df
+}
+
+func (c *Conn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.p.mu.Lock()
+	defer c.p.mu.Unlock()
+	if c.p.closed {
+		return os.ErrClosed
+	}
+	c.p.readDeadline = t
+	return c.p.sock.SetReadDeadline(t)
+}
+
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.p.mu.Lock()
+	defer c.p.mu.Unlock()
+	if c.p.closed {
+		return os.ErrClosed
+	}
+	c.p.writeDeadline = t
+	return c.p.sock.SetWriteDeadline(t)
+}

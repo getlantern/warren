@@ -371,6 +371,9 @@ func FromSecret(secret []byte, obfs Obfs) Options {
 
 // dontFragment sets Don't Fragment on the raw socket when pc is one.
 func dontFragment(pc net.PacketConn) bool {
+	if d, ok := pc.(DontFragmenter); ok {
+		return d.DontFragment() // a socket that manages its own, like a migratable connection
+	}
 	uc, ok := pc.(*net.UDPConn)
 	return ok && utpshape.SetDontFragment(uc)
 }

@@ -57,7 +57,13 @@ type Offer struct {
 	// or a router of its own when it keeps its address private); both sides
 	// bind to it.
 	Relay netip.AddrPort
+	// Resume, when set, asks the responder to move an existing session onto
+	// the path this offer punches, instead of starting a new one. It is
+	// opaque here; the endpoint derives it from the session's secret.
+	Resume []byte
 }
+
+const maxResume = 32
 
 const maxRelays = 8
 
@@ -129,6 +135,10 @@ func (o *Offer) Marshal() []byte {
 		b = bencode.AppendString(b, "s")
 		b = bencode.AppendBytes(b, o.Secret)
 	}
+	if len(o.Resume) > 0 {
+		b = bencode.AppendString(b, "u")
+		b = bencode.AppendBytes(b, o.Resume[:min(len(o.Resume), maxResume)])
+	}
 	return append(b, 'e')
 }
 
@@ -177,6 +187,9 @@ func UnmarshalOffer(b []byte) (Offer, error) {
 	}
 	if sec, ok := v.Get("s"); ok && sec.Kind == bencode.String {
 		o.Secret = append([]byte(nil), sec.Str...)
+	}
+	if u, ok := v.Get("u"); ok && u.Kind == bencode.String && len(u.Str) <= maxResume {
+		o.Resume = append([]byte(nil), u.Str...)
 	}
 	return o, nil
 }
