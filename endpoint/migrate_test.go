@@ -422,3 +422,36 @@ func TestWatcherServesOutstandingRebind(t *testing.T) {
 		}
 	}
 }
+
+// A send that fails mid-handover (network unreachable, no route yet) is
+// packet loss to QUIC, not an error that would end the session; a closed
+// path still reports its error.
+func TestHandoverSendErrorsAreLoss(t *testing.T) {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An IPv6 destination from an IPv4 socket fails like an unreachable
+	// network would.
+	p := newPath(c, netip.MustParseAddrPort("[2001:db8::1]:9"))
+	if n, err := p.write([]byte("x")); err != nil || n != 1 {
+		t.Fatalf("a send error mid-handover reached the protocol: %d, %v", n, err)
+	}
+	p.close()
+	if _, err := p.write([]byte("x")); err == nil {
+		t.Fatal("a write on a closed path reported success")
+	}
+}
+
+// A rebind canceled before its DHT rebind ran stays outstanding, so the
+// watcher reruns it.
+func TestCanceledRebindStaysOutstanding(t *testing.T) {
+	e := &Endpoint{rebindDHT: func(ctx context.Context) error { return context.Canceled }}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.rebindDHT = func(context.Context) error { return ctx.Err() }
+	_ = e.Rebind(context.Background())
+	if e.rebindDone.Load() >= e.rebindReqs.Load() {
+		t.Fatal("a rebind canceled before its DHT rebind was acknowledged")
+	}
+}

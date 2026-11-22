@@ -415,12 +415,16 @@ func (e *Endpoint) Rebind(ctx context.Context) error {
 	}
 	defer e.unlockRebind()
 	serving := e.rebindReqs.Load()
-	defer e.rebindDone.Store(serving)
 	// Migrate even if a family failed to rebind: the others may carry the
 	// new paths. Whatever fails is retried by WatchNetwork.
 	dhtErr := rebind(ctx)
 	migErr := e.migrateAll(ctx, false)
 	e.migratePending.Store(dhtErr != nil || migErr != nil)
+	if !errors.Is(dhtErr, context.Canceled) && !errors.Is(dhtErr, context.DeadlineExceeded) {
+		// Served, unless canceled before the DHT rebind ran: then nothing was
+		// rebound or marked stale, and the watcher must rerun it in full.
+		e.rebindDone.Store(serving)
+	}
 	return errors.Join(dhtErr, migErr)
 }
 

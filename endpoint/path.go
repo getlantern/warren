@@ -96,15 +96,23 @@ func (p *path) write(b []byte) (int, error) {
 			p.testHookWrite()
 		}
 		n, err := sock.WriteToUDPAddrPort(b, real)
-		if err != nil {
-			p.mu.Lock()
-			swapped, closed := p.gen != gen, p.closed
-			p.mu.Unlock()
-			if swapped && !closed {
-				continue
-			}
+		if err == nil {
+			return n, nil
 		}
-		return n, err
+		p.mu.Lock()
+		swapped, closed := p.gen != gen, p.closed
+		p.mu.Unlock()
+		switch {
+		case swapped && !closed:
+			continue
+		case closed, errors.Is(err, os.ErrDeadlineExceeded):
+			return n, err
+		}
+		// Anything else (network unreachable mid-handover, no route yet) is
+		// packet loss to the protocol above: QUIC treats a send error as
+		// fatal, and the session must outlive the moment before a migration
+		// installs a working path.
+		return len(b), nil
 	}
 }
 
