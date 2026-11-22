@@ -470,8 +470,9 @@ func (e *Endpoint) anyUnmoved() bool {
 }
 
 // migrateAll moves outbound connections onto fresh paths: every one, or
-// with onlyUnmoved just those whose last attempt failed, so a retry leaves
-// connections that already moved alone.
+// with onlyUnmoved just those whose last attempt failed, as retries, so a
+// connection that already moved, or moves while the retry waits, is left
+// alone.
 func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 	e.connsMu.Lock()
 	var out []*Conn
@@ -485,7 +486,7 @@ func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 	var wg sync.WaitGroup
 	for i, c := range out {
 		wg.Go(func() {
-			if err := c.Migrate(ctx); err != nil {
+			if err := c.migrate(ctx, onlyUnmoved); err != nil {
 				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.PeerKey[:4], err)
 			}
 		})
@@ -699,10 +700,19 @@ func (e *Endpoint) resumable(id [16]byte, caller [32]byte) *Conn {
 // the Conn (hysteria2, QUIC) carry on; datagrams in flight during the move
 // are lost, as on any network change.
 func (c *Conn) Migrate(ctx context.Context) error {
+	return c.migrate(ctx, false)
+}
+
+// migrate runs a migration. A retry adds no request of its own: it serves
+// the outstanding ones, and does nothing if a migration that held the slot
+// before it already served them, so it never replaces a working path.
+func (c *Conn) migrate(ctx context.Context, retry bool) error {
 	if !c.outbound {
 		return ErrNotCaller
 	}
-	c.moveReqs.Add(1) // counted even if we give up or fail: retries rerun it
+	if !retry {
+		c.moveReqs.Add(1) // counted even if we give up or fail: retries rerun it
+	}
 	c.slotOnce.Do(func() { c.migrateSlot = make(chan struct{}, 1) })
 	select {
 	case c.migrateSlot <- struct{}{}:
@@ -710,6 +720,9 @@ func (c *Conn) Migrate(ctx context.Context) error {
 		return ctx.Err()
 	}
 	defer func() { <-c.migrateSlot }()
+	if retry && !c.unmoved() {
+		return nil
+	}
 	serving := c.moveReqs.Load()
 	e := c.e
 	e.mu.Lock()

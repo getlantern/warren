@@ -587,3 +587,47 @@ func TestWatcherRetriesCanceledExplicitMigrate(t *testing.T) {
 		t.Fatal("the retry didn't move the connection")
 	}
 }
+
+// A watcher retry that queues behind an in-flight migration doesn't add a
+// request of its own, and once that migration succeeds it leaves the new
+// path alone instead of punching and swapping another.
+func TestRetryDoesntDuplicateInFlightMigration(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("dup-provider")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() {
+		c, _ := provider.Accept(ctx)
+		if c != nil {
+			defer c.Close()
+			<-ctx.Done()
+		}
+	}()
+	out, err := caller.Connect(ctx, key("dup-caller"), pub(pk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	// An explicit Migrate in flight: its request is counted and it holds
+	// the slot.
+	out.slotOnce.Do(func() { out.migrateSlot = make(chan struct{}, 1) })
+	out.migrateSlot <- struct{}{}
+	out.moveReqs.Add(1)
+	before := out.LocalAddr().String()
+	retried := make(chan error, 1)
+	go func() { retried <- caller.migrateAll(ctx, true) }()
+	time.Sleep(200 * time.Millisecond) // the retry is now waiting for the slot
+	if got := out.moveReqs.Load(); got != 1 {
+		t.Fatalf("the retry added a request: moveReqs=%d", got)
+	}
+	out.moveDone.Store(out.moveReqs.Load()) // the in-flight migration succeeds
+	<-out.migrateSlot
+	if err := <-retried; err != nil {
+		t.Fatal(err)
+	}
+	if out.LocalAddr().String() != before || out.migrations != 0 {
+		t.Fatal("the retry migrated a connection the in-flight migration had already moved")
+	}
+}
