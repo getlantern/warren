@@ -342,11 +342,11 @@ func TestRetryLeavesMovedConnectionsAlone(t *testing.T) {
 	}
 	// One a failed rebind left unmoved, then recovered by an explicit
 	// Migrate, is left alone by retries too.
-	out.unmoved.Store(true)
+	out.moveReqs.Add(1) // a request a failed rebind left outstanding
 	if err := out.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if out.unmoved.Load() {
+	if out.unmoved() {
 		t.Fatal("a successful Migrate left the connection marked unmoved")
 	}
 }
@@ -382,7 +382,7 @@ func TestConcurrentRebindsSerialize(t *testing.T) {
 			t.Fatalf("overlapping rebinds collided: %v", err)
 		}
 	}
-	if caller.migratePending.Load() || out.unmoved.Load() {
+	if caller.migratePending.Load() || out.unmoved() {
 		t.Fatal("overlapping rebinds left the connection marked unmoved")
 	}
 }
@@ -496,7 +496,21 @@ func TestNewerMigrationWaitsForOlder(t *testing.T) {
 			t.Fatalf("a concurrent migration was refused or failed: %v", err)
 		}
 	}
-	if out.unmoved.Load() || out.migrations != 2 {
-		t.Fatalf("after two migrations: unmoved=%v, migrations=%d", out.unmoved.Load(), out.migrations)
+	if out.unmoved() || out.migrations != 2 {
+		t.Fatalf("after two migrations: unmoved=%v, migrations=%d", out.unmoved(), out.migrations)
+	}
+}
+
+// A newer migration request that gave up waiting behind an older one stays
+// outstanding when the older one then succeeds, so retries still move the
+// connection.
+func TestOlderMigrationCantSettleNewerRequest(t *testing.T) {
+	c := &Conn{outbound: true}
+	c.moveReqs.Add(1)            // the older migration's request
+	serving := c.moveReqs.Load() // what it saw when it took the slot
+	c.moveReqs.Add(1)            // a newer request, which gave up waiting
+	c.moveDone.Store(serving)    // the older migration succeeds
+	if !c.unmoved() {
+		t.Fatal("an older migration's success settled a newer request")
 	}
 }

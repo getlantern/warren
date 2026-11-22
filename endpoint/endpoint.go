@@ -98,8 +98,14 @@ type Conn struct {
 	// up on ctx).
 	migrateSlot chan struct{}
 	slotOnce    sync.Once
-	migrations  uint64      // outbound: the last migration's sequence number
-	unmoved     atomic.Bool // outbound: the last migration attempt failed
+	migrations  uint64 // outbound: the last migration's sequence number
+	// moveReqs counts migration requests, including ones that gave up
+	// waiting or failed; moveDone is the count the last successful one
+	// served (what it saw when it took the slot). An older success can't
+	// settle a newer request, and retries pick connections with requests
+	// outstanding.
+	moveReqs atomic.Uint64
+	moveDone atomic.Uint64
 
 	resumesMu sync.Mutex
 	resumes   []time.Time // inbound: recent resumes, for their budget
@@ -111,6 +117,10 @@ type Conn struct {
 // sessions to one provider after a network change must not strand some.
 // Only the caller holding a session's secret can resume it.
 const maxResumesPerMinute = 6
+
+// unmoved reports whether a migration request is outstanding: one that
+// failed, gave up waiting, or arrived after the last success started.
+func (c *Conn) unmoved() bool { return c.moveDone.Load() < c.moveReqs.Load() }
 
 func (c *Conn) allowResume(now time.Time) bool {
 	c.resumesMu.Lock()
@@ -453,7 +463,7 @@ func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 	e.connsMu.Lock()
 	var out []*Conn
 	for _, c := range e.outConns {
-		if !onlyUnmoved || c.unmoved.Load() {
+		if !onlyUnmoved || c.unmoved() {
 			out = append(out, c)
 		}
 	}
@@ -462,9 +472,7 @@ func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 	var wg sync.WaitGroup
 	for i, c := range out {
 		wg.Go(func() {
-			err := c.Migrate(ctx)
-			c.unmoved.Store(err != nil)
-			if err != nil {
+			if err := c.Migrate(ctx); err != nil {
 				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.PeerKey[:4], err)
 			}
 		})
@@ -676,14 +684,15 @@ func (c *Conn) Migrate(ctx context.Context) error {
 	if !c.outbound {
 		return ErrNotCaller
 	}
+	c.moveReqs.Add(1) // counted even if we give up or fail: retries rerun it
 	c.slotOnce.Do(func() { c.migrateSlot = make(chan struct{}, 1) })
 	select {
 	case c.migrateSlot <- struct{}{}:
 	case <-ctx.Done():
-		c.unmoved.Store(true) // gave up behind an older migration: retry later
 		return ctx.Err()
 	}
 	defer func() { <-c.migrateSlot }()
+	serving := c.moveReqs.Load()
 	e := c.e
 	e.mu.Lock()
 	if e.closed {
@@ -730,7 +739,7 @@ func (c *Conn) Migrate(ctx context.Context) error {
 		pd.sock.Close()
 		return errConnClosed
 	}
-	c.unmoved.Store(false) // moved, however it was asked: retries leave it alone
+	c.moveDone.Store(serving) // every request up to this one is served, however asked
 	return nil
 }
 
