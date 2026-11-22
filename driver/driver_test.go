@@ -516,10 +516,13 @@ func TestRebindPorts(t *testing.T) {
 		t.Skip("another socket took the fixed port during rebind")
 	}
 	d, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
-	if err != nil || len(d.Addrs()) != 2 {
+	if err != nil {
+		t.Skip("no loopback to bind:", err)
+	}
+	defer d.Close() // before any skip: a single-family node is still running
+	if len(d.Addrs()) != 2 {
 		t.Skip("no dual-stack loopback")
 	}
-	defer d.Close()
 	before := d.Addrs()
 	if err := d.Rebind(ctx); err != nil {
 		t.Fatal(err)
