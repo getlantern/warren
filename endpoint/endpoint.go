@@ -167,6 +167,12 @@ type Endpoint struct {
 	// connections to the earlier network.
 	rebinding  chan struct{}
 	rebindOnce sync.Once
+	// rebindReqs counts Rebind calls, including ones that gave up waiting;
+	// rebindDone is the count a finished cycle has served (what it saw when
+	// it started). A newer request is never acknowledged by an older cycle,
+	// and WatchNetwork reruns a full rebind while any is outstanding.
+	rebindReqs atomic.Uint64
+	rebindDone atomic.Uint64
 
 	connsMu sync.Mutex
 	// Live connections by peer key and resume ID, inbound and outbound
@@ -403,11 +409,13 @@ func (e *Endpoint) Rebind(ctx context.Context) error {
 	if rebind == nil {
 		rebind = e.node.Rebind
 	}
+	e.rebindReqs.Add(1) // counted even if we give up waiting: the watcher reruns it
 	if err := e.lockRebind(ctx); err != nil {
-		e.migratePending.Store(true) // gave up waiting: the watcher retries
 		return err
 	}
 	defer e.unlockRebind()
+	serving := e.rebindReqs.Load()
+	defer e.rebindDone.Store(serving)
 	// Migrate even if a family failed to rebind: the others may carry the
 	// new paths. Whatever fails is retried by WatchNetwork.
 	dhtErr := rebind(ctx)
@@ -485,6 +493,8 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 		if cur := probe(); cur != last {
 			last = cur
 			_ = e.Rebind(ctx) // whatever fails is retried below
+		} else if e.rebindDone.Load() < e.rebindReqs.Load() {
+			_ = e.Rebind(ctx) // a requested rebind never completed
 		} else if e.migratePending.Load() {
 			if e.lockRebind(ctx) != nil {
 				return

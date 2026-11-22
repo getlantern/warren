@@ -395,7 +395,30 @@ func TestQueuedRebindCancels(t *testing.T) {
 	if took := time.Since(start); took > time.Second {
 		t.Fatalf("a canceled queued rebind waited %v", took)
 	}
-	if !e.migratePending.Load() {
-		t.Fatal("a canceled rebind didn't leave its work pending")
+	if e.rebindDone.Load() >= e.rebindReqs.Load() {
+		t.Fatal("a canceled rebind didn't leave its request outstanding")
+	}
+}
+
+// A request outstanding because its caller gave up is served by the
+// watcher's next check, with no route change needed.
+func TestWatcherServesOutstandingRebind(t *testing.T) {
+	seed := network(t, 4)
+	e := phone(t, seed)
+	e.routes = func() [2]netip.Addr { return [2]netip.Addr{netip.MustParseAddr("192.168.1.5")} }
+	e.rebindReqs.Add(1) // a Rebind that gave up waiting
+	before := e.DHT().Addr()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.WatchNetwork(ctx, 10*time.Millisecond)
+	for deadline := time.Now().Add(3 * time.Second); e.DHT().Addr() == before; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the watcher never served the outstanding rebind")
+		}
+	}
+	for deadline := time.Now().Add(3 * time.Second); e.rebindDone.Load() < e.rebindReqs.Load(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the request stayed outstanding after the watcher's rebind")
+		}
 	}
 }
