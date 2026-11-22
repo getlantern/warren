@@ -93,7 +93,35 @@ type Conn struct {
 	outbound   bool
 	identity   ed25519.PrivateKey // signs resume offers; outbound only
 	migrating  atomic.Bool
-	migrations uint64 // outbound: the last migration's sequence number
+	migrations uint64      // outbound: the last migration's sequence number
+	unmoved    atomic.Bool // outbound: the last migration attempt failed
+
+	resumesMu sync.Mutex
+	resumes   []time.Time // inbound: recent resumes, for their budget
+}
+
+// maxResumesPerMinute bounds how often one inbound connection can be moved.
+// Resumes have their own budget rather than the new-connection limiter's,
+// which allows only a few punches a minute per caller: moving several live
+// sessions to one provider after a network change must not strand some.
+// Only the caller holding a session's secret can resume it.
+const maxResumesPerMinute = 6
+
+func (c *Conn) allowResume(now time.Time) bool {
+	c.resumesMu.Lock()
+	defer c.resumesMu.Unlock()
+	kept := c.resumes[:0]
+	for _, t := range c.resumes {
+		if now.Sub(t) < time.Minute {
+			kept = append(kept, t)
+		}
+	}
+	c.resumes = kept
+	if len(c.resumes) >= maxResumesPerMinute {
+		return false
+	}
+	c.resumes = append(c.resumes, now)
+	return true
 }
 
 // resumeOffer encodes a migration request: the session's resume ID and the
@@ -371,24 +399,30 @@ func (e *Endpoint) Rebind(ctx context.Context) error {
 	// Migrate even if a family failed to rebind: the others may carry the
 	// new paths. Whatever fails is retried by WatchNetwork.
 	dhtErr := rebind(ctx)
-	migErr := e.migrateAll(ctx)
+	migErr := e.migrateAll(ctx, false)
 	e.migratePending.Store(dhtErr != nil || migErr != nil)
 	return errors.Join(dhtErr, migErr)
 }
 
-// migrateAll moves every outbound connection onto a fresh path.
-func (e *Endpoint) migrateAll(ctx context.Context) error {
+// migrateAll moves outbound connections onto fresh paths: every one, or
+// with onlyUnmoved just those whose last attempt failed, so a retry leaves
+// connections that already moved alone.
+func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 	e.connsMu.Lock()
 	var out []*Conn
 	for _, c := range e.outConns {
-		out = append(out, c)
+		if !onlyUnmoved || c.unmoved.Load() {
+			out = append(out, c)
+		}
 	}
 	e.connsMu.Unlock()
 	errs := make([]error, len(out))
 	var wg sync.WaitGroup
 	for i, c := range out {
 		wg.Go(func() {
-			if err := c.Migrate(ctx); err != nil {
+			err := c.Migrate(ctx)
+			c.unmoved.Store(err != nil)
+			if err != nil {
 				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.PeerKey[:4], err)
 			}
 		})
@@ -431,7 +465,7 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 			if stale, _ := e.node.Stale(ctx); stale {
 				dhtErr = e.node.RebindStale(ctx)
 			}
-			migErr := e.migrateAll(ctx)
+			migErr := e.migrateAll(ctx, true)
 			e.migratePending.Store(dhtErr != nil || migErr != nil)
 		}
 	}
@@ -990,7 +1024,7 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 		if ok {
 			resumed, resumeSeq = e.resumable(id, in.Caller), seq
 		}
-		if resumed == nil {
+		if resumed == nil || !resumed.allowResume(time.Now()) {
 			e.answerEmpty(ctx, in, entry)
 			return
 		}
@@ -1039,8 +1073,8 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 	if !want4 {
 		charged = netip.AddrPort{} // relays only run over IPv4
 	}
-	if !e.limiter.allow(in.Caller, probed, charged, heavy, time.Now()) {
-		return
+	if resumed == nil && !e.limiter.allow(in.Caller, probed, charged, heavy, time.Now()) {
+		return // resumes are budgeted per connection instead (allowResume)
 	}
 	// The relay chosen here is final: the IPv4 session uses exactly this
 	// one (or none).

@@ -73,6 +73,11 @@ func TestSessionSurvivesMigration(t *testing.T) {
 	if err := out.Migrate(ctx); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	// Migrate returns once the caller has moved; the provider swaps in its
+	// own worker, possibly a moment later.
+	for deadline := time.Now().Add(5 * time.Second); in.LocalAddr().String() == inAddr && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if out.LocalAddr().String() == outAddr || in.LocalAddr().String() == inAddr {
 		t.Fatalf("both ends should be on new sockets: caller %v→%v, provider %v→%v", outAddr, out.LocalAddr(), inAddr, in.LocalAddr())
 	}
@@ -249,5 +254,90 @@ func TestRebindMigratesDespiteDHTError(t *testing.T) {
 	}
 	if !caller.migratePending.Load() {
 		t.Fatal("the failed rebind wasn't left pending for WatchNetwork")
+	}
+}
+
+// Resumes have their own per-connection budget, so moving several sessions
+// to one provider isn't refused by the new-connection limiter, while one
+// connection can't be resumed without bound.
+func TestResumeBudget(t *testing.T) {
+	c := &Conn{}
+	now := time.Unix(1_800_000_000, 0)
+	for i := range maxResumesPerMinute {
+		if !c.allowResume(now) {
+			t.Fatalf("resume %d refused within the budget", i)
+		}
+	}
+	if c.allowResume(now) {
+		t.Fatal("a resume past the budget was allowed")
+	}
+	if !c.allowResume(now.Add(time.Minute)) {
+		t.Fatal("the budget didn't refill after a minute")
+	}
+}
+
+// Several live sessions to one provider all migrate together: the
+// new-connection limiter (a few punches a minute per caller) doesn't apply
+// to resumes.
+func TestManySessionsMigrateTogether(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("busy-provider")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	go func() {
+		for {
+			c, err := provider.Accept(ctx)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	var outs []*Conn
+	for range 3 { // the new-connection limiter allows 3 a minute per caller
+		out, err := caller.Connect(ctx, key("busy-caller"), pub(pk))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer out.Close()
+		outs = append(outs, out)
+	}
+	if err := caller.Rebind(ctx); err != nil {
+		t.Fatalf("migrating %d sessions to one provider: %v", len(outs), err)
+	}
+}
+
+// A retry after a partial failure re-migrates only the connections that
+// didn't move.
+func TestRetryLeavesMovedConnectionsAlone(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("retry-provider")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() {
+		c, _ := provider.Accept(ctx)
+		if c != nil {
+			defer c.Close()
+			<-ctx.Done()
+		}
+	}()
+	out, err := caller.Connect(ctx, key("retry-caller"), pub(pk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	if err := caller.migrateAll(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	moved := out.LocalAddr().String()
+	if err := caller.migrateAll(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if out.LocalAddr().String() != moved {
+		t.Fatal("a retry re-migrated a connection that had already moved")
 	}
 }
