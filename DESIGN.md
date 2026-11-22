@@ -654,8 +654,13 @@ A provider that moves can't migrate its inbound connections itself (the
 caller may not be listening): the caller calls `Migrate` when its session
 stalls.
 
-Each migration carries a sequence number, and the provider installs only a
-newer one, so a slow resume can't overwrite a later path. A write that
+Resumes have their own budget, 6 a minute per connection, instead of the
+new-connection limiter's few per caller, so several sessions moving to one
+provider aren't stranded. They still count against the global budgets,
+and a heavy one (spray, open, double birthday) against every network it
+probes: owning a session doesn't buy sprays at addresses of the caller's
+choosing. Each migration carries a sequence number, and the provider
+installs only a newer one, so a slow resume can't overwrite a later path. A write that
 picked a socket just as a swap closed it follows the path to the new one,
 since QUIC treats a write error as fatal. Because QUIC never sees the path
 change, it can't reset what it learned about the old one, so a migratable

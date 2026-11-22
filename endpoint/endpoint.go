@@ -1073,8 +1073,8 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 	if !want4 {
 		charged = netip.AddrPort{} // relays only run over IPv4
 	}
-	if resumed == nil && !e.limiter.allow(in.Caller, probed, charged, heavy, time.Now()) {
-		return // resumes are budgeted per connection instead (allowResume)
+	if !e.limiter.allow(in.Caller, probed, charged, heavy, resumed != nil, time.Now()) {
+		return
 	}
 	// The relay chosen here is final: the IPv4 session uses exactly this
 	// one (or none).
