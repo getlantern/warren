@@ -139,7 +139,6 @@ func resumeID(secret []byte) [16]byte {
 var (
 	ErrNotCaller  = errors.New("endpoint: only the caller can migrate a connection")
 	errWrongPeer  = errors.New("endpoint: datagram for an address other than the peer")
-	errMigrating  = errors.New("endpoint: a migration is already running")
 	errConnClosed = errors.New("endpoint: connection closed")
 )
 

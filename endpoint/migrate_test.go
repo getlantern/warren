@@ -464,3 +464,39 @@ func TestCanceledRebindStaysOutstanding(t *testing.T) {
 		t.Fatal("a rebind canceled before its DHT rebind was acknowledged")
 	}
 }
+
+// A migration that arrives while an older one is in flight waits and then
+// runs, rather than being refused: the newer network change always runs
+// last, and the connection ends up moved and unmarked.
+func TestNewerMigrationWaitsForOlder(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("serial-provider")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	go func() {
+		c, _ := provider.Accept(ctx)
+		if c != nil {
+			defer c.Close()
+			<-ctx.Done()
+		}
+	}()
+	out, err := caller.Connect(ctx, key("serial-caller"), pub(pk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- out.Migrate(ctx) }()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("a concurrent migration was refused or failed: %v", err)
+		}
+	}
+	if out.unmoved.Load() || out.migrations != 2 {
+		t.Fatalf("after two migrations: unmoved=%v, migrations=%d", out.unmoved.Load(), out.migrations)
+	}
+}

@@ -87,14 +87,19 @@ type Conn struct {
 	// the peer, used when no direct path could be punched.
 	Relayed bool
 
-	p          *path
-	e          *Endpoint
-	resume     [16]byte
-	outbound   bool
-	identity   ed25519.PrivateKey // signs resume offers; outbound only
-	migrating  atomic.Bool
-	migrations uint64      // outbound: the last migration's sequence number
-	unmoved    atomic.Bool // outbound: the last migration attempt failed
+	p        *path
+	e        *Endpoint
+	resume   [16]byte
+	outbound bool
+	identity ed25519.PrivateKey // signs resume offers; outbound only
+	// migrateSlot serializes migrations of this connection: a newer one
+	// waits for one in flight and then runs, so the latest network change
+	// always gets the last word (a one-slot semaphore, so a waiter can give
+	// up on ctx).
+	migrateSlot chan struct{}
+	slotOnce    sync.Once
+	migrations  uint64      // outbound: the last migration's sequence number
+	unmoved     atomic.Bool // outbound: the last migration attempt failed
 
 	resumesMu sync.Mutex
 	resumes   []time.Time // inbound: recent resumes, for their budget
@@ -671,10 +676,14 @@ func (c *Conn) Migrate(ctx context.Context) error {
 	if !c.outbound {
 		return ErrNotCaller
 	}
-	if !c.migrating.CompareAndSwap(false, true) {
-		return errMigrating
+	c.slotOnce.Do(func() { c.migrateSlot = make(chan struct{}, 1) })
+	select {
+	case c.migrateSlot <- struct{}{}:
+	case <-ctx.Done():
+		c.unmoved.Store(true) // gave up behind an older migration: retry later
+		return ctx.Err()
 	}
-	defer c.migrating.Store(false)
+	defer func() { <-c.migrateSlot }()
 	e := c.e
 	e.mu.Lock()
 	if e.closed {
