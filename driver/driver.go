@@ -31,6 +31,9 @@ const (
 
 var ErrClosed = errors.New("driver: closed")
 
+// listenUDP binds sockets; tests replace it to simulate bind failures.
+var listenUDP = net.ListenUDP
+
 type packet struct {
 	fam  int
 	from netip.AddrPort
@@ -38,13 +41,15 @@ type packet struct {
 }
 
 // family is one address family's socket and node. conn and addr change on
-// Rebind, on the loop goroutine; addr is also read elsewhere under Node.mu.
+// Rebind, on the loop goroutine, under Node.mu; Close and Addr read them
+// under Node.mu, the loop without it.
 type family struct {
 	network  string // "udp4" or "udp6"
 	bindAddr string // as given to Listen, for rebinding
 	conn     *net.UDPConn
 	addr     netip.AddrPort
 	node     *dht.Node
+	stale    bool // the last rebind failed: still on the old network or socketless
 }
 
 type waitKey struct {
@@ -66,7 +71,8 @@ type Node struct {
 	waiters  map[waitKey]chan dht.Event
 	sessions map[dht.SessionID]int // which family delivered each offer
 	order    []dht.SessionID       // sessions oldest first, for eviction
-	mu       sync.Mutex            // guards each family's addr
+	mu       sync.Mutex            // guards each family's conn and addr, and closed
+	closed   bool
 }
 
 var ErrUnknownSession = errors.New("driver: unknown signaling session")
@@ -120,7 +126,7 @@ func listen(network, addr string) (*net.UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return net.ListenUDP(network, ua)
+	return listenUDP(network, ua)
 }
 
 func localAddr(c *net.UDPConn) netip.AddrPort {
@@ -139,7 +145,8 @@ func start(fams []*family) *Node {
 		sessions: map[dht.SessionID]int{},
 	}
 	for i, f := range fams {
-		n.wg.Go(func() { n.read(i, f.conn) })
+		conn := f.conn // captured now: a Rebind may replace f.conn before the reader runs
+		n.wg.Go(func() { n.read(i, conn) })
 	}
 	n.wg.Go(n.loop)
 	return n
@@ -170,7 +177,19 @@ func (n *Node) Addrs() []netip.AddrPort {
 func (n *Node) Events() <-chan dht.Event { return n.events }
 
 func (n *Node) Close() error {
-	n.once.Do(func() { close(n.done) }) // the loop closes the sockets
+	n.once.Do(func() {
+		close(n.done)
+		// Close the sockets here, not just in the loop: a loop blocked in a
+		// write is only freed by closing its socket.
+		n.mu.Lock()
+		n.closed = true
+		for _, f := range n.fams {
+			if f.conn != nil {
+				f.conn.Close()
+			}
+		}
+		n.mu.Unlock()
+	})
 	n.wg.Wait()
 	return nil
 }
@@ -438,19 +457,45 @@ func (n *Node) isFamily(fam int, a netip.Addr) bool {
 // the families that couldn't bind; those send nothing until a later Rebind
 // succeeds.
 func (n *Node) Rebind(ctx context.Context) error {
+	return n.rebind(ctx, func(*family) bool { return true })
+}
+
+// RebindStale retries only the families whose last rebind failed, leaving
+// healthy sockets alone. It returns nil when none are stale.
+func (n *Node) RebindStale(ctx context.Context) error {
+	return n.rebind(ctx, func(f *family) bool { return f.stale })
+}
+
+// Stale reports whether some family's last rebind failed.
+func (n *Node) Stale(ctx context.Context) (bool, error) {
+	out := make(chan bool, 1)
+	if err := n.do(ctx, func(time.Time) {
+		stale := false
+		for _, f := range n.fams {
+			stale = stale || f.stale
+		}
+		out <- stale
+	}); err != nil {
+		return false, err
+	}
+	return <-out, nil
+}
+
+func (n *Node) rebind(ctx context.Context, which func(*family) bool) error {
 	errc := make(chan error, 1)
 	if err := n.do(ctx, func(now time.Time) {
 		var errs []error
 		for i, f := range n.fams {
+			if !which(f) {
+				continue
+			}
 			conn, err := n.rebindFamily(f)
 			if err != nil {
+				f.stale = true
 				errs = append(errs, fmt.Errorf("rebind %s: %w", f.network, err))
 				continue
 			}
-			f.conn = conn
-			n.mu.Lock()
-			f.addr = localAddr(conn)
-			n.mu.Unlock()
+			f.stale = false
 			n.wg.Go(func() { n.read(i, conn) })
 			f.node.Rebound(now)
 		}
@@ -461,36 +506,52 @@ func (n *Node) Rebind(ctx context.Context) error {
 	return <-errc
 }
 
-// rebindFamily binds a fresh socket for f and closes the old one. Runs on
-// the loop goroutine.
+// rebindFamily binds a fresh socket for f, installs it, and closes the old
+// one. Runs on the loop goroutine.
 func (n *Node) rebindFamily(f *family) (*net.UDPConn, error) {
-	old := f.conn
 	ua, err := net.ResolveUDPAddr(f.network, f.bindAddr)
 	if err != nil {
 		return nil, err
 	}
+	var conn *net.UDPConn
 	if ua.Port == 0 {
 		// An ephemeral port: bind the new socket before closing the old.
-		conn, err := net.ListenUDP(f.network, ua)
-		if err != nil {
+		if conn, err = listenUDP(f.network, ua); err != nil {
 			return nil, err
 		}
-		if old != nil {
-			old.Close()
+	} else {
+		// A fixed port must be released first.
+		n.swap(f, nil)
+		if conn, err = listenUDP(f.network, ua); err != nil {
+			ua.Port = 0
+			if conn, err = listenUDP(f.network, ua); err != nil {
+				return nil, err
+			}
 		}
-		return conn, nil
 	}
-	// A fixed port must be released first.
-	if old != nil {
-		old.Close()
+	if !n.swap(f, conn) {
+		conn.Close()
+		return nil, ErrClosed
 	}
-	f.conn = nil
-	conn, err := net.ListenUDP(f.network, ua)
-	if err != nil {
-		ua.Port = 0
-		conn, err = net.ListenUDP(f.network, ua)
+	return conn, nil
+}
+
+// swap installs conn as f's socket and closes the old one, under the lock
+// Close takes, reporting false (and installing nothing) once closed.
+func (n *Node) swap(f *family, conn *net.UDPConn) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return false
 	}
-	return conn, err
+	if f.conn != nil {
+		f.conn.Close()
+	}
+	f.conn = conn
+	if conn != nil {
+		f.addr = localAddr(conn)
+	}
+	return true
 }
 
 // Bootstrap looks up our own ID on each node from the seeds of its family

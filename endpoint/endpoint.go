@@ -340,7 +340,8 @@ func (e *Endpoint) Rebind(ctx context.Context) error { return e.node.Rebind(ctx)
 
 // WatchNetwork rebinds whenever the local address of the default IPv4 or
 // IPv6 route changes, checking every interval (5 seconds if zero), until
-// ctx ends. Checking sends no packets. Apps whose platform reports network
+// ctx ends, and retries any family whose rebind failed on each check until
+// it binds. Checking sends no packets. Apps whose platform reports network
 // changes (iOS NWPathMonitor, Android ConnectivityManager) should call
 // Rebind from those instead, which is faster and costs nothing between
 // changes.
@@ -365,7 +366,9 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 		}
 		if cur := probe(); cur != last {
 			last = cur
-			_ = e.Rebind(ctx) // a family that failed retries on the next change
+			_ = e.Rebind(ctx) // a family that fails is retried below
+		} else if stale, _ := e.node.Stale(ctx); stale {
+			_ = e.node.RebindStale(ctx)
 		}
 	}
 }

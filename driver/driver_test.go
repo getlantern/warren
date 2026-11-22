@@ -515,3 +515,54 @@ func TestRebindPorts(t *testing.T) {
 		}
 	}
 }
+
+// Rebinding right after Listen, before the first reader has run, mustn't
+// hand a reader the replaced (or nil) socket.
+func TestRebindRightAfterListen(t *testing.T) {
+	for range 50 {
+		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixed := probe.LocalAddr().String()
+		probe.Close()
+		n, err := Listen(fixed, memberConfig(false))
+		if err != nil {
+			continue // the port was taken meanwhile
+		}
+		if err := n.Rebind(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		n.Close()
+	}
+}
+
+// A family whose rebind fails is stale until RebindStale binds it, and a
+// rebind after Close installs nothing.
+func TestStaleRebindRetried(t *testing.T) {
+	n, err := Listen("127.0.0.1:0", memberConfig(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	listenUDP = func(string, *net.UDPAddr) (*net.UDPConn, error) { return nil, errors.New("no network yet") }
+	err = n.Rebind(ctx)
+	listenUDP = net.ListenUDP
+	if err == nil {
+		t.Fatal("a failed bind reported success")
+	}
+	if stale, _ := n.Stale(ctx); !stale {
+		t.Fatal("the family whose rebind failed isn't marked stale")
+	}
+	before := n.Addr()
+	if err := n.RebindStale(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if stale, _ := n.Stale(ctx); stale || n.Addr() == before {
+		t.Fatalf("RebindStale didn't repair the family (stale=%v, addr %v)", stale, n.Addr())
+	}
+	n.Close()
+	if err := n.Rebind(ctx); err == nil {
+		t.Fatal("rebind after Close succeeded")
+	}
+}
