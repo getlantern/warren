@@ -573,6 +573,11 @@ func TestStaleRebindRetried(t *testing.T) {
 	if stale, _ := n.Stale(ctx); !stale {
 		t.Fatal("the family whose rebind failed isn't marked stale")
 	}
+	socketless := make(chan bool, 1)
+	n.do(ctx, func(time.Time) { socketless <- n.fams[0].conn == nil })
+	if !<-socketless {
+		t.Fatal("a failed rebind left the old network's socket in use")
+	}
 	before := n.Addr()
 	if err := n.RebindStale(ctx); err != nil {
 		t.Fatal(err)

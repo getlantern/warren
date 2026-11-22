@@ -520,6 +520,9 @@ func (n *Node) rebindFamily(f *family) (*net.UDPConn, error) {
 	if ua.Port == 0 {
 		// An ephemeral port: bind the new socket before closing the old.
 		if conn, err = listenUDP(f.network, &ua); err != nil {
+			// The old socket is on the old network: close it, so the family
+			// sends nothing (and hears nothing stale) until a retry binds.
+			n.swap(f, nil)
 			return nil, err
 		}
 	} else {
