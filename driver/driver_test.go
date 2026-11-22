@@ -5,6 +5,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -405,5 +407,111 @@ func TestPutAcknowledgementsAddUp(t *testing.T) {
 	got := sumPuts([]dht.Event{dht.PutDone{Stored: 0}, dht.PutDone{Stored: 5, Domestic: 2}})
 	if got.Stored != 5 || got.Domestic != 2 {
 		t.Fatalf("summed acknowledgements %+v, want 5 stored, 2 domestic", got)
+	}
+}
+
+// After a network change the provider rebinds onto a new address, and
+// callers still reach it: its records are re-signed and republished, so
+// holders forward offers to the new address instead of the dead one.
+func TestRebindKeepsProviderReachable(t *testing.T) {
+	nodes := network(t, 12)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	phone := func() *Node {
+		n, err := Listen("127.0.0.1:0", memberConfig(true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { n.Close() })
+		if _, err := n.Bootstrap(ctx, []netip.AddrPort{nodes[4].Addr()}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	provider, caller := phone(), phone()
+	pk := ed25519.NewKeyFromSeed([]byte("provider-seed-provider-seed-0123"))
+	if err := provider.Listen(ctx, pk); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for e := range provider.Events() {
+			if in, ok := e.(dht.Incoming); ok {
+				provider.Answer(ctx, in.Session, append([]byte("re: "), in.Payload...))
+			}
+		}
+	}()
+	waitHolders := func() {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+			var holders int
+			provider.Inspect(ctx, func(d *dht.Node) { holders = len(d.Holders()) })
+			if holders > 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("record never reached holders")
+			}
+		}
+	}
+	signal := func(msg string) error {
+		sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
+		defer scancel()
+		got, err := caller.Signal(sctx, ed25519.NewKeyFromSeed(make([]byte, 32)), [32]byte(pk.Public().(ed25519.PublicKey)), []byte(msg))
+		if err == nil && string(got) != "re: "+msg {
+			return fmt.Errorf("got %q", got)
+		}
+		return err
+	}
+	waitHolders()
+	if err := signal("before"); err != nil {
+		t.Fatalf("before rebind: %v", err)
+	}
+	before := provider.Addr()
+	if err := provider.Rebind(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after := provider.Addr(); after == before {
+		t.Fatalf("rebind kept address %v", after)
+	}
+	if err := signal("after"); err != nil {
+		t.Fatalf("after rebind, the provider was unreachable: %v", err)
+	}
+}
+
+// A fixed port is reused on rebind; a dual-stack node rebinds both families.
+func TestRebindPorts(t *testing.T) {
+	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed := probe.LocalAddr().(*net.UDPAddr).AddrPort()
+	probe.Close()
+	n, err := Listen(fixed.String(), memberConfig(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := n.Rebind(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n.Addr() != fixed {
+		t.Fatalf("fixed port %v became %v after rebind", fixed, n.Addr())
+	}
+	d, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil || len(d.Addrs()) != 2 {
+		t.Skip("no dual-stack loopback")
+	}
+	defer d.Close()
+	before := d.Addrs()
+	if err := d.Rebind(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after := d.Addrs()
+	for i := range before {
+		if before[i] == after[i] {
+			t.Fatalf("family %d kept address %v across rebind", i, after[i])
+		}
 	}
 }

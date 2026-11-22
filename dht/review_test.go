@@ -363,3 +363,28 @@ func TestSiblingCommunityMustMatch(t *testing.T) {
 		t.Fatal("Mainline referrals stopped crossing to the sibling")
 	}
 }
+
+// Rebound forgets the old network's reflections and re-signs the
+// listener's records with a newer seq, so holders move their binding.
+func TestReboundResignsRecords(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(90)), Rand: rng(91), ReadOnly: true})
+	n.main.heard(outsiderID(rng(92)), addr(1), t0)
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	if err := n.Listen(t0, priv); err != nil {
+		t.Fatal(err)
+	}
+	n.reflections = []Reflection{{From: addr(1), Mapped: addr(2)}}
+	seqs := map[krpc.NodeID]int64{}
+	for _, tgt := range n.lst.records {
+		seqs[tgt] = n.owned[tgt].rec.mut.Seq
+	}
+	n.Rebound(t0.Add(time.Second))
+	if len(n.Reflections()) != 0 {
+		t.Fatal("reflections from the old network survived a rebind")
+	}
+	for tgt, old := range seqs {
+		if got := n.owned[tgt].rec.mut.Seq; got <= old {
+			t.Fatalf("record re-published at seq %d, not above %d: holders keep the old binding", got, old)
+		}
+	}
+}
