@@ -89,8 +89,11 @@ func New(pc net.PacketConn, key []byte) *Conn {
 		peers: map[netip.AddrPort]*peer{}, rng: rand.New(rand.NewChaCha8(seed)),
 	}
 	c.bufs.New = func() any { b := make([]byte, maxDatagram); return &b }
-	if uc, ok := pc.(*net.UDPConn); ok {
-		c.df = SetDontFragment(uc)
+	switch p := pc.(type) {
+	case *net.UDPConn:
+		c.df = SetDontFragment(p)
+	case interface{ DontFragment() bool }:
+		c.df = p.DontFragment() // a socket that sets it itself, like a migratable connection
 	}
 	return c
 }

@@ -58,12 +58,12 @@ func TestRelayedConnectAndHysteria2(t *testing.T) {
 	}
 	t.Logf("relayed connection via %s in %v", out.Remote, time.Since(start))
 
-	srv, err := hy2.Serve(ctx, in.UDPConn, pk, hy2.FromSecret(in.Secret, hy2.ObfsUTP), func(c net.Conn, _ string) { io.Copy(c, c) })
+	srv, err := hy2.Serve(ctx, in, pk, hy2.FromSecret(in.Secret, hy2.ObfsUTP), func(c net.Conn, _ string) { io.Copy(c, c) })
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer srv.Close()
-	cl, err := hy2.Dial(ctx, out.UDPConn, out.Remote, out.PeerKey, hy2.FromSecret(out.Secret, hy2.ObfsUTP))
+	cl, err := hy2.Dial(ctx, out, out.Remote, out.PeerKey, hy2.FromSecret(out.Secret, hy2.ObfsUTP))
 	if err != nil {
 		t.Fatal(err)
 	}

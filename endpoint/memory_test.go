@@ -85,7 +85,7 @@ func transferPeak(t *testing.T, provider, caller *Endpoint, pk, ck ed25519.Priva
 	if in == nil {
 		t.Fatal("nothing accepted")
 	}
-	srv, err := hy2.Serve(ctx, in.UDPConn, pk, opts(hy2.FromSecret(in.Secret, hy2.ObfsUTP)), func(c net.Conn, _ string) {
+	srv, err := hy2.Serve(ctx, in, pk, opts(hy2.FromSecret(in.Secret, hy2.ObfsUTP)), func(c net.Conn, _ string) {
 		var want int64
 		if binary.Read(c, binary.BigEndian, &want) != nil {
 			return
@@ -106,7 +106,7 @@ func transferPeak(t *testing.T, provider, caller *Endpoint, pk, ck ed25519.Priva
 		t.Fatal(err)
 	}
 	defer srv.Close()
-	cl, err := hy2.Dial(ctx, out.UDPConn, out.Remote, out.PeerKey, opts(hy2.FromSecret(out.Secret, hy2.ObfsUTP)))
+	cl, err := hy2.Dial(ctx, out, out.Remote, out.PeerKey, opts(hy2.FromSecret(out.Secret, hy2.ObfsUTP)))
 	if err != nil {
 		t.Fatal(err)
 	}

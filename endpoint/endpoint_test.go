@@ -272,7 +272,7 @@ func TestCloseClosesUnaccepted(t *testing.T) {
 		}
 	}
 	provider.Close()
-	if _, err := pending.WriteToUDPAddrPort([]byte("x"), pending.Remote); err == nil {
+	if err := pending.Send([]byte("x")); err == nil {
 		t.Fatal("unaccepted connection still open after Close")
 	}
 }
@@ -287,7 +287,8 @@ func TestRecvSkipsControlAndStrangers(t *testing.T) {
 	stranger, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	defer peer.Close()
 	defer stranger.Close()
-	c := &Conn{UDPConn: a, Remote: peer.LocalAddr().(*net.UDPAddr).AddrPort()}
+	remote := peer.LocalAddr().(*net.UDPAddr).AddrPort()
+	c := &Conn{p: newPath(a, remote), Remote: remote}
 	to := a.LocalAddr().(*net.UDPAddr)
 	peer.WriteTo([]byte("d1:rd2:id20:aaaaaaaaaaaaaaaaaaaae1:t2:aa1:y1:re"), to)
 	stranger.WriteTo([]byte("not from the peer"), to)

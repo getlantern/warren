@@ -639,9 +639,42 @@ callers can't reach it.
   `WatchNetwork` is a fallback that checks the default routes' local
   addresses every few seconds without sending a packet.
 
-Connections punched before the change are bound to the old network and
-stop working; the app reconnects with `Connect`. Carrying a hysteria2
-session across the change with QUIC connection migration is a follow-up.
+**Live sessions migrate.** An `endpoint.Conn` is a stable virtual path: it
+reports a fixed peer address (`Remote`) while the real socket and the peer's
+real address underneath can be swapped, so hysteria2, QUIC and uTP shaping
+above see one unchanging path. `Conn.Migrate` signals the provider again
+with a resume ID derived from the connection's secret, which only the two
+ends hold; both sides punch a fresh path (direct over either family, or
+relayed over IPv4), and the provider, matching the ID and the caller's verified
+key to a live inbound connection, swaps the new socket into it instead of
+handing a new connection to `Accept`. QUIC retransmits what was in flight;
+the hysteria2 password and pinned TLS stay valid because they derive from
+the original secret. `Endpoint.Rebind` migrates every outbound connection.
+A provider that moves can't migrate its inbound connections itself (the
+caller may not be listening): the caller calls `Migrate` when its session
+stalls.
+
+Resumes have their own budget, 6 a minute per connection, instead of the
+new-connection limiter's few per caller, so several sessions moving to one
+provider aren't stranded. They still count against the global budgets,
+and a heavy one (spray, open, double birthday) against every network it
+probes: owning a session doesn't buy sprays at addresses of the caller's
+choosing. Each migration carries a sequence number, and the provider
+installs only a newer one, so a slow resume can't overwrite a later path. A write that
+picked a socket just as a swap closed it follows the path to the new one,
+since QUIC treats a write error as fatal. Because QUIC never sees the path
+change, it can't reset what it learned about the old one, so a migratable
+connection keeps it from path MTU discovery (packets stay at QUIC's safe
+1200-byte initial size): a size found on one network would be dropped on a
+smaller-MTU network after a move. Rebind migrates even when a DHT family
+failed to rebind, and `WatchNetwork` retries what's left.
+
+This works below QUIC rather than with QUIC's own connection migration:
+that lets only the client move, needs the peer's NAT to admit the new
+address anyway (a new punch either way), and would need the QUIC connection
+that sing-quic's hysteria2 client keeps private. The cost is that QUIC
+connection IDs don't rotate across the move, so an observer on both
+networks could link the two paths.
 Full (non-read-only) nodes keep their node ID across the change, though
 BEP 42 derives it from the external address; phones are read-only, so this
 only matters for routers that move, which are rare.
@@ -649,7 +682,10 @@ only matters for routers that move, which are rare.
 Tests cover a provider signaled before and after a rebind onto a new port
 (without the republish it is unreachable), a fixed port reused, both
 families rebinding, a fresh `Connect` after the provider rebinds, and
-`WatchNetwork` rebinding on a route change and not otherwise.
+`WatchNetwork` rebinding on a route change and not otherwise, a hysteria2
+stream echoing across an explicit `Migrate` and across a caller `Rebind`
+(both ends on new sockets), and a resume accepted only from the
+connection's own caller, failing fast when it names nothing.
 
 ## Phase 0: measure first (`natprobe/`, built)
 
@@ -707,4 +743,4 @@ and carrier allocator. The design therefore splits measurement in two:
 | 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
 | 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
-| 6 | iOS integration, memory budget, network-change rebind | Rebind built (see *Network changes*). Next: QUIC connection migration for live sessions, and iOS integration and memory budget |
+| 6 | iOS integration, memory budget, network-change rebind | Rebind and live-session migration built (see *Network changes*). Next: iOS integration and memory budget, and stall detection so a caller migrates on its own when the provider moved |

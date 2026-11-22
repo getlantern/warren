@@ -71,7 +71,14 @@ func prune(ts []time.Time, now time.Time) []time.Time {
 // relay), recording the punch if so. heavy says the planned strategy sends
 // many probes. Checks read into locals and nothing is written unless the
 // punch is allowed, so refused attempts cannot grow the tables.
-func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay netip.AddrPort, heavy bool, now time.Time) bool {
+//
+// resume marks a punch that moves an existing session: it skips the
+// per-caller budget (the session has its own) and, when light, the
+// per-network and per-relay-address ones (the relay network bucket still
+// applies), so several sessions moving to one new network aren't stranded. A heavy resume still counts against every network it probes,
+// and every resume against the global budgets: owning a session must not
+// buy unlimited sprays at addresses of the caller's choosing.
+func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay netip.AddrPort, heavy, resume bool, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.callers == nil {
@@ -84,8 +91,11 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 		}
 	}
 	callerTs := prune(l.callers[caller], now)
-	if len(callerTs) >= perCallerMax {
+	if !resume && len(callerTs) >= perCallerMax {
 		return false
+	}
+	if resume && !heavy {
+		cands = nil // a light resume isn't charged per network
 	}
 	seen := map[netip.Prefix]bool{}
 	var nets []netip.Prefix
@@ -100,8 +110,9 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 		// A relay is budgeted twice: by exact address like any probed host,
 		// and by its network in the looser relay bucket.
 		a := relay.Addr().Unmap()
-		p, _ := a.Prefix(a.BitLen())
-		keys = append(keys, p)
+		if p, _ := a.Prefix(a.BitLen()); !resume || heavy {
+			keys = append(keys, p) // a light resume keeps only the network bucket
+		}
 		relayNet = networkOf(a)
 		relayNetTs = prune(l.relayNets[relayNet], now)
 		if len(relayNetTs) >= relayNetMax {
@@ -124,7 +135,9 @@ func (l *inboundLimiter) allow(caller [32]byte, cands []netip.AddrPort, relay ne
 		return false
 	}
 
-	l.callers[caller] = append(callerTs, now)
+	if !resume {
+		l.callers[caller] = append(callerTs, now)
+	}
 	for i, p := range nets {
 		l.nets[p] = append(netTs[i], now)
 	}

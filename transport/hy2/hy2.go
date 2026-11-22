@@ -109,6 +109,12 @@ func (o *Options) quic(shaped net.PacketConn, df bool) qtls.QUICOptions {
 		}
 	}
 	q.DisablePathMTUDiscovery = !df
+	if !df {
+		// Without discovery packets never grow past the initial size, so
+		// keep it at QUIC's minimum: quic-go's 1280-byte default plus any
+		// obfuscation overhead overflows a minimum-MTU IPv6 path.
+		q.InitialPacketSize = 1200
+	}
 	return q
 }
 
@@ -371,6 +377,9 @@ func FromSecret(secret []byte, obfs Obfs) Options {
 
 // dontFragment sets Don't Fragment on the raw socket when pc is one.
 func dontFragment(pc net.PacketConn) bool {
+	if d, ok := pc.(DontFragmenter); ok {
+		return d.DontFragment() // a socket that manages its own, like a migratable connection
+	}
 	uc, ok := pc.(*net.UDPConn)
 	return ok && utpshape.SetDontFragment(uc)
 }

@@ -205,3 +205,15 @@ func TestOversizedShaperRefused(t *testing.T) {
 		t.Fatalf("Dial: %v, want errShaperOverhead", err)
 	}
 }
+
+// Without Don't Fragment, discovery is off and every mode starts, and so
+// stays, at QUIC's 1200-byte minimum, which fits a minimum-MTU IPv6 path.
+func TestNoDontFragmentKeepsMinimumPacketSize(t *testing.T) {
+	for _, obfs := range []Obfs{ObfsNone, ObfsSalamander, ObfsUTP} {
+		o := Options{Obfs: obfs, Password: "p"}
+		q := o.quic(nil, false)
+		if !q.DisablePathMTUDiscovery || q.InitialPacketSize != 1200 {
+			t.Errorf("obfs %v without DF: discovery disabled %v, initial size %d", obfs, q.DisablePathMTUDiscovery, q.InitialPacketSize)
+		}
+	}
+}
