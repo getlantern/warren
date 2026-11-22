@@ -377,3 +377,25 @@ func TestConcurrentRebindsSerialize(t *testing.T) {
 		t.Fatal("overlapping rebinds left the connection marked unmoved")
 	}
 }
+
+// A rebind waiting behind another gives up when its context ends, and
+// leaves the work pending for the watcher.
+func TestQueuedRebindCancels(t *testing.T) {
+	e := &Endpoint{}
+	if err := e.lockRebind(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer e.unlockRebind()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := e.Rebind(ctx); err == nil {
+		t.Fatal("a queued rebind succeeded while another held the slot")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("a canceled queued rebind waited %v", took)
+	}
+	if !e.migratePending.Load() {
+		t.Fatal("a canceled rebind didn't leave its work pending")
+	}
+}

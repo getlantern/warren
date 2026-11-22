@@ -160,11 +160,13 @@ type Endpoint struct {
 	// migratePending: the last rebind left a DHT family or a connection
 	// unmoved; WatchNetwork retries.
 	migratePending atomic.Bool
-	// rebindMu serializes whole rebind cycles (Rebind and WatchNetwork's
-	// retries): a later network change waits and migrates again, rather
-	// than colliding with an earlier cycle that might then clear its
-	// retry state after moving connections to the earlier network.
-	rebindMu sync.Mutex
+	// rebinding serializes whole rebind cycles (Rebind and WatchNetwork's
+	// retries), as a one-slot semaphore so a waiter can give up: a later
+	// network change waits and migrates again, rather than colliding with
+	// an earlier cycle that might then clear its retry state after moving
+	// connections to the earlier network.
+	rebinding  chan struct{}
+	rebindOnce sync.Once
 
 	connsMu sync.Mutex
 	// Live connections by peer key and resume ID, inbound and outbound
@@ -401,8 +403,11 @@ func (e *Endpoint) Rebind(ctx context.Context) error {
 	if rebind == nil {
 		rebind = e.node.Rebind
 	}
-	e.rebindMu.Lock()
-	defer e.rebindMu.Unlock()
+	if err := e.lockRebind(ctx); err != nil {
+		e.migratePending.Store(true) // gave up waiting: the watcher retries
+		return err
+	}
+	defer e.unlockRebind()
 	// Migrate even if a family failed to rebind: the others may carry the
 	// new paths. Whatever fails is retried by WatchNetwork.
 	dhtErr := rebind(ctx)
@@ -410,6 +415,19 @@ func (e *Endpoint) Rebind(ctx context.Context) error {
 	e.migratePending.Store(dhtErr != nil || migErr != nil)
 	return errors.Join(dhtErr, migErr)
 }
+
+// lockRebind waits for the rebind slot, giving up when ctx ends.
+func (e *Endpoint) lockRebind(ctx context.Context) error {
+	e.rebindOnce.Do(func() { e.rebinding = make(chan struct{}, 1) })
+	select {
+	case e.rebinding <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *Endpoint) unlockRebind() { <-e.rebinding }
 
 // migrateAll moves outbound connections onto fresh paths: every one, or
 // with onlyUnmoved just those whose last attempt failed, so a retry leaves
@@ -468,14 +486,16 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 			last = cur
 			_ = e.Rebind(ctx) // whatever fails is retried below
 		} else if e.migratePending.Load() {
-			e.rebindMu.Lock()
+			if e.lockRebind(ctx) != nil {
+				return
+			}
 			var dhtErr error
 			if stale, _ := e.node.Stale(ctx); stale {
 				dhtErr = e.node.RebindStale(ctx)
 			}
 			migErr := e.migrateAll(ctx, true)
 			e.migratePending.Store(dhtErr != nil || migErr != nil)
-			e.rebindMu.Unlock()
+			e.unlockRebind()
 		}
 	}
 }
