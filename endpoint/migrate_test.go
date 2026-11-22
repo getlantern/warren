@@ -340,6 +340,15 @@ func TestRetryLeavesMovedConnectionsAlone(t *testing.T) {
 	if out.LocalAddr().String() != moved {
 		t.Fatal("a retry re-migrated a connection that had already moved")
 	}
+	// One a failed rebind left unmoved, then recovered by an explicit
+	// Migrate, is left alone by retries too.
+	out.unmoved.Store(true)
+	if err := out.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if out.unmoved.Load() {
+		t.Fatal("a successful Migrate left the connection marked unmoved")
+	}
 }
 
 // Two network changes in quick succession don't collide: the second rebind

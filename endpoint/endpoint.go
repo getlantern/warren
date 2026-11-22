@@ -504,7 +504,9 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 				return
 			}
 			var dhtErr error
-			if stale, _ := e.node.Stale(ctx); stale {
+			stale, err := e.node.Stale(ctx)
+			dhtErr = err // a failed check (canceled, say) keeps the retry pending
+			if err == nil && stale {
 				dhtErr = e.node.RebindStale(ctx)
 			}
 			migErr := e.migrateAll(ctx, true)
@@ -719,6 +721,7 @@ func (c *Conn) Migrate(ctx context.Context) error {
 		pd.sock.Close()
 		return errConnClosed
 	}
+	c.unmoved.Store(false) // moved, however it was asked: retries leave it alone
 	return nil
 }
 
