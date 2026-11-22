@@ -341,3 +341,39 @@ func TestRetryLeavesMovedConnectionsAlone(t *testing.T) {
 		t.Fatal("a retry re-migrated a connection that had already moved")
 	}
 }
+
+// Two network changes in quick succession don't collide: the second rebind
+// waits for the first and migrates again, so neither fails with a
+// migration in progress and nothing is left falsely settled.
+func TestConcurrentRebindsSerialize(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("twice-provider")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	go func() {
+		c, _ := provider.Accept(ctx)
+		if c != nil {
+			defer c.Close()
+			<-ctx.Done()
+		}
+	}()
+	out, err := caller.Connect(ctx, key("twice-caller"), pub(pk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- caller.Rebind(ctx) }()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("overlapping rebinds collided: %v", err)
+		}
+	}
+	if caller.migratePending.Load() || out.unmoved.Load() {
+		t.Fatal("overlapping rebinds left the connection marked unmoved")
+	}
+}

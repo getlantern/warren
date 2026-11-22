@@ -160,6 +160,11 @@ type Endpoint struct {
 	// migratePending: the last rebind left a DHT family or a connection
 	// unmoved; WatchNetwork retries.
 	migratePending atomic.Bool
+	// rebindMu serializes whole rebind cycles (Rebind and WatchNetwork's
+	// retries): a later network change waits and migrates again, rather
+	// than colliding with an earlier cycle that might then clear its
+	// retry state after moving connections to the earlier network.
+	rebindMu sync.Mutex
 
 	connsMu sync.Mutex
 	// Live connections by peer key and resume ID, inbound and outbound
@@ -396,6 +401,8 @@ func (e *Endpoint) Rebind(ctx context.Context) error {
 	if rebind == nil {
 		rebind = e.node.Rebind
 	}
+	e.rebindMu.Lock()
+	defer e.rebindMu.Unlock()
 	// Migrate even if a family failed to rebind: the others may carry the
 	// new paths. Whatever fails is retried by WatchNetwork.
 	dhtErr := rebind(ctx)
@@ -461,12 +468,14 @@ func (e *Endpoint) WatchNetwork(ctx context.Context, interval time.Duration) {
 			last = cur
 			_ = e.Rebind(ctx) // whatever fails is retried below
 		} else if e.migratePending.Load() {
+			e.rebindMu.Lock()
 			var dhtErr error
 			if stale, _ := e.node.Stale(ctx); stale {
 				dhtErr = e.node.RebindStale(ctx)
 			}
 			migErr := e.migrateAll(ctx, true)
 			e.migratePending.Store(dhtErr != nil || migErr != nil)
+			e.rebindMu.Unlock()
 		}
 	}
 }
