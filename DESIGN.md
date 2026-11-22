@@ -644,8 +644,8 @@ reports a fixed peer address (`Remote`) while the real socket and the peer's
 real address underneath can be swapped, so hysteria2, QUIC and uTP shaping
 above see one unchanging path. `Conn.Migrate` signals the provider again
 with a resume ID derived from the connection's secret, which only the two
-ends hold; both sides punch a fresh path (any strategy, relayed or direct,
-either family), and the provider, matching the ID and the caller's verified
+ends hold; both sides punch a fresh path (direct over either family, or
+relayed over IPv4), and the provider, matching the ID and the caller's verified
 key to a live inbound connection, swaps the new socket into it instead of
 handing a new connection to `Accept`. QUIC retransmits what was in flight;
 the hysteria2 password and pinned TLS stay valid because they derive from
