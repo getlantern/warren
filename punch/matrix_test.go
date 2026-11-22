@@ -359,3 +359,18 @@ func TestOfferFamilies(t *testing.T) {
 		t.Fatal("an IPv4-only offer grew an IPv6 profile")
 	}
 }
+
+// A malformed resume field makes the offer invalid instead of decoding as an
+// ordinary offer that would start a new connection.
+func TestMalformedResumeRejected(t *testing.T) {
+	ok := punch.Offer{Resume: make([]byte, 24)}
+	if back, err := punch.UnmarshalOffer(ok.Marshal()); err != nil || len(back.Resume) != 24 {
+		t.Fatalf("a valid resume didn't round-trip: %v", err)
+	}
+	long := punch.Offer{Profile: punch.Profile{}}
+	raw := long.Marshal()
+	raw = append(raw[:len(raw)-1], []byte("1:u33:"+string(make([]byte, 33))+"e")...)
+	if _, err := punch.UnmarshalOffer(raw); err == nil {
+		t.Fatal("an oversized resume decoded as an ordinary offer")
+	}
+}

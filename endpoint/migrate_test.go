@@ -3,6 +3,7 @@ package endpoint
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getlantern/warren/punch"
 	"github.com/getlantern/warren/transport/hy2"
 )
 
@@ -512,5 +514,33 @@ func TestOlderMigrationCantSettleNewerRequest(t *testing.T) {
 	c.moveDone.Store(serving)    // the older migration succeeds
 	if !c.unmoved() {
 		t.Fatal("an older migration's success settled a newer request")
+	}
+}
+
+// A resume naming no live connection is answered at once even when every
+// punch slot is busy.
+func TestUnknownResumeAnsweredWithoutSlot(t *testing.T) {
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	pk := key("full-provider")
+	listenAndWait(t, provider, pk)
+	for len(provider.slots) < cap(provider.slots) {
+		provider.slots <- struct{}{} // every slot busy
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	secret := make([]byte, 32)
+	crand.Read(secret)
+	offer := punch.Offer{Secret: secret, Resume: resumeOffer([16]byte{1}, 1)}
+	start := time.Now()
+	payload, err := caller.DHT().Signal(ctx, key("full-caller"), pub(pk), offer.Marshal())
+	if err != nil {
+		t.Fatalf("no answer to an unknown resume with slots full: %v", err)
+	}
+	if answer, err := punch.UnmarshalOffer(payload); err != nil || len(answer.Candidates) != 0 {
+		t.Fatalf("answer %+v, %v; want an empty offer", answer, err)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the empty answer took %v", took)
 	}
 }

@@ -188,7 +188,12 @@ func UnmarshalOffer(b []byte) (Offer, error) {
 	if sec, ok := v.Get("s"); ok && sec.Kind == bencode.String {
 		o.Secret = append([]byte(nil), sec.Str...)
 	}
-	if u, ok := v.Get("u"); ok && u.Kind == bencode.String && len(u.Str) <= maxResume {
+	if u, ok := v.Get("u"); ok {
+		// A malformed resume must not decode as an ordinary offer, which
+		// would start a new connection instead of moving one.
+		if u.Kind != bencode.String || len(u.Str) == 0 || len(u.Str) > maxResume {
+			return o, ErrBadOffer
+		}
 		o.Resume = append([]byte(nil), u.Str...)
 	}
 	return o, nil

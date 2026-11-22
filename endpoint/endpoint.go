@@ -1052,6 +1052,19 @@ func (e *Endpoint) incoming(in dht.Incoming) {
 		}
 		return
 	}
+	if len(offer.Resume) > 0 {
+		// A resume naming no live connection of this caller is answered at
+		// once, empty, even when every punch slot is busy: it would never
+		// punch, and the caller shouldn't wait out signaling.
+		if id, _, ok := parseResume(offer.Resume); !ok || e.resumable(id, in.Caller) == nil {
+			e.wg.Go(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), e.cfg.GatherWait)
+				defer cancel()
+				e.answerEmpty(ctx, in, entry)
+			})
+			return
+		}
+	}
 	select {
 	case e.slots <- struct{}{}:
 	default:
