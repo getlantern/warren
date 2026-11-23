@@ -77,8 +77,15 @@ func (c *Conn) checkStall(now time.Time, timeout time.Duration) {
 	if timeout <= 0 || wait == 0 || now.Sub(time.Unix(0, wait)) < timeout {
 		return
 	}
+	// Take stallBusy before reading the failure record: a running stall
+	// move publishes its failure before releasing it, so the record read
+	// here is never older than the last attempt.
+	if !c.stallBusy.CompareAndSwap(false, true) {
+		return
+	}
 	sameWait := wait == c.stallFailedWait.Load() && int64(gen) == c.stallFailedGen.Load()
-	if (sameWait && now.UnixNano() < c.stallNext.Load()) || !c.stallBusy.CompareAndSwap(false, true) {
+	if sameWait && now.UnixNano() < c.stallNext.Load() {
+		c.stallBusy.Store(false)
 		return
 	}
 	e := c.e
