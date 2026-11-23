@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/warren/dht"
@@ -78,7 +79,13 @@ func main() {
 	// Learn our address before starting either measured node, so both warm
 	// up for the same time.
 	ip := externalIP(seeds)
-	w := startWarren(seeds, ip, tune)
+	// The default cap leaves gets 4 sure slots (internal lookups may fill
+	// the rest); past that concurrency, raise it so gets really run at once.
+	measured := tune
+	if *concurrency > 4 {
+		measured.MaxLookups = max(measured.MaxLookups, *concurrency+16)
+	}
+	w := startWarren(seeds, ip, measured)
 	var lt *libtorrent
 	if *python != "" {
 		lt = startLibtorrent(*python, *script, *warmup, *concurrency, seeds)
@@ -92,7 +99,7 @@ func main() {
 
 	// Items to find, stored by a separate node on the K nodes closest to
 	// each, so neither measured node has walked toward them before.
-	storer := startWarren(seeds, ip, dht.Config{})
+	storer := startWarren(seeds, ip, dht.Config{MaxLookups: measured.MaxLookups})
 	storer.warm(*warmup / 2)
 	hits := storer.store(*lookups, *concurrency)
 	_ = storer.n.Close()
@@ -105,6 +112,7 @@ func main() {
 		name    string
 		targets []krpc.NodeID
 		w, lt   []lookup
+		busy    int64 // warren gets refused with ErrBusy and retried
 	}
 	phases := []*phase{{name: "hit", targets: hits}, {name: "miss", targets: misses}}
 	if *noMiss {
@@ -115,7 +123,9 @@ func main() {
 		if lt != nil {
 			wg.Go(func() { ph.lt = lt.batch(ph.name, ph.targets) })
 		}
+		busyRetries.Store(0)
 		ph.w = w.gets(ph.targets, *concurrency)
+		ph.busy = busyRetries.Load()
 		wg.Wait()
 	}
 	if lt != nil {
@@ -156,7 +166,7 @@ func main() {
 			}
 		}
 		if n > 0 {
-			fmt.Printf("warren: found %d/%d, %.1f queries and %.1f failures per lookup\n", found, len(ph.w), float64(q)/float64(n), float64(f)/float64(n))
+			fmt.Printf("warren: found %d/%d, %.1f queries and %.1f failures per lookup, %d starts retried at the lookup cap\n", found, len(ph.w), float64(q)/float64(n), float64(f)/float64(n), ph.busy)
 		}
 		if lt != nil {
 			found = 0
@@ -215,7 +225,7 @@ func externalIP(seeds []netip.AddrPort) netip.Addr {
 }
 
 // tune holds the measured warren node's lookup settings from the flags
-// (zero: default); the storer node always uses the defaults.
+// (zero: default); the storer node uses the defaults but for the lookup cap.
 var tune dht.Config
 
 type warren struct{ n *driver.Node }
@@ -270,11 +280,11 @@ func (w *warren) store(n, concurrency int) []krpc.NodeID {
 			var b [20]byte
 			_, _ = crand.Read(b[:])
 			v := append([]byte("20:"), b[:]...)
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
 			var t krpc.NodeID
 			var done dht.PutDone
-			err := untilAdmitted(ctx, func() error {
+			err := untilAdmitted(func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
 				var err error
 				t, done, err = w.n.Put(ctx, v)
 				return err
@@ -301,11 +311,11 @@ func (w *warren) gets(targets []krpc.NodeID, concurrency int) []lookup {
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
 			var g dht.GetDone
 			var elapsed time.Duration
-			err := untilAdmitted(ctx, func() error {
+			err := untilAdmitted(func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
 				began := time.Now()
 				var err error
 				g, err = w.n.GetItem(ctx, t)
@@ -317,7 +327,9 @@ func (w *warren) gets(targets []krpc.NodeID, concurrency int) []lookup {
 				return
 			}
 			// First and settled are offsets from the lookup's start inside
-			// the event loop; shift them onto the same wall-clock basis.
+			// the event loop; shift them onto the same wall-clock basis. The
+			// shift also holds the result's delivery back to us, so both
+			// read a few milliseconds late.
 			queued := elapsed - g.Timing.Total
 			ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 			out[i] = lookup{ms: ms(elapsed), first: ms(g.Timing.First + queued), settled: ms(g.Timing.Settled + queued),
@@ -328,21 +340,24 @@ func (w *warren) gets(targets []krpc.NodeID, concurrency int) []lookup {
 	return out
 }
 
-// untilAdmitted runs f, retrying while the node is at its lookup cap
-// (ErrBusy, returned at once before any lookup starts): internal lookups
-// such as bucket refreshes can fill all but a few slots, and a refused
-// start is not a lookup failure.
-func untilAdmitted(ctx context.Context, f func() error) error {
+// busyRetries counts starts refused with ErrBusy, reported with the results
+// so throttling by the node's lookup cap shows.
+var busyRetries atomic.Int64
+
+// untilAdmitted runs f, retrying for up to a minute while the node is at its
+// lookup cap (ErrBusy, returned at once before any lookup starts): internal
+// lookups such as bucket refreshes can fill all but a few slots, and a
+// refused start is not a lookup failure. f sets its own timeout for the
+// attempt that runs, so waiting here doesn't shorten it.
+func untilAdmitted(f func() error) error {
+	deadline := time.Now().Add(time.Minute)
 	for {
 		err := f()
-		if !errors.Is(err, dht.ErrBusy) {
+		if !errors.Is(err, dht.ErrBusy) || time.Now().After(deadline) {
 			return err
 		}
-		select {
-		case <-time.After(50 * time.Millisecond):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		busyRetries.Add(1)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
