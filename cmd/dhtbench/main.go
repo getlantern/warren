@@ -18,6 +18,7 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -77,12 +78,7 @@ func main() {
 	// Learn our address before starting either measured node, so both warm
 	// up for the same time.
 	ip := externalIP(seeds)
-	// Room for every get and every internal lookup (refresh, republish),
-	// which may fill all but 4 slots, so gets don't fail with ErrBusy.
-	lookupCap := 2**concurrency + 16
-	measured := tune
-	measured.MaxLookups = max(measured.MaxLookups, lookupCap)
-	w := startWarren(seeds, ip, measured)
+	w := startWarren(seeds, ip, tune)
 	var lt *libtorrent
 	if *python != "" {
 		lt = startLibtorrent(*python, *script, *warmup, *concurrency, seeds)
@@ -96,7 +92,7 @@ func main() {
 
 	// Items to find, stored by a separate node on the K nodes closest to
 	// each, so neither measured node has walked toward them before.
-	storer := startWarren(seeds, ip, dht.Config{MaxLookups: lookupCap})
+	storer := startWarren(seeds, ip, dht.Config{})
 	storer.warm(*warmup / 2)
 	hits := storer.store(*lookups, *concurrency)
 	_ = storer.n.Close()
@@ -276,7 +272,13 @@ func (w *warren) store(n, concurrency int) []krpc.NodeID {
 			v := append([]byte("20:"), b[:]...)
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			t, done, err := w.n.Put(ctx, v)
+			var t krpc.NodeID
+			var done dht.PutDone
+			err := untilAdmitted(ctx, func() error {
+				var err error
+				t, done, err = w.n.Put(ctx, v)
+				return err
+			})
 			if err != nil {
 				log.Printf("storer: put: %v", err)
 			}
@@ -301,20 +303,47 @@ func (w *warren) gets(targets []krpc.NodeID, concurrency int) []lookup {
 			defer func() { <-sem }()
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			began := time.Now()
-			g, err := w.n.GetItem(ctx, t)
-			elapsed := time.Since(began) // wall clock around the call, as for libtorrent
+			var g dht.GetDone
+			var elapsed time.Duration
+			err := untilAdmitted(ctx, func() error {
+				began := time.Now()
+				var err error
+				g, err = w.n.GetItem(ctx, t)
+				elapsed = time.Since(began) // wall clock around the call, as for libtorrent
+				return err
+			})
 			if err != nil {
 				out[i] = lookup{ms: -1}
 				return
 			}
+			// First and settled are offsets from the lookup's start inside
+			// the event loop; shift them onto the same wall-clock basis.
+			queued := elapsed - g.Timing.Total
 			ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
-			out[i] = lookup{ms: ms(elapsed), first: ms(g.Timing.First), settled: ms(g.Timing.Settled),
+			out[i] = lookup{ms: ms(elapsed), first: ms(g.Timing.First + queued), settled: ms(g.Timing.Settled + queued),
 				queried: g.Queried, failures: g.Failures, responded: g.Timing.First > 0, found: g.Value != nil}
 		})
 	}
 	wg.Wait()
 	return out
+}
+
+// untilAdmitted runs f, retrying while the node is at its lookup cap
+// (ErrBusy, returned at once before any lookup starts): internal lookups
+// such as bucket refreshes can fill all but a few slots, and a refused
+// start is not a lookup failure.
+func untilAdmitted(ctx context.Context, f func() error) error {
+	for {
+		err := f()
+		if !errors.Is(err, dht.ErrBusy) {
+			return err
+		}
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 type ltMsg struct {

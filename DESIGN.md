@@ -765,28 +765,33 @@ alpha and timeouts for experiments. All nodes share the host's public
 address, and Mainline nodes keep one ID per address in their tables, so
 remote tables may hold only one of them; the comparison is between nodes
 that face the network the same way, not a clean-room benchmark. Baseline
-(100 lookups a phase, 4 in flight, nearest-rank percentiles, so p99 is the
-second-worst lookup):
+(100 lookups a phase, 4 in flight, nearest-rank percentiles; hit times
+count only found values, and with under 100 of them p99 is the worst):
 
 | | warren | libtorrent |
 |---|---|---|
-| hit, p50 / p90 / p99 | 1,038 / 3,341 / 6,469 ms | 418 / 678 / 1,061 ms |
-| miss, p50 | 6.7 s | 18.2 s |
-| routing table at 60 s | 110 nodes | 64 nodes |
+| hit, p50 / p90 / worst | 951 / 3,345 / 9,892 ms | 416 / 670 / 2,384 ms |
+| hits found | 98 of 100 | 99 of 100 |
+| miss, p50 | 7.3 s | 18.2 s |
+| routing table at 60 s | 103 nodes | 52 nodes |
+
+A run before the last fixes to the harness measured the same shape (hit p50
+1,038 against 418 ms, p90 3,341 against 678 ms).
 
 warren's first response comes at about 70 to 180 ms, but about half the
 queries a miss sends fail (14 of 30 a lookup: timeouts, plus the few replies
 rejected for the wrong ID or an error), and with at most 6 queries in flight
 and a fixed 1 s before a slow query stops counting as active, a few dead
 nodes stall a lookup until the 3 s timeout. In an earlier warren-only run of
-four variants side by side (whose default variant measured a hit p50, p90
-and worst of 1.07, 3.8 and 7.6 s), raising the in-flight cap to 16 and the
+four variants side by side (computed with an earlier percentile formula; its
+default variant measured a hit p50, p90 and worst of 1.07, 3.8 and 7.6 s),
+raising the in-flight cap to 16 and the
 short timeout to 300 ms together cut the p90 to 1.7 s and the worst to 2.8 s;
 neither alone helped much. The hit median, about 0.9 to 1.1 s across runs
-against libtorrent's 0.42 to 0.47 s, is unchanged by tuning: about 12 queries a hit
+against libtorrent's 0.42 s, is unchanged by tuning: about 12 queries a hit
 points at hop count and routing-table quality. On a miss warren
-concludes sooner than libtorrent but still spends about 1.8 s past the
-moment its K closest settled. Live numbers vary run to run.
+concludes sooner than libtorrent but still spends about 2 s past the moment
+its K closest settled. Live numbers vary run to run.
 
 CPU, from benchmarks: decoding a response with 8 nodes takes 1.1 µs and 9
 allocations, encoding one 0.3 µs and 12; answering a `find_node` or
