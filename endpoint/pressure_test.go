@@ -3,6 +3,8 @@ package endpoint
 import (
 	"context"
 	"errors"
+	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -95,4 +97,59 @@ func TestRefusingNewConnections(t *testing.T) {
 		t.Fatalf("a live session couldn't migrate while the provider refuses: %v", err)
 	}
 	ping(t, out)
+}
+
+func punchedLoopback(t *testing.T) punched {
+	t.Helper()
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return punched{sock: c, remote: netip.MustParseAddrPort("127.0.0.1:9")}
+}
+
+// A punch that finishes after refusing began adds no connection, so a
+// CloseAll after SetRefusing(true) leaves none behind.
+func TestRefusingDropsLateConnections(t *testing.T) {
+	e := &Endpoint{}
+	e.SetRefusing(true)
+	pd := punchedLoopback(t)
+	defer pd.sock.Close()
+	if c := e.newConn(pd, [32]byte{1}, []byte("secret-secret-secret"), nil); c != nil || e.Connections() != 0 {
+		t.Fatal("a connection punched while refusing was registered")
+	}
+	e.SetRefusing(false)
+	if c := e.newConn(pd, [32]byte{1}, []byte("secret-secret-secret"), nil); c == nil || e.Connections() != 1 {
+		t.Fatal("a connection wasn't registered once refusing ended")
+	}
+}
+
+// Accept never returns a connection shed while it waited, and a shed one
+// doesn't hold its queue slot against a fresh one.
+func TestAcceptSkipsShedConnections(t *testing.T) {
+	e := &Endpoint{accept: make(chan *Conn, 1), done: make(chan struct{})}
+	conn := func(b byte) *Conn {
+		c := e.newConn(punchedLoopback(t), [32]byte{b}, []byte("secret-secret-secret"), nil)
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	shed, fresh := conn(1), conn(2)
+	e.enqueue(shed)
+	e.CloseOldest(1)
+	e.enqueue(fresh) // the queue is full of a closed connection
+	if fresh.p.isClosed() {
+		t.Fatal("a shed connection's queue slot cost a fresh connection")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if got, err := e.Accept(ctx); err != nil || got != fresh {
+		t.Fatalf("Accept returned %p, %v; want the fresh connection", got, err)
+	}
+	e.enqueue(conn(3))
+	e.CloseAll()
+	short, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	if got, err := e.Accept(short); err == nil {
+		t.Fatalf("Accept returned shed connection %p", got)
+	}
 }

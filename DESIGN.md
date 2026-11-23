@@ -571,7 +571,10 @@ connection's memory is its protocol's receive buffers, freed when the layer
 above sees the `Conn` close; the DHT, a fraction of a MiB, keeps running, so
 the phone stays reachable. While refusing, `Connect` fails with
 `ErrRefusing` and a caller's offer is answered at once, empty, so it fails
-fast; a resume still moves a live session.
+fast; a punch already in flight adds no connection either, so
+`SetRefusing(true)` then `CloseAll` leaves none. A resume still moves a live
+session. Connections shed while waiting for `Accept` are skipped and give
+up their queue slots.
 
 **Shaper interface.** `hy2.Shaper` (wrap a socket, declare per-packet overhead,
 optionally report Don't-Fragment) separates the transport from the

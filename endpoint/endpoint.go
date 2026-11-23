@@ -624,13 +624,47 @@ func (e *Endpoint) Listen(ctx context.Context, priv ed25519.PrivateKey) error {
 }
 
 func (e *Endpoint) Accept(ctx context.Context) (*Conn, error) {
+	for {
+		select {
+		case c := <-e.accept:
+			if c.p.isClosed() {
+				continue // shed (CloseOldest, CloseAll) while it waited
+			}
+			return c, nil
+		case <-e.done:
+			return nil, ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// enqueue hands an inbound connection to Accept. When the queue is full it
+// first drops connections closed while they waited, which would otherwise
+// hold their slots, and closes c only if there is still no room.
+func (e *Endpoint) enqueue(c *Conn) {
 	select {
-	case c := <-e.accept:
-		return c, nil
-	case <-e.done:
-		return nil, ErrClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case e.accept <- c:
+		return
+	default:
+	}
+	for range len(e.accept) {
+		select {
+		case q := <-e.accept:
+			if !q.p.isClosed() {
+				select {
+				case e.accept <- q:
+				default:
+					_ = q.Close()
+				}
+			}
+		default:
+		}
+	}
+	select {
+	case e.accept <- c:
+	default:
+		_ = c.Close() // nobody is accepting
 	}
 }
 
@@ -682,7 +716,12 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	if err != nil {
 		return nil, err
 	}
-	return e.newConn(pd, peer, secret, identity), nil
+	c := e.newConn(pd, peer, secret, identity)
+	if c == nil {
+		pd.sock.Close()
+		return nil, ErrRefusing // refusing began while we punched
+	}
+	return c, nil
 }
 
 type connKey struct {
@@ -701,7 +740,9 @@ type punched struct {
 
 // newConn wraps a punched path as a Conn and registers it, so a resume
 // offer, or Rebind for an outbound one, can move it to another path.
-// identity is set only for outbound connections.
+// identity is set only for outbound connections. While the endpoint refuses
+// new connections it registers nothing and returns nil; the caller closes
+// the socket.
 func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed25519.PrivateKey) *Conn {
 	c := &Conn{
 		Remote: pd.remote, PeerKey: peer, Secret: secret, Relayed: pd.relayed,
@@ -709,6 +750,12 @@ func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed
 		outbound: identity != nil, identity: identity, created: time.Now(),
 	}
 	e.connsMu.Lock()
+	if e.refusing.Load() {
+		// Refusing began while this connection punched: the host is
+		// shedding connections, so don't add one behind its back.
+		e.connsMu.Unlock()
+		return nil
+	}
 	if e.all == nil {
 		e.all = map[*Conn]struct{}{}
 	}
@@ -1338,11 +1385,11 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 		return
 	}
 	c := e.newConn(pd, in.Caller, offer.Secret, nil)
-	select {
-	case e.accept <- c:
-	default:
-		_ = c.Close() // nobody is accepting
+	if c == nil {
+		pd.sock.Close() // refusing began while we punched
+		return
 	}
+	e.enqueue(c)
 }
 
 // answerEmpty answers an offer we won't punch for with an empty offer, so

@@ -53,6 +53,13 @@ func (e *Endpoint) CloseAll() int {
 
 // SetRefusing turns refusing new connections on or off. While on, Connect
 // fails with ErrRefusing and a caller's offer is answered at once, empty,
-// so it fails fast instead of waiting out signaling. Live connections keep
-// migrating: a resume moves a session that already exists.
-func (e *Endpoint) SetRefusing(on bool) { e.refusing.Store(on) }
+// so it fails fast instead of waiting out signaling. A punch already in
+// flight when refusing begins doesn't add its connection either (its
+// socket is closed, and Connect fails with ErrRefusing), so a CloseAll
+// after SetRefusing(true) leaves none. Live connections keep migrating: a
+// resume moves a session that already exists.
+func (e *Endpoint) SetRefusing(on bool) {
+	e.connsMu.Lock() // ordered against newConn's registration
+	e.refusing.Store(on)
+	e.connsMu.Unlock()
+}

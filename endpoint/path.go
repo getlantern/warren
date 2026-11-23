@@ -183,6 +183,12 @@ func (p *path) sent(gen int) {
 	p.waiting.Store(now)
 }
 
+func (p *path) isClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closed
+}
+
 func (p *path) close() error {
 	p.mu.Lock()
 	if p.closed {
