@@ -348,8 +348,9 @@ can reach the application afterwards; layers above drop them, and
 `endpoint.Conn.Recv` skips them.
 
 **Still to come:** PCP/NAT-PMP/UPnP (Tailscale's `portmapper` is
-a candidate); low-TTL priming; filtering-aware planning. Check the iOS
-`RLIMIT_NOFILE` soft limit before relying on 64-socket fans.
+a candidate); low-TTL priming; filtering-aware planning. Extra sockets come
+from the endpoint's open-file budget (see *Open files* under the data
+plane).
 
 ## Connecting by public key (`endpoint/`)
 
@@ -531,19 +532,49 @@ derive from the session secret via `hy2.FromSecret`.
 capped to 1 MiB and 2.5 MiB through `QUICOptions`, with no fork needed. The
 engine is already linked into the Network Extension through lantern-box.
 
-Measured Go heap and stack growth (`TestPhoneMemory`, in-process; a device
-build should confirm it):
+Measured Go heap and stack growth (`TestPhoneMemory`, in-process), on macOS
+and built for iOS and run in the iOS simulator (`tools/iossim/run.sh`):
 
-| Phone state | Growth |
-|---|---|
-| read-only DHT node, bootstrapped, idle | 0.04 MiB |
-| listening as a provider | 0.26 MiB |
-| 64 MiB transfer behind a slow reader, capped windows, both ends | 7.6 MiB peak |
-| same, hysteria2's default windows | 23.6 MiB peak |
+| Phone state | macOS | iOS simulator |
+|---|---|---|
+| read-only DHT node, bootstrapped, idle | 0.04 MiB | 0.06 MiB |
+| listening as a provider | 0.26 MiB | 0.22 MiB |
+| 64 MiB transfer behind a slow reader, capped windows, both ends | 7.6 MiB peak | 7.4 MiB peak |
+| same, hysteria2's default windows | 23.6 MiB peak | 26.2 MiB peak |
+
+Every package also builds for an iOS device (`GOOS=ios GOARCH=arm64`, the
+iPhoneOS SDK). These are Go heap and stack figures, what warren allocates; the
+process's `phys_footprint`, which jetsam judges, also counts the runtime and
+native memory, and needs a device.
 
 The DHT is effectively free. The transfer cost is the receive buffer, about
 3.8 MiB per end with caps versus about 12 MiB with the defaults, so **the caps
 are mandatory**. They still allow about 100 Mbps at 200 ms round-trip time.
+
+**Open files.** The open and birthday strategies want up to 64 extra sockets
+a punch, and with `MaxInbound` inbound punches over two families an
+unbounded endpoint could ask for over a thousand descriptors, in a process
+that shares its open-file limit with the VPN's datapath. The endpoint keeps
+a budget of extra punch sockets (`MaxPunchSockets`: by default a quarter of
+the soft `RLIMIT_NOFILE`, between 16 and 512, read at run time). A punch
+reserves sockets when it plans (`punch.Config.Reserve`), only for a strategy
+that needs them, and returns them when the punch ends. Granted fewer, it
+punches with fewer; granted none, it falls back to its relay, or probes
+from its own socket alone. The simulator shares the Mac's kernel limits, so
+a device's limit is still to be read.
+
+**Memory pressure.** A memory monitor in the host (radiance's `memmon`
+closes the oldest connections at its soft level, all of them at its hard
+level, and refuses new ones in between) reaches warren's connections through
+`Endpoint.Connections`, `CloseOldest`, `CloseAll` and `SetRefusing`. A
+connection's memory is its protocol's receive buffers, freed when the layer
+above sees the `Conn` close; the DHT, a fraction of a MiB, keeps running, so
+the phone stays reachable. While refusing, `Connect` fails with
+`ErrRefusing` and a caller's offer is answered at once, empty, so it fails
+fast; a punch already in flight adds no connection either, so
+`SetRefusing(true)` then `CloseAll` leaves none. A resume still moves a live
+session. Connections shed while waiting for `Accept` are skipped and give
+up their queue slots.
 
 **Shaper interface.** `hy2.Shaper` (wrap a socket, declare per-packet overhead,
 optionally report Don't-Fragment) separates the transport from the
@@ -770,4 +801,4 @@ and carrier allocator. The design therefore splits measurement in two:
 | 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
 | 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
-| 6 | iOS integration, memory budget, network-change rebind | Rebind and live-session migration built (see *Network changes*). Stall detection built: a caller migrates on its own when the provider goes silent. Next: iOS integration and memory budget |
+| 6 | iOS integration, memory budget, network-change rebind | Rebind and live-session migration built (see *Network changes*). Stall detection built: a caller migrates on its own when the provider goes silent. iOS: builds for device; memory measured in the simulator; open-file budget for punch sockets; memory-pressure hooks for the host's monitor. Next: wiring into radiance and lantern-box, and device measurements (`phys_footprint`, `RLIMIT_NOFILE`) |

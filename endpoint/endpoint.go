@@ -57,9 +57,15 @@ type Config struct {
 	// connection goes through a relay router.
 	RelayOnly bool
 	// MaxInbound bounds concurrent inbound punches: each holds sockets.
-	MaxInbound    int
-	PunchDeadline time.Duration
-	GatherWait    time.Duration
+	MaxInbound int
+	// MaxPunchSockets bounds the extra sockets all punches in flight hold
+	// at once (the open and birthday strategies use up to
+	// punch.MaxExtraSockets each); a punch that can't get them tries with
+	// fewer, then falls back to its relay. Zero means a quarter of the
+	// process's soft open-file limit, between 16 and 512.
+	MaxPunchSockets int
+	PunchDeadline   time.Duration
+	GatherWait      time.Duration
 	// StallTimeout is how long the provider may stay silent after this
 	// endpoint sent it something before an outbound connection counts as
 	// stalled and migrates on its own (5 seconds if zero; negative turns
@@ -114,6 +120,8 @@ type Conn struct {
 	// outstanding.
 	moveReqs atomic.Uint64
 	moveDone atomic.Uint64
+
+	created time.Time // when the connection was first punched
 
 	resumesMu sync.Mutex
 	resumes   []time.Time // inbound: recent resumes, for their budget
@@ -211,12 +219,23 @@ type Endpoint struct {
 	rebindReqs atomic.Uint64
 	rebindDone atomic.Uint64
 
+	sockets sockets // extra punch sockets in flight (Config.MaxPunchSockets)
+
+	refusing  atomic.Bool // SetRefusing
+	enqueueMu sync.Mutex  // serializes handing inbound connections to Accept
+	// testHookRequeue, if set, runs while enqueue holds a live connection
+	// out of the queue, so tests can race another producer into its slot.
+	testHookRequeue func()
+
 	connsMu sync.Mutex
 	// Live connections by peer key and resume ID, inbound and outbound
 	// apart: an inbound resume ID derives from a secret the caller chose, so
 	// it must never select an outbound slot, or another peer's.
 	inConns  map[connKey]*Conn
 	outConns map[connKey]*Conn
+	// all is every open connection, including one a repeated secret kept
+	// out of the registry, for the pressure methods.
+	all map[*Conn]struct{}
 
 	offersMu sync.Mutex
 	offers   map[[32]byte]*offerEntry // recent offers, by caller and secret
@@ -387,6 +406,9 @@ func New(cfg Config) (*Endpoint, error) {
 	if cfg.StallTimeout == 0 {
 		cfg.StallTimeout = defaultStallTimeout
 	}
+	if cfg.MaxPunchSockets == 0 {
+		cfg.MaxPunchSockets = defaultPunchSockets()
+	}
 	var node *driver.Node
 	var err error
 	if cfg.DHTAddr6 != "" {
@@ -411,6 +433,7 @@ func New(cfg Config) (*Endpoint, error) {
 	}
 	e := &Endpoint{cfg: cfg, node: node, accept: make(chan *Conn, cfg.MaxInbound), slots: make(chan struct{}, cfg.MaxInbound), done: make(chan struct{})}
 	e.stallTimeout.Store(int64(cfg.StallTimeout))
+	e.sockets.free = cfg.MaxPunchSockets
 	e.wg.Go(e.events)
 	return e, nil
 }
@@ -605,13 +628,54 @@ func (e *Endpoint) Listen(ctx context.Context, priv ed25519.PrivateKey) error {
 }
 
 func (e *Endpoint) Accept(ctx context.Context) (*Conn, error) {
+	for {
+		select {
+		case c := <-e.accept:
+			if c.p.isClosed() {
+				continue // shed (CloseOldest, CloseAll) while it waited
+			}
+			return c, nil
+		case <-e.done:
+			return nil, ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// enqueue hands an inbound connection to Accept. When the queue is full it
+// first drops connections closed while they waited, which would otherwise
+// hold their slots, and closes c only if there is still no room. Producers
+// are serialized, so while one takes live connections out to put them back
+// only Accept can change the queue, and only by making room.
+func (e *Endpoint) enqueue(c *Conn) {
+	e.enqueueMu.Lock()
+	defer e.enqueueMu.Unlock()
 	select {
-	case c := <-e.accept:
-		return c, nil
-	case <-e.done:
-		return nil, ErrClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case e.accept <- c:
+		return
+	default:
+	}
+	for range len(e.accept) {
+		select {
+		case q := <-e.accept:
+			if !q.p.isClosed() {
+				if e.testHookRequeue != nil {
+					e.testHookRequeue()
+				}
+				select {
+				case e.accept <- q:
+				default:
+					_ = q.Close()
+				}
+			}
+		default:
+		}
+	}
+	select {
+	case e.accept <- c:
+	default:
+		_ = c.Close() // nobody is accepting
 	}
 }
 
@@ -623,6 +687,10 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	if e.closed {
 		e.mu.Unlock()
 		return nil, ErrClosed
+	}
+	if e.refusing.Load() {
+		e.mu.Unlock()
+		return nil, ErrRefusing
 	}
 	e.wg.Add(1)
 	e.mu.Unlock()
@@ -659,7 +727,12 @@ func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, pee
 	if err != nil {
 		return nil, err
 	}
-	return e.newConn(pd, peer, secret, identity), nil
+	c := e.newConn(pd, peer, secret, identity)
+	if c == nil {
+		pd.sock.Close()
+		return nil, ErrRefusing // refusing began while we punched
+	}
+	return c, nil
 }
 
 type connKey struct {
@@ -678,14 +751,26 @@ type punched struct {
 
 // newConn wraps a punched path as a Conn and registers it, so a resume
 // offer, or Rebind for an outbound one, can move it to another path.
-// identity is set only for outbound connections.
+// identity is set only for outbound connections. While the endpoint refuses
+// new connections it registers nothing and returns nil; the caller closes
+// the socket.
 func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed25519.PrivateKey) *Conn {
 	c := &Conn{
 		Remote: pd.remote, PeerKey: peer, Secret: secret, Relayed: pd.relayed,
 		p: newPath(pd.sock, pd.remote), e: e, resume: resumeID(secret),
-		outbound: identity != nil, identity: identity,
+		outbound: identity != nil, identity: identity, created: time.Now(),
 	}
 	e.connsMu.Lock()
+	if e.refusing.Load() {
+		// Refusing began while this connection punched: the host is
+		// shedding connections, so don't add one behind its back.
+		e.connsMu.Unlock()
+		return nil
+	}
+	if e.all == nil {
+		e.all = map[*Conn]struct{}{}
+	}
+	e.all[c] = struct{}{}
 	m := &e.inConns
 	if c.outbound {
 		m = &e.outConns
@@ -715,6 +800,7 @@ func (e *Endpoint) forget(c *Conn) {
 	if m[c.key()] == c {
 		delete(m, c.key())
 	}
+	delete(e.all, c)
 }
 
 // resumable returns the live inbound connection a resume ID names, if the
@@ -846,6 +932,19 @@ type leg struct {
 	conn  *net.UDPConn
 	id    int32         // this leg's claim token, when claim is set
 	claim *atomic.Int32 // shared by a caller's legs; nil for a responder
+	// granted is how many extra sockets this leg's session reserved from
+	// budget; they go back once the punch is over.
+	granted atomic.Int64
+	budget  *sockets
+}
+
+// returnSockets gives the leg's reserved extra sockets back to the
+// endpoint's budget, once: the runner has closed them (or kept the winner,
+// which is then a connection's socket, not a punch's).
+func (l *leg) returnSockets() {
+	if n := l.granted.Swap(0); n > 0 {
+		l.budget.put(int(n))
+	}
 }
 
 // release gives up this leg's claim, so another family can commit, unless
@@ -860,7 +959,7 @@ func claimer(owner *atomic.Int32, id int32) func() bool {
 	return func() bool { return owner.CompareAndSwap(0, id) || owner.Load() == id }
 }
 
-func (l *leg) abort() { l.r.Abort(); l.conn.Close() }
+func (l *leg) abort() { l.r.Abort(); l.conn.Close(); l.returnSockets() }
 
 func abortAll(legs []*leg) {
 	for _, l := range legs {
@@ -1000,6 +1099,7 @@ func (e *Endpoint) race(ctx context.Context, legs []*leg, remote punch.Offer, he
 				}
 			}
 			c, err := e.finish(ctx, l.r, l.conn, fr)
+			l.returnSockets() // Punch has closed every extra socket but a winner
 			if err != nil {
 				l.release() // a failed leg mustn't block the other family
 			}
@@ -1085,14 +1185,20 @@ func (e *Endpoint) prepare(ctx context.Context, pc punch.Config, v6 bool) (*leg,
 	var seed [32]byte
 	crand.Read(seed[:])
 	pc.Rand = rand.New(rand.NewChaCha8(seed))
-	sess := punch.New(pc)
-	r := punch.NewRunner(sess, conn)
-	if err := r.Gather(ctx, reflectors, e.cfg.GatherWait); err != nil {
-		r.Abort()
+	l := &leg{v6: v6, conn: conn, budget: &e.sockets}
+	pc.Reserve = func(want int) int {
+		n := e.sockets.take(want)
+		l.granted.Add(int64(n))
+		return n
+	}
+	l.sess = punch.New(pc)
+	l.r = punch.NewRunner(l.sess, conn)
+	if err := l.r.Gather(ctx, reflectors, e.cfg.GatherWait); err != nil {
+		l.r.Abort()
 		conn.Close()
 		return nil, err
 	}
-	return &leg{v6: v6, sess: sess, r: r, conn: conn}, nil
+	return l, nil
 }
 
 func (e *Endpoint) finish(ctx context.Context, r *punch.Runner, conn *net.UDPConn, remote punch.Offer) (punched, error) {
@@ -1159,6 +1265,15 @@ func (e *Endpoint) incoming(in dht.Incoming) {
 			})
 			return
 		}
+	} else if e.refusing.Load() {
+		// Refusing new connections: answer at once, empty, so the caller
+		// fails fast rather than waiting out signaling.
+		e.wg.Go(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), e.cfg.GatherWait)
+			defer cancel()
+			e.answerEmpty(ctx, in, entry)
+		})
+		return
 	}
 	select {
 	case e.slots <- struct{}{}:
@@ -1281,11 +1396,11 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 		return
 	}
 	c := e.newConn(pd, in.Caller, offer.Secret, nil)
-	select {
-	case e.accept <- c:
-	default:
-		_ = c.Close() // nobody is accepting
+	if c == nil {
+		pd.sock.Close() // refusing began while we punched
+		return
 	}
+	e.enqueue(c)
 }
 
 // answerEmpty answers an offer we won't punch for with an empty offer, so
