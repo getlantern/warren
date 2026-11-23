@@ -863,6 +863,7 @@ func (n *Node) abandon(now time.Time, t *txn) {
 		l := t.lookup
 		if c := l.byAddr(t.to); c != nil && c.state == inflight {
 			c.state = failed
+			l.failures++ // not the peer's fault, but the lookup got no answer
 		}
 		n.step(now, l)
 	case txPut:

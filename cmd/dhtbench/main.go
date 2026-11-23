@@ -1,12 +1,15 @@
 // Command dhtbench measures warren's DHT on live Mainline next to
 // libtorrent's, on the same host at the same time: how fast each fills its
-// routing table, and how long an immutable get to a random target (a full
-// walk to the target's closest nodes) takes.
+// routing table, how long an immutable get takes to find an item a third
+// node stored (a hit, what finding a provider's record costs), and how long
+// one to a random target takes (a miss, a full walk to its closest nodes).
 //
 //	go run ./cmd/dhtbench -python /path/to/venv/bin/python -lookups 200
 //
-// Without -python only warren runs. Both nodes are full (not read-only)
-// nodes, bootstrapped from the public routers.
+// Without -python only warren runs; -no-miss skips the miss phase, and
+// -inflight, -alpha, -short and -timeout tune the measured warren node.
+// Both nodes are full (not read-only) nodes, bootstrapped from the public
+// routers.
 package main
 
 import (
@@ -61,16 +64,24 @@ func main() {
 	flag.DurationVar(&tune.ShortTimeout, "short", 0, "warren: a query stops counting as active after this (0: default)")
 	flag.DurationVar(&tune.QueryTimeout, "timeout", 0, "warren: a query fails after this (0: default)")
 	flag.Parse()
+	if *concurrency < 1 || *lookups < 1 {
+		log.Fatal("-concurrency and -lookups must be at least 1")
+	}
 
 	seeds := resolve(natprobe.DefaultBootstrap)
 	if len(seeds) == 0 {
 		log.Fatal("no bootstrap router resolved")
 	}
+	// Learn our address before starting either measured node, so both warm
+	// up for the same time.
+	ip := externalIP(seeds)
+	measured := tune
+	measured.MaxLookups = max(measured.MaxLookups, *concurrency+16) // gets never hit ErrBusy
+	w := startWarren(seeds, ip, measured)
 	var lt *libtorrent
 	if *python != "" {
 		lt = startLibtorrent(*python, *script, *warmup, *concurrency)
 	}
-	w := startWarren(seeds)
 	defer func() { _ = w.n.Close() }()
 	wTable := w.warm(*warmup)
 	var ltTable []tableSample
@@ -80,7 +91,7 @@ func main() {
 
 	// Items to find, stored by a separate node on the K nodes closest to
 	// each, so neither measured node has walked toward them before.
-	storer := startWarren(seeds)
+	storer := startWarren(seeds, ip, dht.Config{})
 	storer.warm(*warmup / 2)
 	hits := storer.store(*lookups, *concurrency)
 	_ = storer.n.Close()
@@ -110,22 +121,29 @@ func main() {
 		lt.quit()
 	}
 
-	fmt.Printf("\nrouting table size during warm-up (nodes)\n%8s %10s %12s\n", "at", "warren", "libtorrent")
+	fmt.Printf("\nrouting table size during warm-up (nodes)\n%8s %10s %16s\n", "at", "warren", "libtorrent (at)")
 	for i, s := range wTable {
 		l := "-"
 		if i < len(ltTable) {
-			l = strconv.Itoa(ltTable[i].nodes)
+			l = fmt.Sprintf("%d (%ds)", ltTable[i].nodes, ltTable[i].at)
 		}
-		fmt.Printf("%7ds %10d %12s\n", s.at, s.nodes, l)
+		fmt.Printf("%7ds %10d %16s\n", s.at, s.nodes, l)
 	}
-	total := func(l lookup) float64 { return l.ms }
+	total := func(l lookup) (float64, bool) { return l.ms, true }
 	for _, ph := range phases {
 		fmt.Printf("\nimmutable get, %s: %d targets, %d in flight\n", ph.name, len(ph.targets), *concurrency)
-		report("warren total", ph.w, total)
-		report("warren first reply", ph.w, func(l lookup) float64 { return l.first })
-		report("warren K settled", ph.w, func(l lookup) float64 { return l.settled })
+		tot := total
+		if ph.name == "hit" {
+			// Time to the value: a hit that came back empty is reported as
+			// not found below, not as a latency.
+			tot = func(l lookup) (float64, bool) { return l.ms, l.found }
+		}
+		report("warren total", ph.w, tot)
+		// A lookup no node answered has no first reply or settling time.
+		report("warren first reply", ph.w, func(l lookup) (float64, bool) { return l.first, l.responded })
+		report("warren K settled", ph.w, func(l lookup) (float64, bool) { return l.settled, l.responded })
 		if lt != nil {
-			report("libtorrent total", ph.lt, total)
+			report("libtorrent total", ph.lt, tot)
 		}
 		var q, f, n, found int
 		for _, l := range ph.w {
@@ -181,10 +199,13 @@ func externalIP(seeds []netip.AddrPort) netip.Addr {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_, _ = n.Bootstrap(ctx, seeds)
+	// The bootstrap may have used up ctx; read what it collected regardless.
+	ictx, icancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer icancel()
 	var ip netip.Addr
-	_ = n.Inspect(ctx, func(d *dht.Node) {
+	_ = n.Inspect(ictx, func(d *dht.Node) {
 		for _, r := range d.Reflections() {
-			if a := r.Mapped.Addr().Unmap(); a.IsGlobalUnicast() {
+			if a := r.Mapped.Addr().Unmap(); a.IsGlobalUnicast() && !a.IsPrivate() {
 				ip = a
 			}
 		}
@@ -192,19 +213,19 @@ func externalIP(seeds []netip.AddrPort) netip.Addr {
 	return ip
 }
 
-// tune overrides the measured warren node's lookup settings (zero: default).
+// tune holds the measured warren node's lookup settings from the flags
+// (zero: default); the storer node always uses the defaults.
 var tune dht.Config
 
 type warren struct{ n *driver.Node }
 
-func startWarren(seeds []netip.AddrPort) *warren {
+func startWarren(seeds []netip.AddrPort, ip netip.Addr, cfg dht.Config) *warren {
 	id := randomID()
-	if ip := externalIP(seeds); ip.IsValid() {
+	if ip.IsValid() {
 		id = krpc.SecureID(ip, id)
 	} else {
 		log.Print("warren: no external address learned; using a random ID")
 	}
-	cfg := tune
 	cfg.ID = id
 	n, err := driver.Listen("0.0.0.0:0", cfg)
 	if err != nil {
@@ -222,11 +243,16 @@ func (w *warren) warm(warmup time.Duration) []tableSample {
 		return s
 	}
 	var table []tableSample
-	for next := time.Duration(0); time.Since(start) < warmup; next += 5 * time.Second {
-		time.Sleep(time.Until(start.Add(next)))
+	sample := func() {
 		table = append(table, tableSample{int(time.Since(start).Round(time.Second).Seconds()), size()})
 	}
-	return append(table, tableSample{int(time.Since(start).Round(time.Second).Seconds()), size()})
+	for next := time.Duration(0); next < warmup; next += 5 * time.Second {
+		time.Sleep(time.Until(start.Add(next)))
+		sample()
+	}
+	time.Sleep(time.Until(start.Add(warmup)))
+	sample()
+	return table
 }
 
 // store puts n random items and returns the targets of those stored on at
@@ -323,10 +349,27 @@ func startLibtorrent(python, script string, warmup time.Duration, concurrency in
 	return l
 }
 
+// next returns the helper's next message, giving up (and killing it) if it
+// goes silent: libtorrent's own gets time out at 60 s.
+func (l *libtorrent) next(phase string) (ltMsg, bool) {
+	select {
+	case m, ok := <-l.lines:
+		return m, ok
+	case <-time.After(5 * time.Minute):
+		_ = l.cmd.Process.Kill()
+		log.Fatalf("libtorrent stalled during %s", phase)
+		return ltMsg{}, false
+	}
+}
+
 // ready waits out libtorrent's warm-up and returns its table samples.
 func (l *libtorrent) ready() []tableSample {
 	var table []tableSample
-	for m := range l.lines {
+	for {
+		m, ok := l.next("warm-up")
+		if !ok {
+			break
+		}
 		switch m.T {
 		case "table":
 			table = append(table, tableSample{m.At, m.Nodes})
@@ -348,7 +391,11 @@ func (l *libtorrent) batch(label string, targets []krpc.NodeID) []lookup {
 		log.Fatalf("libtorrent: %v", err)
 	}
 	var out []lookup
-	for m := range l.lines {
+	for {
+		m, ok := l.next(label)
+		if !ok {
+			break
+		}
 		switch m.T {
 		case "lookup":
 			out = append(out, lookup{ms: m.Ms, found: m.Found})
@@ -366,7 +413,7 @@ func (l *libtorrent) quit() {
 	_ = l.cmd.Wait()
 }
 
-func report(name string, ls []lookup, f func(lookup) float64) {
+func report(name string, ls []lookup, f func(lookup) (float64, bool)) {
 	var v []float64
 	failed := 0
 	for _, l := range ls {
@@ -374,7 +421,9 @@ func report(name string, ls []lookup, f func(lookup) float64) {
 			failed++
 			continue
 		}
-		v = append(v, f(l))
+		if x, ok := f(l); ok {
+			v = append(v, x)
+		}
 	}
 	if len(v) == 0 {
 		fmt.Printf("%-20s no results (%d failed)\n", name, failed)

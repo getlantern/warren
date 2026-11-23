@@ -23,6 +23,8 @@ def emit(o):
 
 warmup = float(sys.argv[1])
 concurrency = int(sys.argv[2])
+if concurrency < 1:
+    sys.exit('CONCURRENCY must be at least 1')
 
 s = lt.session({
     'listen_interfaces': '0.0.0.0:0',
