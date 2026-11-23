@@ -45,6 +45,12 @@ func TestPunchSocketBudget(t *testing.T) {
 		}
 		out.Close()
 		cancel()
+		caller.sockets.mu.Lock()
+		granted := caller.sockets.granted
+		caller.sockets.mu.Unlock()
+		if granted != budget {
+			t.Fatalf("budget %d: the punch was granted %d sockets", budget, granted)
+		}
 		if free := caller.sockets.take(1 << 20); free != budget {
 			t.Fatalf("budget %d: %d free after the punch", budget, free)
 		}

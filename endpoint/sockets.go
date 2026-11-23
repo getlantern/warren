@@ -9,8 +9,9 @@ import "sync"
 // process (an iOS Network Extension) that shares its open-file limit with
 // the rest of the VPN.
 type sockets struct {
-	mu   sync.Mutex
-	free int
+	mu      sync.Mutex
+	free    int
+	granted int // ever granted, for tests
 }
 
 // take reserves up to want sockets and returns how many it got.
@@ -19,6 +20,7 @@ func (s *sockets) take(want int) int {
 	defer s.mu.Unlock()
 	n := min(want, s.free)
 	s.free -= n
+	s.granted += n
 	return n
 }
 
