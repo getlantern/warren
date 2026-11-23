@@ -60,6 +60,13 @@ type Config struct {
 	MaxInbound    int
 	PunchDeadline time.Duration
 	GatherWait    time.Duration
+	// StallTimeout is how long the provider may stay silent after this
+	// endpoint sent it something before an outbound connection counts as
+	// stalled and migrates on its own (5 seconds if zero; negative turns
+	// stall detection off). Silence is measured over datagrams the
+	// application reads, so a connection that writes without ever reading
+	// should turn it off.
+	StallTimeout time.Duration
 }
 
 // Conn is a punched path to a peer, usable as a net.PacketConn whose only
@@ -70,8 +77,9 @@ type Config struct {
 // Recv, which skips the KRPC ones.
 //
 // A Conn survives a network change: Migrate (run for outbound connections
-// by Endpoint.Rebind) punches a fresh path and moves the connection onto
-// it, while Remote, Secret and everything layered above stay the same.
+// by Endpoint.Rebind, and by the stall watcher when the peer goes silent)
+// punches a fresh path and moves the connection onto it, while Remote,
+// Secret and everything layered above stay the same.
 type Conn struct {
 	// Remote is the peer's address as the connection reports it. It is the
 	// address first punched and never changes, even after Migrate moves the
@@ -109,6 +117,17 @@ type Conn struct {
 
 	resumesMu sync.Mutex
 	resumes   []time.Time // inbound: recent resumes, for their budget
+
+	// Stall migrations (outbound): one at a time, and after a failure none
+	// for the same wait before stallNext (Unix nanoseconds). The backoff
+	// belongs to the wait that failed (stallFailedGen, stallFailedWait): a
+	// new wait or path starts fresh. stallBackoff is touched only by the
+	// running stall migration.
+	stallBusy       atomic.Bool
+	stallNext       atomic.Int64
+	stallFailedGen  atomic.Int64
+	stallFailedWait atomic.Int64
+	stallBackoff    time.Duration
 }
 
 // maxResumesPerMinute bounds how often one inbound connection can be moved.
@@ -166,6 +185,9 @@ type Endpoint struct {
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	closed  bool // guards wg.Add for outbound Connects against Close's Wait
+	// stallWatching: watchStalls is running (under mu).
+	stallWatching bool
+	stallTimeout  atomic.Int64 // a time.Duration; read by the watcher
 
 	// routes reports the local addresses the default routes use; tests
 	// replace it. WatchNetwork rebinds when they change.
@@ -362,6 +384,9 @@ func New(cfg Config) (*Endpoint, error) {
 	if cfg.HeadStart == 0 {
 		cfg.HeadStart = 200 * time.Millisecond
 	}
+	if cfg.StallTimeout == 0 {
+		cfg.StallTimeout = defaultStallTimeout
+	}
 	var node *driver.Node
 	var err error
 	if cfg.DHTAddr6 != "" {
@@ -385,6 +410,7 @@ func New(cfg Config) (*Endpoint, error) {
 		}
 	}
 	e := &Endpoint{cfg: cfg, node: node, accept: make(chan *Conn, cfg.MaxInbound), slots: make(chan struct{}, cfg.MaxInbound), done: make(chan struct{})}
+	e.stallTimeout.Store(int64(cfg.StallTimeout))
 	e.wg.Go(e.events)
 	return e, nil
 }
@@ -486,7 +512,11 @@ func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 	var wg sync.WaitGroup
 	for i, c := range out {
 		wg.Go(func() {
-			if err := c.migrate(ctx, onlyUnmoved); err != nil {
+			kind := moveRequest
+			if onlyUnmoved {
+				kind = moveRetry
+			}
+			if err := c.migrate(ctx, kind, stallMark{}); err != nil {
 				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.PeerKey[:4], err)
 			}
 		})
@@ -669,6 +699,9 @@ func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed
 		(*m)[c.key()] = c
 	}
 	e.connsMu.Unlock()
+	if c.outbound {
+		e.startStallWatch()
+	}
 	return c
 }
 
@@ -694,23 +727,47 @@ func (e *Endpoint) resumable(id [16]byte, caller [32]byte) *Conn {
 
 // Migrate moves an outbound connection onto a freshly punched path, for
 // after a network change (Endpoint.Rebind calls it) or when the peer moved
-// and the connection stalled. It signals the provider again with a resume
+// and the connection stalled (the endpoint's stall watcher calls it when
+// the peer goes silent; see Config.StallTimeout). It signals the provider again with a resume
 // request derived from the connection's secret; both sides punch a new path
 // and move the connection onto it. Remote, Secret and anything layered on
 // the Conn (hysteria2, QUIC) carry on; datagrams in flight during the move
 // are lost, as on any network change.
 func (c *Conn) Migrate(ctx context.Context) error {
-	return c.migrate(ctx, false)
+	return c.migrate(ctx, moveRequest, stallMark{})
 }
 
-// migrate runs a migration. A retry adds no request of its own: it serves
-// the outstanding ones, and does nothing if a migration that held the slot
-// before it already served them, so it never replaces a working path.
-func (c *Conn) migrate(ctx context.Context, retry bool) error {
+// moveKind is why a migration runs.
+type moveKind int
+
+const (
+	// moveRequest is a caller's or Rebind's request, counted so a failure
+	// leaves it outstanding for WatchNetwork to retry.
+	moveRequest moveKind = iota
+	// moveRetry serves outstanding requests without adding one, and does
+	// nothing if a migration that held the slot before it served them.
+	moveRetry
+	// moveStall answers a silent peer. It adds no request (the stall
+	// watcher retries it, with backoff) and does nothing if, by the time it
+	// holds the slot, the wait it judged is over: the path was replaced or
+	// the peer answered, even if a fresh wait has started since.
+	moveStall
+)
+
+// stallMark identifies the wait a stall move judged: the path generation
+// and when that wait began.
+type stallMark struct {
+	gen  int
+	wait int64
+}
+
+// migrate runs a migration; stall is the wait a moveStall judged. Retries
+// and stall moves never replace a working path.
+func (c *Conn) migrate(ctx context.Context, kind moveKind, stall stallMark) error {
 	if !c.outbound {
 		return ErrNotCaller
 	}
-	if !retry {
+	if kind == moveRequest {
 		c.moveReqs.Add(1) // counted even if we give up or fail: retries rerun it
 	}
 	c.slotOnce.Do(func() { c.migrateSlot = make(chan struct{}, 1) })
@@ -720,8 +777,15 @@ func (c *Conn) migrate(ctx context.Context, retry bool) error {
 		return ctx.Err()
 	}
 	defer func() { <-c.migrateSlot }()
-	if retry && !c.unmoved() {
-		return nil
+	switch kind {
+	case moveRetry:
+		if !c.unmoved() {
+			return nil
+		}
+	case moveStall:
+		if _, _, gen := c.p.current(); gen != stall.gen || stall.wait == 0 || c.p.waiting.Load() != stall.wait {
+			return nil
+		}
 	}
 	serving := c.moveReqs.Load()
 	e := c.e

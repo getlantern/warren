@@ -651,8 +651,35 @@ handing a new connection to `Accept`. QUIC retransmits what was in flight;
 the hysteria2 password and pinned TLS stay valid because they derive from
 the original secret. `Endpoint.Rebind` migrates every outbound connection.
 A provider that moves can't migrate its inbound connections itself (the
-caller may not be listening): the caller calls `Migrate` when its session
-stalls.
+caller may not be listening): the caller notices the session stalled and
+migrates.
+
+**Stalls migrate on their own.** A path can die with no network change on
+the caller's side, so `Rebind` never runs: the provider moved, a NAT dropped
+its mapping, a relay went away. Each path notes when it sent a datagram the
+peer hasn't answered, and a stall watcher, running once a second only while
+the endpoint has outbound connections, migrates any connection whose
+provider has been silent for `StallTimeout` (5 seconds) after being sent
+something that expects an answer. QUIC acknowledges ack-eliciting packets
+within a round trip, so a live path answers in time. A bare acknowledgment
+gets no answer, so a datagram sent within a second of one arriving doesn't
+start the wait; otherwise acknowledging the provider's keepalive would make
+an idle session look stalled until our own keepalive 10 seconds later. A
+request that goes unanswered is retransmitted later than that and starts
+the wait then. A send that fails as a lost packet (no route) starts it too,
+so a path whose route vanished is judged stalled. An idle session (nothing
+sent) is never judged. Five seconds also leaves a migration time to finish
+before QUIC's 30-second idle timeout ends the session. Silence costs no
+probe packets: the session's own traffic is the probe. A failed stall
+migration backs off while the same wait goes unanswered, doubling from the
+timeout to 30 seconds (a new wait or path starts again), since a
+provider that is gone rather than moved would otherwise be signaled through
+the DHT every second until the layer above gives up. A stall move isn't
+a migration request, so a failed one isn't retried by `WatchNetwork` around
+that backoff, and one queued behind another migration does nothing once
+that migration replaced the path or the provider answered. Silence is measured
+over datagrams the application reads, so a raw connection that writes
+without reading turns detection off (negative `StallTimeout`).
 
 Resumes have their own budget, 6 a minute per connection, instead of the
 new-connection limiter's few per caller, so several sessions moving to one
@@ -743,4 +770,4 @@ and carrier allocator. The design therefore splits measurement in two:
 | 5a | Configurable shaping (glamour) | Design only, in `docs/shaping-design.md`: a spec-driven engine at `github.com/getlantern/glamour`, implementing `hy2.Shaper`. Not built yet; to be built in a separate session |
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
 | 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
-| 6 | iOS integration, memory budget, network-change rebind | Rebind and live-session migration built (see *Network changes*). Next: iOS integration and memory budget, and stall detection so a caller migrates on its own when the provider moved |
+| 6 | iOS integration, memory budget, network-change rebind | Rebind and live-session migration built (see *Network changes*). Stall detection built: a caller migrates on its own when the provider goes silent. Next: iOS integration and memory budget |

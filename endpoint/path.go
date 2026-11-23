@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/warren/utpshape"
@@ -27,9 +28,18 @@ type path struct {
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
+	// waiting is when the first datagram that expects an answer went out
+	// since the peer was last heard from (Unix nanoseconds), or zero: how
+	// long the peer has been silent while we expected an answer. lastRecv
+	// is when the peer was last heard from.
+	waiting  atomic.Int64
+	lastRecv atomic.Int64
 	// testHookWrite, if set, runs between a write choosing its socket and
 	// sending, so tests can swap the path in that window.
 	testHookWrite func()
+	// testDrop, if set, silently drops writes on that socket, as a path
+	// that died without an error would.
+	testDrop atomic.Pointer[net.UDPConn]
 }
 
 func newPath(sock *net.UDPConn, real netip.AddrPort) *path {
@@ -50,6 +60,9 @@ func (p *path) swap(seq uint64, sock *net.UDPConn, real netip.AddrPort) bool {
 	old := p.sock
 	p.sock, p.real, p.seq = sock, real, seq
 	p.gen++
+	// A fresh path starts unjudged. lastRecv carries over: an acknowledgment
+	// of what arrived on the old path can still go out on the new one.
+	p.waiting.Store(0)
 	utpshape.SetDontFragment(sock)
 	_ = sock.SetReadDeadline(p.readDeadline)
 	_ = sock.SetWriteDeadline(p.writeDeadline)
@@ -82,6 +95,7 @@ func (p *path) read(b []byte) (int, error) {
 		if netip.AddrPortFrom(from.Addr().Unmap(), from.Port()) != real {
 			continue
 		}
+		p.heard(gen)
 		return n, nil
 	}
 }
@@ -95,8 +109,13 @@ func (p *path) write(b []byte) (int, error) {
 		if p.testHookWrite != nil {
 			p.testHookWrite()
 		}
+		if p.testDrop.Load() == sock {
+			p.sent(gen)
+			return len(b), nil
+		}
 		n, err := sock.WriteToUDPAddrPort(b, real)
 		if err == nil {
+			p.sent(gen)
 			return n, nil
 		}
 		p.mu.Lock()
@@ -111,9 +130,57 @@ func (p *path) write(b []byte) (int, error) {
 		// Anything else (network unreachable mid-handover, no route yet) is
 		// packet loss to the protocol above: QUIC treats a send error as
 		// fatal, and the session must outlive the moment before a migration
-		// installs a working path.
+		// installs a working path. It still awaits an answer, so a path whose
+		// route is gone is judged stalled.
+		p.sent(gen)
 		return len(b), nil
 	}
+}
+
+// heard notes a datagram from the peer arrived on path generation gen.
+// Every delivered datagram counts as heard, for ackGrace: the protocol
+// above may acknowledge it on the new path. Only one from the current path
+// clears the wait: a datagram read from a socket since swapped out would
+// clear a wait begun on the new path, which nothing there has answered.
+func (p *path) heard(gen int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastRecv.Store(time.Now().UnixNano())
+	if p.gen != gen {
+		return
+	}
+	if p.waiting.Load() != 0 {
+		p.waiting.Store(0)
+	}
+}
+
+// ackGrace: a datagram sent this soon after one arrived doesn't start the
+// wait for an answer. It is likely a bare acknowledgment (QUIC sends them
+// within 25 ms), which the peer never answers, so it would otherwise make
+// an idle session look stalled until the next keepalive. A real request
+// that goes unanswered is retransmitted later than this and starts it then.
+const ackGrace = time.Second
+
+// sent notes a datagram went out on path generation gen, starting the
+// wait for an answer if none is running and it isn't an acknowledgment of
+// what just arrived. It holds mu, as heard does, so a reply can't land
+// between the check and the start and leave a wait nothing will clear, and
+// a write that went out on a socket since swapped out doesn't start a wait
+// on the new path, which sent nothing.
+func (p *path) sent(gen int) {
+	if p.waiting.Load() != 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.gen != gen || p.waiting.Load() != 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	if now-p.lastRecv.Load() < int64(ackGrace) {
+		return
+	}
+	p.waiting.Store(now)
 }
 
 func (p *path) close() error {
