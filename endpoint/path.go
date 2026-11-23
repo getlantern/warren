@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/getlantern/warren/utpshape"
@@ -27,9 +28,16 @@ type path struct {
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
+	// waiting is when the first datagram written since the peer was last
+	// heard from went out (Unix nanoseconds), or zero: how long the peer
+	// has been silent while we expected an answer.
+	waiting atomic.Int64
 	// testHookWrite, if set, runs between a write choosing its socket and
 	// sending, so tests can swap the path in that window.
 	testHookWrite func()
+	// testDrop, if set, silently drops writes on that socket, as a path
+	// that died without an error would.
+	testDrop atomic.Pointer[net.UDPConn]
 }
 
 func newPath(sock *net.UDPConn, real netip.AddrPort) *path {
@@ -50,6 +58,7 @@ func (p *path) swap(seq uint64, sock *net.UDPConn, real netip.AddrPort) bool {
 	old := p.sock
 	p.sock, p.real, p.seq = sock, real, seq
 	p.gen++
+	p.waiting.Store(0) // a fresh path starts unjudged
 	utpshape.SetDontFragment(sock)
 	_ = sock.SetReadDeadline(p.readDeadline)
 	_ = sock.SetWriteDeadline(p.writeDeadline)
@@ -82,6 +91,9 @@ func (p *path) read(b []byte) (int, error) {
 		if netip.AddrPortFrom(from.Addr().Unmap(), from.Port()) != real {
 			continue
 		}
+		if p.waiting.Load() != 0 {
+			p.waiting.Store(0)
+		}
 		return n, nil
 	}
 }
@@ -95,8 +107,13 @@ func (p *path) write(b []byte) (int, error) {
 		if p.testHookWrite != nil {
 			p.testHookWrite()
 		}
+		if p.testDrop.Load() == sock {
+			p.sent()
+			return len(b), nil
+		}
 		n, err := sock.WriteToUDPAddrPort(b, real)
 		if err == nil {
+			p.sent()
 			return n, nil
 		}
 		p.mu.Lock()
@@ -114,6 +131,24 @@ func (p *path) write(b []byte) (int, error) {
 		// installs a working path.
 		return len(b), nil
 	}
+}
+
+// sent notes a datagram went out, starting the wait for an answer if none
+// is running.
+func (p *path) sent() {
+	if p.waiting.Load() == 0 {
+		p.waiting.CompareAndSwap(0, time.Now().UnixNano())
+	}
+}
+
+// silentFor reports how long the peer has been silent since a datagram we
+// sent, or zero when nothing is awaiting an answer.
+func (p *path) silentFor(now time.Time) time.Duration {
+	w := p.waiting.Load()
+	if w == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, w))
 }
 
 func (p *path) close() error {
