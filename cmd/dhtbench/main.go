@@ -8,8 +8,9 @@
 //
 // Without -python only warren runs; -no-miss skips the miss phase, and
 // -inflight, -alpha, -short and -timeout tune the measured warren node.
-// Above -concurrency 4 both warren nodes' lookup cap is raised to
-// concurrency+16 so the gets can run at once.
+// Above -concurrency 4 the measured warren node's and the storer's lookup
+// cap is raised to concurrency+16, more headroom for the gets (internal
+// lookups can still use all but 4 slots, so it is not a guarantee).
 // Both nodes are full (not read-only) nodes, bootstrapped from the public
 // routers.
 package main
@@ -82,8 +83,7 @@ func main() {
 	// up for the same time.
 	ip := externalIP(seeds)
 	// The default cap leaves gets 4 sure slots (internal lookups may fill
-	// the rest, though in practice they take one or two); past that
-	// concurrency, raise it so gets can run at once.
+	// the rest); past that concurrency, raise it for more headroom.
 	measured := tune
 	if *concurrency > 4 {
 		measured.MaxLookups = max(measured.MaxLookups, *concurrency+16)
@@ -115,7 +115,7 @@ func main() {
 		name    string
 		targets []krpc.NodeID
 		w, lt   []lookup
-		busy    int64 // warren gets refused with ErrBusy and retried
+		busy    int64 // retries after ErrBusy, one per 50 ms wait per get
 	}
 	phases := []*phase{{name: "hit", targets: hits}, {name: "miss", targets: misses}}
 	if *noMiss {
@@ -171,7 +171,7 @@ func main() {
 		if n > 0 {
 			fmt.Printf("warren: found %d/%d, %.1f queries and %.1f failures per lookup\n", found, len(ph.w), float64(q)/float64(n), float64(f)/float64(n))
 		}
-		fmt.Printf("warren: %d retries at the lookup cap (50 ms apart)\n", ph.busy)
+		fmt.Printf("warren: %d retries at the lookup cap (one per 50 ms wait per get)\n", ph.busy)
 		if lt != nil {
 			found = 0
 			for _, l := range ph.lt {
