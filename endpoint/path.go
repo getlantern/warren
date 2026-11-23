@@ -237,7 +237,9 @@ func (c *Conn) Send(b []byte) error {
 }
 
 // Recv reads the next datagram from the peer, skipping leftover
-// hole-punching control traffic (KRPC, first byte 'd').
+// hole-punching control traffic (KRPC, first byte 'd'). It skips every
+// datagram that starts with 'd', so a raw protocol read with Recv must
+// frame its data so that it never does; ReadFrom skips nothing.
 func (c *Conn) Recv(b []byte) (int, error) {
 	for {
 		n, err := c.p.read(b)

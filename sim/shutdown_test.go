@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -233,18 +234,48 @@ func TestShutdown(t *testing.T) {
 	if testing.Short() {
 		t.Skip("multi-hour virtual-time simulation")
 	}
-	for _, sz := range []sizes{
+	all := []sizes{
 		{name: "balanced", ir: 240, abroad: 80, readers: 60},
 		{name: "router-scarce + churn", ir: 60, abroad: 180, readers: 200, churn: 0.2},
-	} {
+	}
+	// Each (size, scenario) is its own deterministic simulation sharing no
+	// state, so they run in parallel: one after another they took about ten
+	// minutes under -race, at go test's default timeout.
+	results := make([]map[string][]row, len(all))
+	var mu sync.Mutex
+	t.Run("sims", func(t *testing.T) {
+		for i, sz := range all {
+			results[i] = map[string][]row{}
+			for _, sc := range scenarios {
+				t.Run(sz.name+"/"+sc.name, func(t *testing.T) {
+					t.Parallel()
+					rows := runShutdown(42, sc, sz)
+					mu.Lock()
+					results[i][sc.name] = rows
+					mu.Unlock()
+				})
+			}
+		}
+	})
+	for i, sz := range all {
+		results := results[i]
+		// The isolation guarantee is checked whenever that scenario ran, even
+		// when -run selected a single simulation.
+		for _, r := range results["+isolation"] {
+			if r.ir.rate() < 0.98 || r.ab.rate() < 0.98 {
+				t.Errorf("%s %s: isolation mode read %.0f%% domestic, %.0f%% foreign; want ≥98%%",
+					sz.name, r.label, 100*r.ir.rate(), 100*r.ab.rate())
+			}
+		}
+		if len(results) < len(scenarios) {
+			continue // the comparison table needs every scenario
+		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "\n%s: %d domestic routers, %d abroad, %d domestic read-only phones, %.0f%% domestic router churn after the cut\n",
 			sz.name, sz.ir, sz.abroad, sz.readers, 100*sz.churn)
 		fmt.Fprintf(&b, "%-10s", "")
-		results := map[string][]row{}
 		for _, sc := range scenarios {
 			fmt.Fprintf(&b, "  %-23s", sc.name)
-			results[sc.name] = runShutdown(42, sc, sz)
 		}
 		fmt.Fprintf(&b, "\n%-10s", "")
 		for range scenarios {
@@ -260,11 +291,5 @@ func TestShutdown(t *testing.T) {
 			b.WriteString("\n")
 		}
 		t.Log(b.String())
-		for _, r := range results["+isolation"] {
-			if r.ir.rate() < 0.98 || r.ab.rate() < 0.98 {
-				t.Errorf("%s %s: isolation mode read %.0f%% domestic, %.0f%% foreign; want ≥98%%",
-					sz.name, r.label, 100*r.ir.rate(), 100*r.ab.rate())
-			}
-		}
 	}
 }
