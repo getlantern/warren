@@ -95,10 +95,7 @@ func (p *path) read(b []byte) (int, error) {
 		if netip.AddrPortFrom(from.Addr().Unmap(), from.Port()) != real {
 			continue
 		}
-		p.lastRecv.Store(time.Now().UnixNano())
-		if p.waiting.Load() != 0 {
-			p.waiting.Store(0)
-		}
+		p.heard(gen)
 		return n, nil
 	}
 }
@@ -137,6 +134,21 @@ func (p *path) write(b []byte) (int, error) {
 		// route is gone is judged stalled.
 		p.sent()
 		return len(b), nil
+	}
+}
+
+// heard notes the peer answered on path generation gen. A datagram read
+// from a socket since swapped out doesn't count: it would clear a wait
+// begun on the new path, which nothing there has answered.
+func (p *path) heard(gen int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.gen != gen {
+		return
+	}
+	p.lastRecv.Store(time.Now().UnixNano())
+	if p.waiting.Load() != 0 {
+		p.waiting.Store(0)
 	}
 }
 

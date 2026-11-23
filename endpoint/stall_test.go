@@ -321,3 +321,19 @@ func TestSwapKeepsAckGrace(t *testing.T) {
 		t.Fatal("an acknowledgment just after a swap started a wait")
 	}
 }
+
+// A datagram read from a socket swapped out since doesn't clear a wait
+// begun on the new path.
+func TestOldPathReadKeepsNewWait(t *testing.T) {
+	p := &path{gen: 1}
+	w := time.Now().UnixNano()
+	p.waiting.Store(w)
+	p.heard(0)
+	if p.waiting.Load() != w {
+		t.Fatal("a read from the old path cleared the new path's wait")
+	}
+	p.heard(1)
+	if p.waiting.Load() != 0 {
+		t.Fatal("an answer on the current path didn't clear the wait")
+	}
+}
