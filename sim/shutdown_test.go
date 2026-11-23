@@ -259,6 +259,17 @@ func TestShutdown(t *testing.T) {
 	})
 	for i, sz := range all {
 		results := results[i]
+		// The isolation guarantee is checked whenever that scenario ran, even
+		// when -run selected a single simulation.
+		for _, r := range results["+isolation"] {
+			if r.ir.rate() < 0.98 || r.ab.rate() < 0.98 {
+				t.Errorf("%s %s: isolation mode read %.0f%% domestic, %.0f%% foreign; want ≥98%%",
+					sz.name, r.label, 100*r.ir.rate(), 100*r.ab.rate())
+			}
+		}
+		if len(results) < len(scenarios) {
+			continue // the comparison table needs every scenario
+		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "\n%s: %d domestic routers, %d abroad, %d domestic read-only phones, %.0f%% domestic router churn after the cut\n",
 			sz.name, sz.ir, sz.abroad, sz.readers, 100*sz.churn)
@@ -280,11 +291,5 @@ func TestShutdown(t *testing.T) {
 			b.WriteString("\n")
 		}
 		t.Log(b.String())
-		for _, r := range results["+isolation"] {
-			if r.ir.rate() < 0.98 || r.ab.rate() < 0.98 {
-				t.Errorf("%s %s: isolation mode read %.0f%% domestic, %.0f%% foreign; want ≥98%%",
-					sz.name, r.label, 100*r.ir.rate(), 100*r.ab.rate())
-			}
-		}
 	}
 }

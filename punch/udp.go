@@ -126,8 +126,9 @@ func (r *Runner) Gather(ctx context.Context, reflectors []netip.AddrPort, wait t
 // the nominated socket and peer address; every other socket is closed and
 // the runner stops reading, handing the socket to the caller. The peer may
 // still be finishing its own checks, so the socket can receive a few more
-// punch control datagrams (KRPC, first byte 'd') before data; callers skip
-// them.
+// punch control datagrams (KRPC, first byte 'd') before data. Callers skip
+// them, which reserves that first byte: data must be framed never to start
+// with 'd' (endpoint.Conn.Recv does this skipping).
 func (r *Runner) Punch(ctx context.Context, remote Offer) (*net.UDPConn, netip.AddrPort, error) {
 	r.s.Start(time.Now(), remote)
 	timer := time.NewTimer(0)

@@ -74,7 +74,7 @@ type Config struct {
 // hole-punching control datagrams (KRPC, first byte 'd'), and a relayed one
 // a few 20-byte relay probes or acks; protocols layered above drop them
 // (uTP shaping and QUIC both reject them), and raw users should read with
-// Recv, which skips the KRPC ones.
+// Recv, which skips the KRPC ones (and so reserves a leading 'd'; see Recv).
 //
 // A Conn survives a network change: Migrate (run for outbound connections
 // by Endpoint.Rebind, and by the stall watcher when the peer goes silent)
