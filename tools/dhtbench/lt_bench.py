@@ -70,7 +70,7 @@ def batch(label, targets):
     queue = list(targets)
     while queue or pending:
         while queue and len(pending) < concurrency:
-            t = queue.pop(0)
+            t = bytes.fromhex(queue.pop(0)).hex()  # lowercase, as alerts report it
             s.dht_get_immutable_item(lt.sha1_hash(bytes.fromhex(t)))
             pending[t] = time.monotonic()
         s.wait_for_alert(200)
@@ -79,7 +79,13 @@ def batch(label, targets):
                 t = str(a.target)
                 if t in pending:
                     ms = round((time.monotonic() - pending.pop(t)) * 1000, 1)
-                    found = bool(a.item)  # None (or empty) when not found
+                    try:
+                        # 2.1's binding gives an empty value for a missing
+                        # item (the benchmark's items are never empty).
+                        found = bool(a.item)
+                    except Exception:
+                        # 2.0's binding raises reading a missing item.
+                        found = False
                     emit({'t': 'lookup', 'label': label, 'ms': ms, 'found': found})
         for t, began in list(pending.items()):
             if time.monotonic() - began > 60:
