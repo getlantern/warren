@@ -543,7 +543,7 @@ and built for iOS and run in the iOS simulator (`tools/iossim/run.sh`):
 | same, hysteria2's default windows | 23.6 MiB peak | 26.2 MiB peak |
 
 Every package also builds for an iOS device (`GOOS=ios GOARCH=arm64`, the
-iPhoneOS SDK). These are Go heap figures, what warren allocates; the
+iPhoneOS SDK). These are Go heap and stack figures, what warren allocates; the
 process's `phys_footprint`, which jetsam judges, also counts the runtime and
 native memory, and needs a device.
 
