@@ -632,6 +632,25 @@ func (n *Node) Get(ctx context.Context, target krpc.NodeID) ([]byte, error) {
 	return nil, partial
 }
 
+// GetItem is Get returning the whole finished lookup, with how many nodes it
+// queried, how many failed, and its Timing: the first node's result, or the
+// first that found the value.
+func (n *Node) GetItem(ctx context.Context, target krpc.NodeID) (dht.GetDone, error) {
+	got, partial, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+		op, err := d.Get(now, target)
+		return op, false, err
+	}, func(e dht.Event) bool { return e.(dht.GetDone).Value != nil })
+	for _, e := range got {
+		if g := e.(dht.GetDone); g.Value != nil {
+			return g, nil
+		}
+	}
+	if len(got) > 0 {
+		return got[0].(dht.GetDone), errors.Join(err, partial)
+	}
+	return dht.GetDone{}, errors.Join(err, partial)
+}
+
 // Put stores v through every node and returns the acknowledgements summed
 // across them, including any that arrived before an error.
 func (n *Node) Put(ctx context.Context, v []byte) (krpc.NodeID, dht.PutDone, error) {

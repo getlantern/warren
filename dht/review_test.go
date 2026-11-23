@@ -450,3 +450,49 @@ func TestReboundDropsStaleTokensAndPublications(t *testing.T) {
 		t.Fatal("a publication from before the rebind installed its holders")
 	}
 }
+
+// A finished lookup reports when its first response came, when its K
+// closest responders last changed, and its total time.
+func TestLookupTiming(t *testing.T) {
+	r := rng(80)
+	n := New(Config{ID: outsiderID(r), Rand: rng(81)})
+	ids := make([]krpc.NodeID, 3)
+	for i := range ids {
+		ids[i] = outsiderID(r)
+		n.primary.heard(ids[i], addr(i+1), t0)
+	}
+	op, err := n.FindNode(t0, outsiderID(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sends, _ := n.Drain()
+	tids := map[netip.AddrPort][]byte{}
+	for _, s := range sends {
+		var m krpc.Msg
+		if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+			tids[s.To] = m.T
+		}
+	}
+	var done *LookupDone
+	for i, after := range []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 400 * time.Millisecond} {
+		from := addr(i + 1)
+		if tids[from] == nil {
+			t.Fatalf("no query to %v", from)
+		}
+		resp := krpc.AppendMarshal(nil, &krpc.Msg{T: tids[from], Y: krpc.Response, R: krpc.Return{ID: ids[i]}})
+		n.HandlePacket(t0.Add(after), from, resp)
+		_, events := n.Drain()
+		for _, e := range events {
+			if d, ok := e.(LookupDone); ok && d.Op == op {
+				done = &d
+			}
+		}
+	}
+	if done == nil {
+		t.Fatal("the lookup never finished")
+	}
+	want := Timing{First: 100 * time.Millisecond, Settled: 400 * time.Millisecond, Total: 400 * time.Millisecond}
+	if done.Timing != want || done.Failures != 0 {
+		t.Fatalf("timing %+v failures %d, want %+v and none", done.Timing, done.Failures, want)
+	}
+}

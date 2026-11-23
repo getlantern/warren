@@ -745,6 +745,45 @@ stream echoing across an explicit `Migrate` and across a caller `Rebind`
 (both ends on new sockets), and a resume accepted only from the
 connection's own caller, failing fast when it names nothing.
 
+## Performance against libtorrent (`cmd/dhtbench`)
+
+`cmd/dhtbench` runs a warren node and a libtorrent 2.1.1 node
+(`tools/dhtbench/lt_bench.py`) on the same host at the same time, both full
+nodes bootstrapped from the public routers on live Mainline, and measures:
+
+- how fast each fills its routing table;
+- **hits**: immutable gets for items a third (warren) node stored, so neither
+  measured node has walked toward them; the time to the value is what
+  signaling pays to find a provider's record;
+- **misses**: gets to random targets, a full walk to the closest nodes.
+
+A finished lookup reports its `dht.Timing` (first response, when the K
+closest responders last changed, total) and failures. Flags set warren's
+in-flight cap, alpha and timeouts for experiments. Baseline (100 lookups a
+phase, 4 in flight):
+
+| | warren | libtorrent |
+|---|---|---|
+| hit, p50 / p90 / p99 | 896 / 4,390 / 6,970 ms | 469 / 673 / 2,107 ms |
+| miss, p50 | 8.6 s | 18.4 s |
+| routing table at 60 s | 121 nodes | 59 nodes |
+
+warren's first response comes at about 70 to 180 ms, but about half the
+nodes a lookup queries never answer, and with at most 6 queries in flight
+and a fixed 1 s before a slow query stops counting as active, a few dead
+nodes stall a lookup until the 3 s timeout. Raising the in-flight cap to 16
+and the short timeout to 300 ms together cut the hit p90 from 3.8 s to 1.7 s
+and the p99 from 7.6 s to 2.8 s; neither alone helped much. The hit median,
+about 1 s against libtorrent's 0.47 s, is unchanged by tuning: about 12
+queries a hit points at hop count and routing-table quality. On a miss warren
+concludes sooner than libtorrent but still spends about 2.4 s past the
+moment its K closest settled. Live numbers vary run to run.
+
+CPU, from benchmarks: decoding a response with 8 nodes takes 1.1 µs and 9
+allocations, encoding one 0.3 µs and 12; answering a `find_node` or
+`get_peers` takes about 12 µs and 35 allocations, three quarters of it
+sorting the whole routing table to find the closest contacts.
+
 ## Phase 0: measure first (`natprobe/`, built)
 
 `natprobe` uses **public Mainline nodes as reflectors**: BEP 42 responses carry the
