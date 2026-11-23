@@ -28,10 +28,12 @@ type path struct {
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
-	// waiting is when the first datagram written since the peer was last
-	// heard from went out (Unix nanoseconds), or zero: how long the peer
-	// has been silent while we expected an answer.
-	waiting atomic.Int64
+	// waiting is when the first datagram that expects an answer went out
+	// since the peer was last heard from (Unix nanoseconds), or zero: how
+	// long the peer has been silent while we expected an answer. lastRecv
+	// is when the peer was last heard from.
+	waiting  atomic.Int64
+	lastRecv atomic.Int64
 	// testHookWrite, if set, runs between a write choosing its socket and
 	// sending, so tests can swap the path in that window.
 	testHookWrite func()
@@ -59,6 +61,7 @@ func (p *path) swap(seq uint64, sock *net.UDPConn, real netip.AddrPort) bool {
 	p.sock, p.real, p.seq = sock, real, seq
 	p.gen++
 	p.waiting.Store(0) // a fresh path starts unjudged
+	p.lastRecv.Store(0)
 	utpshape.SetDontFragment(sock)
 	_ = sock.SetReadDeadline(p.readDeadline)
 	_ = sock.SetWriteDeadline(p.writeDeadline)
@@ -91,6 +94,7 @@ func (p *path) read(b []byte) (int, error) {
 		if netip.AddrPortFrom(from.Addr().Unmap(), from.Port()) != real {
 			continue
 		}
+		p.lastRecv.Store(time.Now().UnixNano())
 		if p.waiting.Load() != 0 {
 			p.waiting.Store(0)
 		}
@@ -128,17 +132,31 @@ func (p *path) write(b []byte) (int, error) {
 		// Anything else (network unreachable mid-handover, no route yet) is
 		// packet loss to the protocol above: QUIC treats a send error as
 		// fatal, and the session must outlive the moment before a migration
-		// installs a working path.
+		// installs a working path. It still awaits an answer, so a path whose
+		// route is gone is judged stalled.
+		p.sent()
 		return len(b), nil
 	}
 }
 
+// ackGrace: a datagram sent this soon after one arrived doesn't start the
+// wait for an answer. It is likely a bare acknowledgment (QUIC sends them
+// within 25 ms), which the peer never answers, so it would otherwise make
+// an idle session look stalled until the next keepalive. A real request
+// that goes unanswered is retransmitted later than this and starts it then.
+const ackGrace = time.Second
+
 // sent notes a datagram went out, starting the wait for an answer if none
-// is running.
+// is running and it isn't an acknowledgment of what just arrived.
 func (p *path) sent() {
-	if p.waiting.Load() == 0 {
-		p.waiting.CompareAndSwap(0, time.Now().UnixNano())
+	if p.waiting.Load() != 0 {
+		return
 	}
+	now := time.Now().UnixNano()
+	if now-p.lastRecv.Load() < int64(ackGrace) {
+		return
+	}
+	p.waiting.CompareAndSwap(0, now)
 }
 
 // silentFor reports how long the peer has been silent since a datagram we

@@ -660,14 +660,23 @@ its mapping, a relay went away. Each path notes when it sent a datagram the
 peer hasn't answered, and a stall watcher, running once a second only while
 the endpoint has outbound connections, migrates any connection whose
 provider has been silent for `StallTimeout` (5 seconds) after being sent
-something. QUIC acknowledges within a round trip and hysteria2 pings every 10
-seconds, so a live path always answers in time, and an idle session (nothing
+something that expects an answer. QUIC acknowledges ack-eliciting packets
+within a round trip, so a live path answers in time. A bare acknowledgment
+gets no answer, so a datagram sent within a second of one arriving doesn't
+start the wait; otherwise acknowledging the provider's keepalive would make
+an idle session look stalled until our own keepalive 10 seconds later. A
+request that goes unanswered is retransmitted later than that and starts
+the wait then. A send that fails as a lost packet (no route) starts it too,
+so a path whose route vanished is judged stalled. An idle session (nothing
 sent) is never judged. Five seconds also leaves a migration time to finish
 before QUIC's 30-second idle timeout ends the session. Silence costs no
 probe packets: the session's own traffic is the probe. A failed stall
 migration backs off, doubling from the timeout to 30 seconds, since a
 provider that is gone rather than moved would otherwise be signaled through
-the DHT every second until the layer above gives up. Silence is measured
+the DHT every second until the layer above gives up. A stall move isn't
+a migration request, so a failed one isn't retried by `WatchNetwork` around
+that backoff, and one queued behind another migration does nothing once
+that migration replaced the path or the provider answered. Silence is measured
 over datagrams the application reads, so a raw connection that writes
 without reading turns detection off (negative `StallTimeout`).
 

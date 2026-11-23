@@ -7,10 +7,11 @@ import (
 
 const (
 	// defaultStallTimeout is how long a peer may stay silent after we sent
-	// it something before the path counts as dead. QUIC acknowledges within
-	// a round trip and hysteria2 pings every 10 seconds, so a live path
-	// answers well inside it, and a migration still has time to finish
-	// before QUIC's 30-second idle timeout ends the session.
+	// it something that expects an answer before the path counts as dead.
+	// QUIC acknowledges ack-eliciting packets within a round trip, and bare
+	// acknowledgments, which get no answer, are ignored (see ackGrace), so
+	// a live path answers well inside it; a migration still has time to
+	// finish before QUIC's 30-second idle timeout ends the session.
 	defaultStallTimeout = 5 * time.Second
 	// maxStallBackoff caps the wait between failed stall migrations, for a
 	// peer that is gone rather than moved.
@@ -77,6 +78,7 @@ func (c *Conn) checkStall(now time.Time, timeout time.Duration) {
 	if now.UnixNano() < c.stallNext.Load() || !c.stallBusy.CompareAndSwap(false, true) {
 		return
 	}
+	_, _, gen := c.p.current()
 	e := c.e
 	e.mu.Lock()
 	if e.closed {
@@ -91,7 +93,7 @@ func (c *Conn) checkStall(now time.Time, timeout time.Duration) {
 		defer c.stallBusy.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), maxStallBackoff)
 		defer cancel()
-		if err := c.Migrate(ctx); err != nil {
+		if err := c.migrate(ctx, moveStall, gen); err != nil {
 			// The peer may be gone rather than moved: back off, doubling up to
 			// the cap, so a dead session doesn't signal the DHT every second
 			// until the layer above gives up on it.

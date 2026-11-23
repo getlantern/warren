@@ -508,7 +508,11 @@ func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 	var wg sync.WaitGroup
 	for i, c := range out {
 		wg.Go(func() {
-			if err := c.migrate(ctx, onlyUnmoved); err != nil {
+			kind := moveRequest
+			if onlyUnmoved {
+				kind = moveRetry
+			}
+			if err := c.migrate(ctx, kind, 0); err != nil {
 				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.PeerKey[:4], err)
 			}
 		})
@@ -726,17 +730,32 @@ func (e *Endpoint) resumable(id [16]byte, caller [32]byte) *Conn {
 // the Conn (hysteria2, QUIC) carry on; datagrams in flight during the move
 // are lost, as on any network change.
 func (c *Conn) Migrate(ctx context.Context) error {
-	return c.migrate(ctx, false)
+	return c.migrate(ctx, moveRequest, 0)
 }
 
-// migrate runs a migration. A retry adds no request of its own: it serves
-// the outstanding ones, and does nothing if a migration that held the slot
-// before it already served them, so it never replaces a working path.
-func (c *Conn) migrate(ctx context.Context, retry bool) error {
+// moveKind is why a migration runs.
+type moveKind int
+
+const (
+	// moveRequest is a caller's or Rebind's request, counted so a failure
+	// leaves it outstanding for WatchNetwork to retry.
+	moveRequest moveKind = iota
+	// moveRetry serves outstanding requests without adding one, and does
+	// nothing if a migration that held the slot before it served them.
+	moveRetry
+	// moveStall answers a silent peer. It adds no request (the stall
+	// watcher retries it, with backoff) and does nothing if, by the time it
+	// holds the slot, the path it judged was replaced or the peer answered.
+	moveStall
+)
+
+// migrate runs a migration; stallGen is the path generation a moveStall
+// judged stalled. Retries and stall moves never replace a working path.
+func (c *Conn) migrate(ctx context.Context, kind moveKind, stallGen int) error {
 	if !c.outbound {
 		return ErrNotCaller
 	}
-	if !retry {
+	if kind == moveRequest {
 		c.moveReqs.Add(1) // counted even if we give up or fail: retries rerun it
 	}
 	c.slotOnce.Do(func() { c.migrateSlot = make(chan struct{}, 1) })
@@ -746,8 +765,15 @@ func (c *Conn) migrate(ctx context.Context, retry bool) error {
 		return ctx.Err()
 	}
 	defer func() { <-c.migrateSlot }()
-	if retry && !c.unmoved() {
-		return nil
+	switch kind {
+	case moveRetry:
+		if !c.unmoved() {
+			return nil
+		}
+	case moveStall:
+		if _, _, gen := c.p.current(); gen != stallGen || c.p.silentFor(time.Now()) == 0 {
+			return nil
+		}
 	}
 	serving := c.moveReqs.Load()
 	e := c.e

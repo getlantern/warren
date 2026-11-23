@@ -1,9 +1,15 @@
 package endpoint
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net"
+	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/getlantern/warren/transport/hy2"
 )
 
 // echoed connects caller to an echoing provider.
@@ -65,12 +71,13 @@ func TestStalledSessionMigrates(t *testing.T) {
 	before := out.LocalAddr().String()
 	sock, _, _ := out.p.current()
 	out.p.testDrop.Store(sock) // the path goes dark
-	if err := out.Send([]byte("ping")); err != nil {
-		t.Fatal(err)
-	}
-	for deadline := time.Now().Add(10 * time.Second); out.LocalAddr().String() == before; time.Sleep(20 * time.Millisecond) {
+	// Keep sending, as QUIC retransmits what goes unanswered.
+	for deadline := time.Now().Add(10 * time.Second); out.LocalAddr().String() == before; time.Sleep(100 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("the stalled connection never migrated")
+		}
+		if err := out.Send([]byte("ping")); err != nil {
+			t.Fatal(err)
 		}
 	}
 	ping(t, out)
@@ -140,4 +147,143 @@ func TestStallWatcherStopsWithoutConnections(t *testing.T) {
 			t.Fatal("the watcher kept running with no outbound connections")
 		}
 	}
+}
+
+// A datagram sent just after one arrived is likely a bare acknowledgment,
+// which the peer never answers, so it doesn't start the wait; one sent
+// later does.
+func TestAckDoesntStartWait(t *testing.T) {
+	p := &path{}
+	p.lastRecv.Store(time.Now().UnixNano())
+	p.sent()
+	if p.waiting.Load() != 0 {
+		t.Fatal("an acknowledgment of what just arrived started the wait")
+	}
+	p.lastRecv.Store(time.Now().Add(-2 * ackGrace).UnixNano())
+	p.sent()
+	if p.waiting.Load() == 0 {
+		t.Fatal("a datagram sent well after the last arrival didn't start the wait")
+	}
+}
+
+// A send error treated as loss still awaits an answer, so a path whose
+// route is gone is judged stalled.
+func TestSuppressedSendErrorStartsWait(t *testing.T) {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPath(c, netip.MustParseAddrPort("[2001:db8::1]:9"))
+	defer p.close()
+	if _, err := p.write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if p.waiting.Load() == 0 {
+		t.Fatal("a send that failed as loss didn't start the wait")
+	}
+}
+
+// A failed stall move leaves no request outstanding, so WatchNetwork's
+// retries don't bypass the stall backoff.
+func TestFailedStallMoveLeavesNoRequest(t *testing.T) {
+	c := &Conn{e: &Endpoint{closed: true}, p: &path{}, outbound: true}
+	c.p.waiting.Store(time.Now().Add(-time.Hour).UnixNano())
+	if err := c.migrate(context.Background(), moveStall, 0); err == nil {
+		t.Fatal("setup: the stall move should fail on a closed endpoint")
+	}
+	if c.moveReqs.Load() != 0 || c.unmoved() {
+		t.Fatal("a failed stall move left a request for WatchNetwork to retry")
+	}
+}
+
+// A stall move queued behind another migration does nothing once that one
+// replaced the path it judged, or the peer answered.
+func TestQueuedStallMoveSkipsReplacedPath(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		recover func(p *path)
+	}{
+		{"replaced", func(p *path) { p.mu.Lock(); p.gen++; p.mu.Unlock() }},
+		{"answered", func(p *path) { p.waiting.Store(0) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A closed endpoint makes a move that runs fail, so a nil error
+			// means it was skipped.
+			c := &Conn{e: &Endpoint{closed: true}, p: &path{}, outbound: true}
+			c.p.waiting.Store(time.Now().Add(-time.Hour).UnixNano())
+			c.slotOnce.Do(func() { c.migrateSlot = make(chan struct{}, 1) })
+			c.migrateSlot <- struct{}{} // another migration in flight
+			done := make(chan error, 1)
+			go func() { done <- c.migrate(context.Background(), moveStall, 0) }()
+			time.Sleep(50 * time.Millisecond)
+			tc.recover(c.p)
+			<-c.migrateSlot
+			if err := <-done; err != nil {
+				t.Fatalf("the queued stall move ran anyway: %v", err)
+			}
+		})
+	}
+}
+
+// A healthy hysteria2 session left idle past a keepalive doesn't migrate:
+// the bare acknowledgments QUIC sends get no answer, and must not look
+// like a stall.
+func TestIdleHysteria2DoesntStall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("idles past a 10-second keepalive")
+	}
+	seed := network(t, 8)
+	provider, caller := phone(t, seed), phone(t, seed)
+	caller.stallTimeout.Store(int64(3 * time.Second))
+	pk, ck := key("idle-provider"), key("idle-caller")
+	listenAndWait(t, provider, pk)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	accepted := make(chan *Conn, 1)
+	go func() {
+		c, _ := provider.Accept(ctx)
+		accepted <- c
+	}()
+	out, err := caller.Connect(ctx, ck, pub(pk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	in := <-accepted
+	if in == nil {
+		t.Fatal("nothing accepted")
+	}
+	defer in.Close()
+	srv, err := hy2.Serve(ctx, in, pk, hy2.FromSecret(in.Secret, hy2.ObfsUTP), func(c net.Conn, _ string) { io.Copy(c, c) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	cl, err := hy2.Dial(ctx, out, out.Remote, out.PeerKey, hy2.FromSecret(out.Secret, hy2.ObfsUTP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	stream, err := cl.DialConn(ctx, "echo:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	echo := func() {
+		msg := []byte("still here")
+		if _, err := stream.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(msg))
+		_ = stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(stream, got); err != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("echo: %v", err)
+		}
+	}
+	echo()
+	time.Sleep(14 * time.Second) // past hysteria2's 10-second keepalive
+	if out.migrations != 0 {
+		t.Fatalf("an idle, healthy session migrated %d times", out.migrations)
+	}
+	echo()
 }
