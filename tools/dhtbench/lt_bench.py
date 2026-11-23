@@ -1,6 +1,9 @@
 """Measure libtorrent's DHT on live Mainline, for cmd/dhtbench to compare.
 
-Usage: python -I lt_bench.py WARMUP_SECONDS CONCURRENCY
+Usage: python -I lt_bench.py WARMUP_SECONDS CONCURRENCY ROUTERS
+
+ROUTERS is a comma-separated list of host:port bootstrap routers, the same
+ones the warren node uses.
 
 Warms up its routing table, printing {"t": "table", "at": s, "nodes": n}
 every 5 seconds, then {"t": "ready"}. Then reads commands from stdin, one
@@ -26,9 +29,12 @@ concurrency = int(sys.argv[2])
 if concurrency < 1:
     sys.exit('CONCURRENCY must be at least 1')
 
+routers = sys.argv[3]
+
 s = lt.session({
     'listen_interfaces': '0.0.0.0:0',
     'enable_dht': True,
+    'dht_bootstrap_nodes': routers,
     'enable_lsd': False,
     'enable_upnp': False,
     'enable_natpmp': False,

@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,12 +77,15 @@ func main() {
 	// Learn our address before starting either measured node, so both warm
 	// up for the same time.
 	ip := externalIP(seeds)
+	// Room for every get and every internal lookup (refresh, republish),
+	// which may fill all but 4 slots, so gets don't fail with ErrBusy.
+	lookupCap := 2**concurrency + 16
 	measured := tune
-	measured.MaxLookups = max(measured.MaxLookups, *concurrency+16) // gets never hit ErrBusy
+	measured.MaxLookups = max(measured.MaxLookups, lookupCap)
 	w := startWarren(seeds, ip, measured)
 	var lt *libtorrent
 	if *python != "" {
-		lt = startLibtorrent(*python, *script, *warmup, *concurrency)
+		lt = startLibtorrent(*python, *script, *warmup, *concurrency, seeds)
 	}
 	defer func() { _ = w.n.Close() }()
 	wTable := w.warm(*warmup)
@@ -91,7 +96,7 @@ func main() {
 
 	// Items to find, stored by a separate node on the K nodes closest to
 	// each, so neither measured node has walked toward them before.
-	storer := startWarren(seeds, ip, dht.Config{})
+	storer := startWarren(seeds, ip, dht.Config{MaxLookups: lookupCap})
 	storer.warm(*warmup / 2)
 	hits := storer.store(*lookups, *concurrency)
 	_ = storer.n.Close()
@@ -272,6 +277,9 @@ func (w *warren) store(n, concurrency int) []krpc.NodeID {
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			t, done, err := w.n.Put(ctx, v)
+			if err != nil {
+				log.Printf("storer: put: %v", err)
+			}
 			if err == nil && done.Stored > 0 {
 				mu.Lock()
 				out = append(out, t)
@@ -293,13 +301,15 @@ func (w *warren) gets(targets []krpc.NodeID, concurrency int) []lookup {
 			defer func() { <-sem }()
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
+			began := time.Now()
 			g, err := w.n.GetItem(ctx, t)
+			elapsed := time.Since(began) // wall clock around the call, as for libtorrent
 			if err != nil {
 				out[i] = lookup{ms: -1}
 				return
 			}
 			ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
-			out[i] = lookup{ms: ms(g.Timing.Total), first: ms(g.Timing.First), settled: ms(g.Timing.Settled),
+			out[i] = lookup{ms: ms(elapsed), first: ms(g.Timing.First), settled: ms(g.Timing.Settled),
 				queried: g.Queried, failures: g.Failures, responded: g.Timing.First > 0, found: g.Value != nil}
 		})
 	}
@@ -321,8 +331,12 @@ type libtorrent struct {
 	lines chan ltMsg
 }
 
-func startLibtorrent(python, script string, warmup time.Duration, concurrency int) *libtorrent {
-	cmd := exec.Command(python, "-I", script, strconv.Itoa(int(warmup.Seconds())), strconv.Itoa(concurrency))
+func startLibtorrent(python, script string, warmup time.Duration, concurrency int, seeds []netip.AddrPort) *libtorrent {
+	routers := make([]string, len(seeds))
+	for i, s := range seeds {
+		routers[i] = s.String()
+	}
+	cmd := exec.Command(python, "-I", script, strconv.FormatFloat(warmup.Seconds(), 'f', -1, 64), strconv.Itoa(concurrency), strings.Join(routers, ","))
 	cmd.Stderr = os.Stderr
 	in, err := cmd.StdinPipe()
 	if err != nil {
@@ -430,7 +444,9 @@ func report(name string, ls []lookup, f func(lookup) (float64, bool)) {
 		return
 	}
 	slices.Sort(v)
-	p := func(q float64) float64 { return v[min(int(q*float64(len(v))), len(v)-1)] }
+	// Nearest rank: the smallest value with at least q of the samples at or
+	// below it (with 100 samples, p99 is the second largest).
+	p := func(q float64) float64 { return v[max(int(math.Ceil(q*float64(len(v))))-1, 0)] }
 	fmt.Printf("%-20s p50 %7.0fms  p90 %7.0fms  p99 %7.0fms  max %7.0fms  (%d ok, %d failed)\n",
 		name, p(0.5), p(0.9), p(0.99), v[len(v)-1], len(v), failed)
 }

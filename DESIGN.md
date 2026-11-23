@@ -749,7 +749,8 @@ connection's own caller, failing fast when it names nothing.
 
 `cmd/dhtbench` runs a warren node and a libtorrent 2.1.1 node
 (`tools/dhtbench/lt_bench.py`) on the same host at the same time, both full
-nodes bootstrapped from the public routers on live Mainline, and measures:
+nodes bootstrapped from the same public routers on live Mainline, and
+measures:
 
 - how fast each fills its routing table;
 - **hits**: immutable gets for items a third (warren) node stored, so neither
@@ -758,28 +759,33 @@ nodes bootstrapped from the public routers on live Mainline, and measures:
 - **misses**: gets to random targets, a full walk to the closest nodes.
 
 A finished lookup reports its `dht.Timing` (first response, when the K
-closest responders last changed, total) and failures. Flags set warren's
-in-flight cap, alpha and timeouts for experiments. Baseline (100 lookups a
-phase, 4 in flight):
+closest responders last changed, total) and failures; both sides' totals
+are wall-clock times around the get call. Flags set warren's in-flight cap,
+alpha and timeouts for experiments. All nodes share the host's public
+address, and Mainline nodes keep one ID per address in their tables, so
+remote tables may hold only one of them; the comparison is between nodes
+that face the network the same way, not a clean-room benchmark. Baseline
+(100 lookups a phase, 4 in flight, nearest-rank percentiles, so p99 is the
+second-worst lookup):
 
 | | warren | libtorrent |
 |---|---|---|
-| hit, p50 / p90 / p99 | 896 / 4,390 / 6,970 ms | 469 / 673 / 2,107 ms |
-| miss, p50 | 8.6 s | 18.4 s |
-| routing table at 60 s | 121 nodes | 59 nodes |
+| hit, p50 / p90 / p99 | 1,038 / 3,341 / 6,469 ms | 418 / 678 / 1,061 ms |
+| miss, p50 | 6.7 s | 18.2 s |
+| routing table at 60 s | 110 nodes | 64 nodes |
 
 warren's first response comes at about 70 to 180 ms, but about half the
 queries a miss sends fail (14 of 30 a lookup: timeouts, plus the few replies
 rejected for the wrong ID or an error), and with at most 6 queries in flight
 and a fixed 1 s before a slow query stops counting as active, a few dead
-nodes stall a lookup until the 3 s timeout. In a separate warren-only run
-of four variants side by side (its default variant measured a hit p50, p90
-and p99 of 1.07, 3.8 and 7.6 s), raising the in-flight cap to 16 and the
-short timeout to 300 ms together cut the p90 to 1.7 s and the p99 to 2.8 s;
+nodes stall a lookup until the 3 s timeout. In an earlier warren-only run of
+four variants side by side (whose default variant measured a hit p50, p90
+and worst of 1.07, 3.8 and 7.6 s), raising the in-flight cap to 16 and the
+short timeout to 300 ms together cut the p90 to 1.7 s and the worst to 2.8 s;
 neither alone helped much. The hit median, about 0.9 to 1.1 s across runs
-against libtorrent's 0.47 s, is unchanged by tuning: about 12 queries a hit
+against libtorrent's 0.42 to 0.47 s, is unchanged by tuning: about 12 queries a hit
 points at hop count and routing-table quality. On a miss warren
-concludes sooner than libtorrent but still spends about 2.4 s past the
+concludes sooner than libtorrent but still spends about 1.8 s past the
 moment its K closest settled. Live numbers vary run to run.
 
 CPU, from benchmarks: decoding a response with 8 nodes takes 1.1 µs and 9
