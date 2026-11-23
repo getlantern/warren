@@ -72,13 +72,14 @@ func (e *Endpoint) watchStalls() {
 // checkStall starts a migration if c's peer has been silent past timeout
 // and no stall migration is running or backing off.
 func (c *Conn) checkStall(now time.Time, timeout time.Duration) {
-	if timeout <= 0 || c.p.silentFor(now) < timeout {
+	_, _, gen := c.p.current()
+	wait := c.p.waiting.Load()
+	if timeout <= 0 || wait == 0 || now.Sub(time.Unix(0, wait)) < timeout {
 		return
 	}
 	if now.UnixNano() < c.stallNext.Load() || !c.stallBusy.CompareAndSwap(false, true) {
 		return
 	}
-	_, _, gen := c.p.current()
 	e := c.e
 	e.mu.Lock()
 	if e.closed {
@@ -93,7 +94,7 @@ func (c *Conn) checkStall(now time.Time, timeout time.Duration) {
 		defer c.stallBusy.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), maxStallBackoff)
 		defer cancel()
-		if err := c.migrate(ctx, moveStall, gen); err != nil {
+		if err := c.migrate(ctx, moveStall, stallMark{gen, wait}); err != nil {
 			// The peer may be gone rather than moved: back off, doubling up to
 			// the cap, so a dead session doesn't signal the DHT every second
 			// until the layer above gives up on it.

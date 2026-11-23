@@ -87,12 +87,13 @@ func TestStalledSessionMigrates(t *testing.T) {
 // idle one: silence counts only after we sent something.
 func TestAnsweredConnectionStays(t *testing.T) {
 	_, out, _ := echoed(t, "healthy")
+	before := out.LocalAddr().String()
 	for end := time.Now().Add(2500 * time.Millisecond); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
 		ping(t, out)
 	}
 	time.Sleep(1500 * time.Millisecond) // idle across watcher ticks
-	if n := out.moveReqs.Load(); n != 0 {
-		t.Fatalf("a connection with an answering peer migrated %d times", n)
+	if out.LocalAddr().String() != before {
+		t.Fatal("a connection with an answering peer migrated")
 	}
 }
 
@@ -187,8 +188,9 @@ func TestSuppressedSendErrorStartsWait(t *testing.T) {
 // retries don't bypass the stall backoff.
 func TestFailedStallMoveLeavesNoRequest(t *testing.T) {
 	c := &Conn{e: &Endpoint{closed: true}, p: &path{}, outbound: true}
-	c.p.waiting.Store(time.Now().Add(-time.Hour).UnixNano())
-	if err := c.migrate(context.Background(), moveStall, 0); err == nil {
+	w := time.Now().Add(-time.Hour).UnixNano()
+	c.p.waiting.Store(w)
+	if err := c.migrate(context.Background(), moveStall, stallMark{0, w}); err == nil {
 		t.Fatal("setup: the stall move should fail on a closed endpoint")
 	}
 	if c.moveReqs.Load() != 0 || c.unmoved() {
@@ -196,8 +198,9 @@ func TestFailedStallMoveLeavesNoRequest(t *testing.T) {
 	}
 }
 
-// A stall move queued behind another migration does nothing once that one
-// replaced the path it judged, or the peer answered.
+// A stall move queued behind another migration does nothing once the wait
+// it judged is over: that migration replaced the path, the peer answered,
+// or it answered and a fresh wait (not yet past the timeout) began.
 func TestQueuedStallMoveSkipsReplacedPath(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -205,16 +208,18 @@ func TestQueuedStallMoveSkipsReplacedPath(t *testing.T) {
 	}{
 		{"replaced", func(p *path) { p.mu.Lock(); p.gen++; p.mu.Unlock() }},
 		{"answered", func(p *path) { p.waiting.Store(0) }},
+		{"fresh wait", func(p *path) { p.waiting.Store(time.Now().UnixNano()) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// A closed endpoint makes a move that runs fail, so a nil error
 			// means it was skipped.
 			c := &Conn{e: &Endpoint{closed: true}, p: &path{}, outbound: true}
-			c.p.waiting.Store(time.Now().Add(-time.Hour).UnixNano())
+			w := time.Now().Add(-time.Hour).UnixNano()
+			c.p.waiting.Store(w)
 			c.slotOnce.Do(func() { c.migrateSlot = make(chan struct{}, 1) })
 			c.migrateSlot <- struct{}{} // another migration in flight
 			done := make(chan error, 1)
-			go func() { done <- c.migrate(context.Background(), moveStall, 0) }()
+			go func() { done <- c.migrate(context.Background(), moveStall, stallMark{0, w}) }()
 			time.Sleep(50 * time.Millisecond)
 			tc.recover(c.p)
 			<-c.migrateSlot
@@ -281,9 +286,38 @@ func TestIdleHysteria2DoesntStall(t *testing.T) {
 		}
 	}
 	echo()
+	before := out.LocalAddr().String()
 	time.Sleep(14 * time.Second) // past hysteria2's 10-second keepalive
-	if out.migrations != 0 {
-		t.Fatalf("an idle, healthy session migrated %d times", out.migrations)
+	if out.LocalAddr().String() != before {
+		t.Fatal("an idle, healthy session migrated")
 	}
 	echo()
+}
+
+// A path swap keeps when the peer was last heard from: an acknowledgment of
+// what arrived on the old path, sent on the new one, mustn't start a wait.
+func TestSwapKeepsAckGrace(t *testing.T) {
+	var socks [2]*net.UDPConn
+	for i := range socks {
+		c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		socks[i] = c
+	}
+	peer := netip.MustParseAddrPort("127.0.0.1:9")
+	p := newPath(socks[0], peer)
+	defer p.close()
+	p.lastRecv.Store(time.Now().UnixNano())
+	p.waiting.Store(time.Now().Add(-time.Hour).UnixNano())
+	if !p.swap(1, socks[1], peer) {
+		t.Fatal("setup: swap refused")
+	}
+	if p.waiting.Load() != 0 {
+		t.Fatal("a swap kept the old path's wait")
+	}
+	p.sent()
+	if p.waiting.Load() != 0 {
+		t.Fatal("an acknowledgment just after a swap started a wait")
+	}
 }

@@ -60,8 +60,9 @@ func (p *path) swap(seq uint64, sock *net.UDPConn, real netip.AddrPort) bool {
 	old := p.sock
 	p.sock, p.real, p.seq = sock, real, seq
 	p.gen++
-	p.waiting.Store(0) // a fresh path starts unjudged
-	p.lastRecv.Store(0)
+	// A fresh path starts unjudged. lastRecv carries over: an acknowledgment
+	// of what arrived on the old path can still go out on the new one.
+	p.waiting.Store(0)
 	utpshape.SetDontFragment(sock)
 	_ = sock.SetReadDeadline(p.readDeadline)
 	_ = sock.SetWriteDeadline(p.writeDeadline)
@@ -157,16 +158,6 @@ func (p *path) sent() {
 		return
 	}
 	p.waiting.CompareAndSwap(0, now)
-}
-
-// silentFor reports how long the peer has been silent since a datagram we
-// sent, or zero when nothing is awaiting an answer.
-func (p *path) silentFor(now time.Time) time.Duration {
-	w := p.waiting.Load()
-	if w == 0 {
-		return 0
-	}
-	return now.Sub(time.Unix(0, w))
 }
 
 func (p *path) close() error {

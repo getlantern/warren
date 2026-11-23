@@ -512,7 +512,7 @@ func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 			if onlyUnmoved {
 				kind = moveRetry
 			}
-			if err := c.migrate(ctx, kind, 0); err != nil {
+			if err := c.migrate(ctx, kind, stallMark{}); err != nil {
 				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.PeerKey[:4], err)
 			}
 		})
@@ -730,7 +730,7 @@ func (e *Endpoint) resumable(id [16]byte, caller [32]byte) *Conn {
 // the Conn (hysteria2, QUIC) carry on; datagrams in flight during the move
 // are lost, as on any network change.
 func (c *Conn) Migrate(ctx context.Context) error {
-	return c.migrate(ctx, moveRequest, 0)
+	return c.migrate(ctx, moveRequest, stallMark{})
 }
 
 // moveKind is why a migration runs.
@@ -745,13 +745,21 @@ const (
 	moveRetry
 	// moveStall answers a silent peer. It adds no request (the stall
 	// watcher retries it, with backoff) and does nothing if, by the time it
-	// holds the slot, the path it judged was replaced or the peer answered.
+	// holds the slot, the wait it judged is over: the path was replaced or
+	// the peer answered, even if a fresh wait has started since.
 	moveStall
 )
 
-// migrate runs a migration; stallGen is the path generation a moveStall
-// judged stalled. Retries and stall moves never replace a working path.
-func (c *Conn) migrate(ctx context.Context, kind moveKind, stallGen int) error {
+// stallMark identifies the wait a stall move judged: the path generation
+// and when that wait began.
+type stallMark struct {
+	gen  int
+	wait int64
+}
+
+// migrate runs a migration; stall is the wait a moveStall judged. Retries
+// and stall moves never replace a working path.
+func (c *Conn) migrate(ctx context.Context, kind moveKind, stall stallMark) error {
 	if !c.outbound {
 		return ErrNotCaller
 	}
@@ -771,7 +779,7 @@ func (c *Conn) migrate(ctx context.Context, kind moveKind, stallGen int) error {
 			return nil
 		}
 	case moveStall:
-		if _, _, gen := c.p.current(); gen != stallGen || c.p.silentFor(time.Now()) == 0 {
+		if _, _, gen := c.p.current(); gen != stall.gen || stall.wait == 0 || c.p.waiting.Load() != stall.wait {
 			return nil
 		}
 	}
