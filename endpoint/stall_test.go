@@ -156,12 +156,12 @@ func TestStallWatcherStopsWithoutConnections(t *testing.T) {
 func TestAckDoesntStartWait(t *testing.T) {
 	p := &path{}
 	p.lastRecv.Store(time.Now().UnixNano())
-	p.sent()
+	p.sent(0)
 	if p.waiting.Load() != 0 {
 		t.Fatal("an acknowledgment of what just arrived started the wait")
 	}
 	p.lastRecv.Store(time.Now().Add(-2 * ackGrace).UnixNano())
-	p.sent()
+	p.sent(0)
 	if p.waiting.Load() == 0 {
 		t.Fatal("a datagram sent well after the last arrival didn't start the wait")
 	}
@@ -316,7 +316,7 @@ func TestSwapKeepsAckGrace(t *testing.T) {
 	if p.waiting.Load() != 0 {
 		t.Fatal("a swap kept the old path's wait")
 	}
-	p.sent()
+	p.sent(1)
 	if p.waiting.Load() != 0 {
 		t.Fatal("an acknowledgment just after a swap started a wait")
 	}
@@ -335,5 +335,19 @@ func TestOldPathReadKeepsNewWait(t *testing.T) {
 	p.heard(1)
 	if p.waiting.Load() != 0 {
 		t.Fatal("an answer on the current path didn't clear the wait")
+	}
+}
+
+// A write that went out on a socket swapped out since doesn't start a wait
+// on the new path, which sent nothing.
+func TestOldPathSendStartsNoWait(t *testing.T) {
+	p := &path{gen: 1}
+	p.sent(0)
+	if p.waiting.Load() != 0 {
+		t.Fatal("a send on the old path started a wait on the new one")
+	}
+	p.sent(1)
+	if p.waiting.Load() == 0 {
+		t.Fatal("a send on the current path didn't start the wait")
 	}
 }

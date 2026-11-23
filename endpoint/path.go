@@ -110,12 +110,12 @@ func (p *path) write(b []byte) (int, error) {
 			p.testHookWrite()
 		}
 		if p.testDrop.Load() == sock {
-			p.sent()
+			p.sent(gen)
 			return len(b), nil
 		}
 		n, err := sock.WriteToUDPAddrPort(b, real)
 		if err == nil {
-			p.sent()
+			p.sent(gen)
 			return n, nil
 		}
 		p.mu.Lock()
@@ -132,7 +132,7 @@ func (p *path) write(b []byte) (int, error) {
 		// fatal, and the session must outlive the moment before a migration
 		// installs a working path. It still awaits an answer, so a path whose
 		// route is gone is judged stalled.
-		p.sent()
+		p.sent(gen)
 		return len(b), nil
 	}
 }
@@ -159,17 +159,26 @@ func (p *path) heard(gen int) {
 // that goes unanswered is retransmitted later than this and starts it then.
 const ackGrace = time.Second
 
-// sent notes a datagram went out, starting the wait for an answer if none
-// is running and it isn't an acknowledgment of what just arrived.
-func (p *path) sent() {
+// sent notes a datagram went out on path generation gen, starting the
+// wait for an answer if none is running and it isn't an acknowledgment of
+// what just arrived. It holds mu, as heard does, so a reply can't land
+// between the check and the start and leave a wait nothing will clear, and
+// a write that went out on a socket since swapped out doesn't start a wait
+// on the new path, which sent nothing.
+func (p *path) sent(gen int) {
 	if p.waiting.Load() != 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.gen != gen || p.waiting.Load() != 0 {
 		return
 	}
 	now := time.Now().UnixNano()
 	if now-p.lastRecv.Load() < int64(ackGrace) {
 		return
 	}
-	p.waiting.CompareAndSwap(0, now)
+	p.waiting.Store(now)
 }
 
 func (p *path) close() error {
