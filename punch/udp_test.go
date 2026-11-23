@@ -57,8 +57,19 @@ func exchange(t *testing.T, a, b punchResult) {
 		t.Fatal(err)
 	}
 	b.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 64)
-	n, from, err := b.conn.ReadFromUDPAddrPort(buf)
+	buf := make([]byte, 256)
+	var n int
+	var from netip.AddrPort
+	var err error
+	for {
+		n, from, err = b.conn.ReadFromUDPAddrPort(buf)
+		// The peer may still be finishing its own checks: skip leftover
+		// punch control traffic (KRPC, first byte 'd'), as endpoint.Conn.Recv
+		// does.
+		if err != nil || n == 0 || buf[0] != 'd' {
+			break
+		}
+	}
 	if err != nil || string(buf[:n]) != "ping over punched path" {
 		t.Fatalf("data over the path: %v %q", err, buf[:n])
 	}
