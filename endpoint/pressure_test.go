@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,5 +152,36 @@ func TestAcceptSkipsShedConnections(t *testing.T) {
 	defer cancel2()
 	if got, err := e.Accept(short); err == nil {
 		t.Fatalf("Accept returned shed connection %p", got)
+	}
+}
+
+// Another inbound worker queueing while enqueue holds a live connection out
+// of the queue (to drop closed ones) can't take its slot and get it closed.
+func TestConcurrentEnqueueKeepsLiveConnections(t *testing.T) {
+	e := &Endpoint{accept: make(chan *Conn, 3), done: make(chan struct{})}
+	conn := func(b byte) *Conn {
+		c := e.newConn(punchedLoopback(t), [32]byte{b}, []byte("secret-secret-secret"), nil)
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	live, shed1, shed2 := conn(1), conn(2), conn(3)
+	e.enqueue(live)
+	e.enqueue(shed1)
+	e.enqueue(shed2)
+	shed1.Close()
+	shed2.Close()
+	a, b := conn(4), conn(5)
+	var wg sync.WaitGroup
+	e.testHookRequeue = func() {
+		e.testHookRequeue = nil
+		wg.Go(func() { e.enqueue(b) }) // races into the slot live left
+		time.Sleep(50 * time.Millisecond)
+	}
+	e.enqueue(a)
+	wg.Wait()
+	for _, c := range []*Conn{live, a, b} {
+		if c.p.isClosed() {
+			t.Fatal("a live connection that fit the queue was closed")
+		}
 	}
 }

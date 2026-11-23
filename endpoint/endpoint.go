@@ -221,7 +221,11 @@ type Endpoint struct {
 
 	sockets sockets // extra punch sockets in flight (Config.MaxPunchSockets)
 
-	refusing atomic.Bool // SetRefusing
+	refusing  atomic.Bool // SetRefusing
+	enqueueMu sync.Mutex  // serializes handing inbound connections to Accept
+	// testHookRequeue, if set, runs while enqueue holds a live connection
+	// out of the queue, so tests can race another producer into its slot.
+	testHookRequeue func()
 
 	connsMu sync.Mutex
 	// Live connections by peer key and resume ID, inbound and outbound
@@ -641,8 +645,12 @@ func (e *Endpoint) Accept(ctx context.Context) (*Conn, error) {
 
 // enqueue hands an inbound connection to Accept. When the queue is full it
 // first drops connections closed while they waited, which would otherwise
-// hold their slots, and closes c only if there is still no room.
+// hold their slots, and closes c only if there is still no room. Producers
+// are serialized, so while one takes live connections out to put them back
+// only Accept can change the queue, and only by making room.
 func (e *Endpoint) enqueue(c *Conn) {
+	e.enqueueMu.Lock()
+	defer e.enqueueMu.Unlock()
 	select {
 	case e.accept <- c:
 		return
@@ -652,6 +660,9 @@ func (e *Endpoint) enqueue(c *Conn) {
 		select {
 		case q := <-e.accept:
 			if !q.p.isClosed() {
+				if e.testHookRequeue != nil {
+					e.testHookRequeue()
+				}
 				select {
 				case e.accept <- q:
 				default:
