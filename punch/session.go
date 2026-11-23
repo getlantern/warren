@@ -50,6 +50,16 @@ type Config struct {
 	// per address family) shares one claim among them, so the responder
 	// is only ever nominated on one and both sides keep the same path.
 	Claim func() bool
+	// Reserve, if set, is asked once, when the session plans, for the extra
+	// sockets its strategy wants (up to MaxExtraSockets, for the open and
+	// birthday strategies); it returns how many the session may open, from
+	// 0 to want. The process's open files are finite (on iOS especially),
+	// so a caller running several punches shares a budget through it. With
+	// fewer sockets the strategy is less likely to land; with none the
+	// session falls back to the relay if it has one, and otherwise probes
+	// from its own socket alone (Direct), which can still meet a peer that
+	// sprays toward it.
+	Reserve func(want int) int
 }
 
 func (s *Session) claim() bool { return s.cfg.Claim == nil || s.cfg.Claim() }
@@ -357,6 +367,16 @@ func (s *Session) Start(now time.Time, remote Offer) {
 	}
 	if noDirect {
 		s.strategy, extra = Relay, 0
+	}
+	if extra > 0 && s.cfg.Reserve != nil {
+		switch got := min(max(s.cfg.Reserve(extra), 0), extra); {
+		case got > 0:
+			extra = got
+		case s.relay.IsValid():
+			s.strategy, extra = Relay, 0
+		default:
+			s.strategy, extra = Direct, 0
+		}
 	}
 	s.sockets = 1 + extra
 	s.started = true

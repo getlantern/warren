@@ -555,3 +555,53 @@ func TestCommittedAfterNomination(t *testing.T) {
 		t.Fatal("not committed after connecting through a nomination")
 	}
 }
+
+// A session asks Reserve for the extra sockets its strategy wants and opens
+// only what it is granted; granted none, it falls back to its relay, or to
+// probing from its own socket when it has no relay.
+func TestReserveBoundsExtraSockets(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	dependent := Profile{Mapping: MappingDependent, Allocation: AllocRandom}
+	peer := Offer{Candidates: []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:40000")}, Profile: Profile{Mapping: MappingIndependent}}
+	relay := netip.MustParseAddrPort("2.176.0.9:6881")
+	for _, tc := range []struct {
+		name     string
+		grant    int
+		relay    netip.AddrPort
+		sockets  int
+		strategy Strategy
+	}{
+		{"all", MaxExtraSockets, netip.AddrPort{}, 1 + MaxExtraSockets, Open},
+		{"some", 3, netip.AddrPort{}, 4, Open},
+		{"none, relay", 0, relay, 1, Relay},
+		{"none, no relay", 0, netip.AddrPort{}, 1, Direct},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked int
+			var relays []netip.AddrPort
+			if tc.relay.IsValid() {
+				relays = []netip.AddrPort{tc.relay}
+			}
+			s := New(Config{Initiator: true, Secret: secret, Local: dependent, Relays: relays, Rand: rand.New(rand.NewPCG(9, 9)),
+				Reserve: func(want int) int { asked = want; return tc.grant }})
+			s.Start(time.Unix(1_800_000_000, 0), peer)
+			if asked != MaxExtraSockets {
+				t.Fatalf("asked for %d sockets, want %d", asked, MaxExtraSockets)
+			}
+			if s.Sockets() != tc.sockets || s.strategy != tc.strategy {
+				t.Fatalf("sockets %d strategy %v, want %d %v", s.Sockets(), s.strategy, tc.sockets, tc.strategy)
+			}
+		})
+	}
+}
+
+// A strategy needing no extra sockets never asks for any.
+func TestDirectReservesNothing(t *testing.T) {
+	asked := false
+	s := New(Config{Initiator: true, Secret: []byte("0123456789abcdef0123456789abcdef"), Local: Profile{Mapping: MappingIndependent},
+		Rand: rand.New(rand.NewPCG(10, 10)), Reserve: func(int) int { asked = true; return 0 }})
+	s.Start(time.Unix(1_800_000_000, 0), Offer{Candidates: []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:40000")}, Profile: Profile{Mapping: MappingIndependent}})
+	if asked || s.Sockets() != 1 {
+		t.Fatalf("a direct session reserved sockets (asked %v, sockets %d)", asked, s.Sockets())
+	}
+}

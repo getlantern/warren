@@ -15,8 +15,15 @@ import (
 // echoed connects caller to an echoing provider.
 func echoed(t *testing.T, name string) (*Endpoint, *Conn, context.Context) {
 	t.Helper()
+	caller, _, out, ctx := echoedWith(t, name)
+	return caller, out, ctx
+}
+
+// echoedWith is echoed, also returning the provider.
+func echoedWith(t *testing.T, name string) (caller, provider *Endpoint, out *Conn, ctx context.Context) {
+	t.Helper()
 	seed := network(t, 8)
-	provider, caller := phone(t, seed), phone(t, seed)
+	provider, caller = phone(t, seed), phone(t, seed)
 	caller.stallTimeout.Store(int64(300 * time.Millisecond))
 	pk := key(name + "-provider")
 	listenAndWait(t, provider, pk)
@@ -42,7 +49,7 @@ func echoed(t *testing.T, name string) (*Endpoint, *Conn, context.Context) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { out.Close() })
-	return caller, out, ctx
+	return caller, provider, out, ctx
 }
 
 func ping(t *testing.T, c *Conn) {

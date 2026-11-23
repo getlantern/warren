@@ -25,6 +25,10 @@ func (s Strategy) String() string {
 	return [...]string{"direct", "spray", "open", "double-birthday", "relay"}[s]
 }
 
+// MaxExtraSockets is the most extra sockets a session opens (the open and
+// birthday strategies), besides its own.
+const MaxExtraSockets = openSockets
+
 // Budgets.
 const (
 	openSockets        = 64
