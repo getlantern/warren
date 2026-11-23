@@ -8,6 +8,8 @@
 //
 // Without -python only warren runs; -no-miss skips the miss phase, and
 // -inflight, -alpha, -short and -timeout tune the measured warren node.
+// Above -concurrency 4 both warren nodes' lookup cap is raised to
+// concurrency+16 so the gets can run at once.
 // Both nodes are full (not read-only) nodes, bootstrapped from the public
 // routers.
 package main
@@ -80,7 +82,8 @@ func main() {
 	// up for the same time.
 	ip := externalIP(seeds)
 	// The default cap leaves gets 4 sure slots (internal lookups may fill
-	// the rest); past that concurrency, raise it so gets really run at once.
+	// the rest, though in practice they take one or two); past that
+	// concurrency, raise it so gets can run at once.
 	measured := tune
 	if *concurrency > 4 {
 		measured.MaxLookups = max(measured.MaxLookups, *concurrency+16)
@@ -166,8 +169,9 @@ func main() {
 			}
 		}
 		if n > 0 {
-			fmt.Printf("warren: found %d/%d, %.1f queries and %.1f failures per lookup, %d starts retried at the lookup cap\n", found, len(ph.w), float64(q)/float64(n), float64(f)/float64(n), ph.busy)
+			fmt.Printf("warren: found %d/%d, %.1f queries and %.1f failures per lookup\n", found, len(ph.w), float64(q)/float64(n), float64(f)/float64(n))
 		}
+		fmt.Printf("warren: %d retries at the lookup cap (50 ms apart)\n", ph.busy)
 		if lt != nil {
 			found = 0
 			for _, l := range ph.lt {
@@ -340,8 +344,8 @@ func (w *warren) gets(targets []krpc.NodeID, concurrency int) []lookup {
 	return out
 }
 
-// busyRetries counts starts refused with ErrBusy, reported with the results
-// so throttling by the node's lookup cap shows.
+// busyRetries counts retries after ErrBusy (one per 50 ms wait), reported
+// with the results so throttling by the node's lookup cap shows.
 var busyRetries atomic.Int64
 
 // untilAdmitted runs f, retrying for up to a minute while the node is at its
