@@ -332,6 +332,9 @@ func TestOldPathReadKeepsNewWait(t *testing.T) {
 	if p.waiting.Load() != w {
 		t.Fatal("a read from the old path cleared the new path's wait")
 	}
+	if p.lastRecv.Load() == 0 {
+		t.Fatal("a datagram delivered from the old path didn't count for ackGrace")
+	}
 	p.heard(1)
 	if p.waiting.Load() != 0 {
 		t.Fatal("an answer on the current path didn't clear the wait")
@@ -349,5 +352,36 @@ func TestOldPathSendStartsNoWait(t *testing.T) {
 	p.sent(1)
 	if p.waiting.Load() == 0 {
 		t.Fatal("a send on the current path didn't start the wait")
+	}
+}
+
+// The backoff belongs to the wait that failed: once the peer answers and a
+// new wait begins, a stall is acted on at once and backs off from the
+// timeout again.
+func TestStallBackoffResetsForNewWait(t *testing.T) {
+	c := &Conn{e: &Endpoint{}, p: &path{}} // not outbound: Migrate fails at once
+	c.p.waiting.Store(time.Now().Add(-time.Hour).UnixNano())
+	settle := func() {
+		for c.stallBusy.Load() {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	timeout := 100 * time.Millisecond
+	c.checkStall(time.Now(), timeout)
+	settle()
+	c.checkStall(time.Unix(0, c.stallNext.Load()).Add(time.Millisecond), timeout)
+	settle()
+	if c.stallBackoff != 2*timeout {
+		t.Fatalf("setup: backoff %v, want %v", c.stallBackoff, 2*timeout)
+	}
+	next := c.stallNext.Load()
+	c.p.waiting.Store(time.Now().Add(-time.Minute).UnixNano()) // answered, then a new wait
+	c.checkStall(time.Now(), timeout)
+	settle()
+	if c.stallNext.Load() == next {
+		t.Fatal("a new wait inherited the old wait's backoff")
+	}
+	if c.stallBackoff != timeout {
+		t.Fatalf("a new wait's backoff %v, want %v", c.stallBackoff, timeout)
 	}
 }

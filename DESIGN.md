@@ -671,7 +671,8 @@ so a path whose route vanished is judged stalled. An idle session (nothing
 sent) is never judged. Five seconds also leaves a migration time to finish
 before QUIC's 30-second idle timeout ends the session. Silence costs no
 probe packets: the session's own traffic is the probe. A failed stall
-migration backs off, doubling from the timeout to 30 seconds, since a
+migration backs off while the same wait goes unanswered, doubling from the
+timeout to 30 seconds (a new wait or path starts again), since a
 provider that is gone rather than moved would otherwise be signaled through
 the DHT every second until the layer above gives up. A stall move isn't
 a migration request, so a failed one isn't retried by `WatchNetwork` around

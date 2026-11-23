@@ -77,7 +77,8 @@ func (c *Conn) checkStall(now time.Time, timeout time.Duration) {
 	if timeout <= 0 || wait == 0 || now.Sub(time.Unix(0, wait)) < timeout {
 		return
 	}
-	if now.UnixNano() < c.stallNext.Load() || !c.stallBusy.CompareAndSwap(false, true) {
+	sameWait := wait == c.stallFailedWait.Load() && int64(gen) == c.stallFailedGen.Load()
+	if (sameWait && now.UnixNano() < c.stallNext.Load()) || !c.stallBusy.CompareAndSwap(false, true) {
 		return
 	}
 	e := c.e
@@ -96,13 +97,21 @@ func (c *Conn) checkStall(now time.Time, timeout time.Duration) {
 		defer cancel()
 		if err := c.migrate(ctx, moveStall, stallMark{gen, wait}); err != nil {
 			// The peer may be gone rather than moved: back off, doubling up to
-			// the cap, so a dead session doesn't signal the DHT every second
-			// until the layer above gives up on it.
+			// the cap while the same wait goes unanswered, so a dead session
+			// doesn't signal the DHT every second until the layer above gives
+			// up on it. A new wait (the peer answered meanwhile) or a new path
+			// starts again from the timeout.
+			if !sameWait {
+				c.stallBackoff = 0
+			}
 			c.stallBackoff = min(max(2*c.stallBackoff, timeout), maxStallBackoff)
+			c.stallFailedGen.Store(int64(gen))
+			c.stallFailedWait.Store(wait)
 			c.stallNext.Store(time.Now().Add(c.stallBackoff).UnixNano())
 			return
 		}
 		c.stallBackoff = 0
 		c.stallNext.Store(0)
+		c.stallFailedWait.Store(0)
 	}()
 }

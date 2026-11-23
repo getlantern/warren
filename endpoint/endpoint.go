@@ -119,11 +119,15 @@ type Conn struct {
 	resumes   []time.Time // inbound: recent resumes, for their budget
 
 	// Stall migrations (outbound): one at a time, and after a failure none
-	// before stallNext (Unix nanoseconds). stallBackoff is touched only by
-	// the running stall migration.
-	stallBusy    atomic.Bool
-	stallNext    atomic.Int64
-	stallBackoff time.Duration
+	// for the same wait before stallNext (Unix nanoseconds). The backoff
+	// belongs to the wait that failed (stallFailedGen, stallFailedWait): a
+	// new wait or path starts fresh. stallBackoff is touched only by the
+	// running stall migration.
+	stallBusy       atomic.Bool
+	stallNext       atomic.Int64
+	stallFailedGen  atomic.Int64
+	stallFailedWait atomic.Int64
+	stallBackoff    time.Duration
 }
 
 // maxResumesPerMinute bounds how often one inbound connection can be moved.

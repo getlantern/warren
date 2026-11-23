@@ -137,16 +137,18 @@ func (p *path) write(b []byte) (int, error) {
 	}
 }
 
-// heard notes the peer answered on path generation gen. A datagram read
-// from a socket since swapped out doesn't count: it would clear a wait
-// begun on the new path, which nothing there has answered.
+// heard notes a datagram from the peer arrived on path generation gen.
+// Every delivered datagram counts as heard, for ackGrace: the protocol
+// above may acknowledge it on the new path. Only one from the current path
+// clears the wait: a datagram read from a socket since swapped out would
+// clear a wait begun on the new path, which nothing there has answered.
 func (p *path) heard(gen int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.lastRecv.Store(time.Now().UnixNano())
 	if p.gen != gen {
 		return
 	}
-	p.lastRecv.Store(time.Now().UnixNano())
 	if p.waiting.Load() != 0 {
 		p.waiting.Store(0)
 	}
