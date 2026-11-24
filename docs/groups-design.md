@@ -130,8 +130,10 @@ The roster is a set of operations signed by member keys, kept by members
 - `add` (member key, display name, role, and the current `G` and every
   epoch key so far sealed to the new member; a mirror gets `G` only) by an
   admin, or by the owner when the role is `admin`. A role is fixed when the
-  key is added: v1 has no role changes. To change a device's role, it is
-  removed and added again under a fresh member key;
+  key is added: v1 has no role changes, and an `add` of a key already on
+  the roster never counts. To change a device's role, it is removed and
+  added again under a fresh member key (a full removal, see *Open
+  problems*);
 - `remove` (member key; the remover's view of that member: the hashes of its
   latest roster operations and the head of its log the remover has seen,
   sequence number and entry hash; and the rekey, see *Removal*) by an admin,
@@ -170,8 +172,8 @@ operations the author had seen). Folding is deterministic:
   counts in the total order. Two concurrent rekeys by different admins
   therefore resolve the same way on every member, and the losing rekey's
   epoch key stays readable (*Keys*);
-- **a removed key never returns**: an `add` of a key that was ever removed
-  doesn't count, and a `remove` of a key that is no longer on the roster
+- **a removed key never returns**: an `add` of a key that a counting
+  `remove` earlier in the total order removed doesn't count, and a `remove` of a key that is no longer on the roster
   when applied doesn't count either (members keep any keys it sealed to
   them, so content written under them stays readable);
 - operations by a removed author count only if the `remove` names them, or
@@ -187,8 +189,9 @@ a trusted clock, every rule for admins removing each other at once lets a
 compromised admin either strike back at its remover, make itself
 unremovable, or grant itself authority through an admin it adds; a single
 owner rules that out. The owner's operations fold like any others; its
-authority is absolute, so nothing it signs, even from a stale backup, can
-conflict with its own authority. The cost: a lost or compromised owner key
+authority is absolute, so its operations can't conflict with each other's
+authority. v1 can't detect a stolen owner key: the app shows every roster
+change as an event, so people can notice and recreate the group. The cost: a lost or compromised owner key
 can't be replaced in v1. The group keeps working but its admins are fixed,
 and if the owner key is compromised, the members recreate the group.
 
@@ -430,13 +433,38 @@ carries neither `G` nor any member key.
   can check its own `add` and compute the members' rendezvous keys. The
   invitee then leaves the join session for normal ones.
 - Single-use invites are spent at the first `add` against them; all are
-  refused after expiry or after a removal (*Removal*). An admin re-invites a
-  member that was offline through a removal the same way, removing its old
-  key; for a former admin, the owner does both.
+  refused after expiry, and invites issued before a removal are refused
+  after it (*Removal*). An admin re-invites a
+  member that was offline through a removal the same way: it removes the
+  old key first, then issues the invite; for a former admin, the owner does
+  both.
 
 A leaked invite lets its holder ask to join, nothing more: it can't
 impersonate the admin, read the directory or content, find members, or
 join without an admin's `add`.
+
+## Device restore
+
+A device restored from a backup must not sign anything until it has fetched
+its own latest roster operations and log head from members; otherwise it
+reuses sequence numbers, which members take as proof its log forked. A
+device that can't reach a member waits (and the app is told) rather than
+signing.
+
+## Open problems
+
+These need the dedicated protocol review (ideally a model checker over the
+fold) before phase 1 builds the roster:
+
+- **Re-invites and role changes are full removals.** Each rekeys the group,
+  cuts the device's log at the remover's view (dropping what it wrote
+  offline), refuses earlier invites, and starts a new 24-hour window that
+  can push other long-offline members out in turn. A lighter **replace key**
+  operation, with no rekey, for a device that holds only secrets the group
+  already gave it, is the likely fix.
+- **Owner compromise** is detectable only by people watching roster events.
+- **Concurrent removals of the same member** keep only the first remover's
+  log cutoff, dropping entries only the second had seen.
 
 ## Library surface
 
