@@ -52,7 +52,7 @@ Gaps this design closes:
 | Members announce IPs in the clear under the topic | Members are reached through warren's signaling: records hold an encrypted key, holders and relays hide addresses (*Discovery*) |
 | Titles, chat, thumbnails plaintext | All metadata encrypted (*Content*) |
 | No rotation; a removed member reads everything | Group key epochs rotate on removal (*Removal*) |
-| Topic a plain hash of the PSK | HKDF-derived keys, HMAC topics (*Keys*) |
+| Topic a plain hash of the PSK | HKDF-derived keys; per-period directory keys and blinded member keys (*Keys*, *Identity*) |
 
 ## Keys
 
@@ -121,9 +121,12 @@ The roster is a set of operations signed by member keys, kept by members
 - `add` (member key, display name, role or `mirror`, and the current `G`
   and every epoch key so far sealed to the new member; a mirror gets `G`
   only) by an admin;
-- `remove` (member key, and the highest sequence number of its log the
-  remover has seen, see *Logs*) by an admin;
-- `rekey` (see *Removal*) by an admin;
+- `remove` (member key; the remover's view of that member: the hashes of its
+  latest roster operations and the highest sequence number of its log the
+  remover has seen; and the rekey, see *Removal*) by an admin, as one
+  operation;
+- `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
+  admin;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
 - `deliver` (the current `G` and epoch key sealed to one member already
   added) by any member: it grants no rights, so it isn't admin-checked, and
@@ -139,9 +142,12 @@ latest operations the author had seen). Folding is deterministic:
   admin: then the removal by the **more senior** admin (added earlier in
   the fold) stands. Seniority is fixed by history, unlike a hash an author
   could grind;
-- once a member has applied an author's removal, it rejects every operation
-  from that author it receives afterwards, whatever parents or clock it
-  claims, so a removed admin can't backdate operations into the past.
+- operations by a removed author count only if the `remove` names them, or
+  their descendants, in its view of that author. That depends only on the
+  `remove`'s content, not on when anything arrives, so every member folds
+  the same roster, and a removed admin can't backdate operations into the
+  past. A legitimate operation by that author the remover hadn't seen yet is
+  dropped too: the price of a rule everyone applies alike.
 
 Members exchange operations they lack at the start of every session
 (*Sessions*), so the roster converges by gossip.
@@ -201,9 +207,14 @@ recovery and memory caps.
   checks pass. Warren needs two changes for this: an endpoint listening under
   several keys at once (today the DHT node holds a single listener), and
   `Authorize` told which listener key was called.
-- **A newer roster than the callee's** (a member added since the callee last
-  synced): the caller presents the signed `add` chain first; the callee
-  verifies and admits it.
+- **A caller the callee doesn't know yet** (a member added since the
+  callee last synced): signaling can't carry the proof, since admission
+  comes before any session. The callee admits a caller whose key it doesn't
+  recognize into a **sync session** that serves nothing until the caller
+  presents a signed `add` chain admitting a member key whose blinded key is
+  the caller's. Only a holder of `G` can compute the callee's rendezvous key
+  to call it at all, so this opens the callee only to members, recently
+  removed members (refused once the chain is checked), and nobody else.
 - On connect the two exchange roster heads and missing operations, then
   liveness (members each has reached lately), then log heads (*Logs*) and
   content inventories (*Swarming*).
@@ -246,12 +257,14 @@ sends what's missing. Two different entries at the same sequence number,
 both signed by the author, are proof the author forked its log: members keep
 the proof, stop accepting that log, and tell the app. Any member can serve
 another's log, so a member offline for a week catches up from whoever is
-around.
+around (unless a rekey happened meanwhile, see *Removal*).
 
 **Removal and logs.** A removed member's log keeps the entries it wrote
 before removal. The `remove` operation records the highest sequence number
 of that log the removing admin had seen, and members accept nothing past
-it. Without a trusted clock an entry written offline just before removal
+it. If two admins remove the same member concurrently, the higher of their
+cutoffs applies (both admins saw those entries). Entries a member had
+already accepted past the final cutoff are withdrawn, and the app told. Without a trusted clock an entry written offline just before removal
 can't be told from one backdated after, so this cut is the rule: a removed
 member's late offline writes are dropped rather than its forgeries kept.
 
@@ -283,57 +296,68 @@ mirrors as to members, and the new epoch key to members only.
 
 Removing a member:
 
-1. An admin writes `remove`, then a `rekey`: a fresh group secret `G'`
-   sealed to every remaining member and mirror, and a fresh epoch key sealed
-   to every remaining member, each to its X25519 key (derived from its
-   member key).
-2. A member that learns of a `remove` applies it, and any rekey, **before it
-   publishes anything**, so it wraps new blob keys under the new epoch key
-   and moves to `G'`.
-3. **Concurrent changes.** If, after folding, the current rekey turns out to
-   have sealed keys to a member the fold removed (two admins removing two
-   members at once), it is superseded: an admin issues a fresh rekey sealed
+1. An admin writes `remove`, which carries the rekey in the same operation: a
+   fresh group secret `G'` sealed to every remaining member and mirror, and a
+   fresh epoch key sealed to every remaining member, each to its X25519 key
+   (derived from its member key). One operation, so no member can apply the
+   removal without the new keys.
+2. A member that learns of a `remove` applies it **before it publishes
+   anything**, so it wraps new blob keys under the new epoch key and moves to
+   `G'`.
+3. **Concurrent changes.** If, after folding, the current keys turn out to
+   have been sealed to a member the fold removed (two admins removing two
+   members at once), they are superseded: an admin issues a `rekey` sealed
    only to the members the fold keeps. A member added concurrently with a
-   rekey (one the rekeying admin didn't know of) gets `G'` and the new epoch
-   key from any member that notices, in a `deliver` operation.
-4. **Members offline during a rekey.** For seven days after a rekey, the
+   removal (one the removing admin didn't know of) gets `G'` and the new
+   epoch key from any member that notices, in a `deliver` operation.
+4. **Members offline during a removal.** For 24 hours afterwards, the
    remaining members also listen under their rendezvous keys from the old
-   `G`. A member that missed the rekey reaches them there, and gets the
-   rekey by roster gossip. The removed member can compute those keys too,
-   but every member that applied the removal refuses it.
+   `G`. A member that missed the removal reaches them there, and gets it by
+   roster gossip. A member offline longer is out until an admin re-invites
+   it (*Invites*): it holds only secrets the removed member also holds, so
+   nothing else can tell them apart.
 
 What the removed member keeps: everything from before its removal. What it
 loses: anything published under the new epoch key, the new directory, and
-every session. The guarantee holds for content published by members who
-have applied the removal: a member that hasn't heard of it yet still
-publishes under the old epoch key, which the removed member holds, until it
-does. Step 2 keeps that window as short as gossip.
+every session. Two limits, both inherent to members going offline:
+
+- a member that hasn't heard of the removal yet still publishes under the old
+  epoch key, which the removed member holds, until it does (step 2 keeps
+  that window as short as gossip);
+- during the 24-hour window, the removed member can compute members' old
+  rendezvous keys and see from signaling records who is online, though every
+  member refuses its sessions.
 
 This costs one sealed copy per member per removal, fine for v1 group sizes;
 a tree scheme (MLS/TreeKEM) can replace it for large groups.
 
 ## Invites
 
-An invite is a random **invite secret** `I`, an expiry, a token signed by
-the inviting admin, the group's display name, and a few bootstrap hints
+The inviting admin makes an ed25519 **invite key** and keeps its private
+half. An invite carries the invite **public** key, a random **invite
+secret** `I`, an expiry, the group's display name, and a few bootstrap hints
 (DHT contacts in the right community), encoded as a link or QR code. It
 carries neither `G` nor any member key.
 
-- The admin records the invite in the roster as an `invite` operation
-  (the invite's public key and expiry), so other online members can admit
-  its join session too.
-- While the invite is valid, the admin (and any member that wants to help)
-  listens under a per-period rendezvous key derived from `I`. The invitee
-  derives the same key and calls it with its own key, also derived from `I`.
-- That **join session** carries the invitee's new member key, display name
-  and the signed token, and nothing else. An admin approves with an `add`,
-  which delivers `G` and the epoch keys sealed to the new member, and the
-  invitee leaves the join session for normal ones.
+- The admin records the invite in the roster as an `invite` operation (the
+  invite public key and expiry).
+- While the invite is valid, the admin listens under the invite key blinded
+  per period (*Identity*). The invitee computes that key from the invite's
+  public half and calls it with a fresh key of its own. Only the admin holds
+  the invite's private key, so only the admin can listen there, and one
+  listener means no clash at holders.
+- That **join session** carries the invitee's new member key, display name,
+  and a proof that it knows `I` (a MAC over the session's secret), and
+  nothing else. The admin approves with an `add`, which delivers `G` and the
+  epoch keys sealed to the new member, and the invitee leaves the join
+  session for normal ones.
 - Single-use invites are spent at the first `add` against them; all are
-  refused after expiry or after a rekey (*Removal*).
+  refused after expiry or after a removal (*Removal*). An admin re-invites a
+  member that was offline through a removal the same way.
 
-A leaked invite lets its holder ask to join, nothing more: it can't read the
-directory or content, find members, or join without an admin's `add`.
+A leaked invite lets its holder ask to join, nothing more: it can't
+impersonate the admin, read the directory or content, find members, or
+join without an admin's `add`.
 
 ## Library surface
 
@@ -362,7 +386,8 @@ so an app chooses where data lives and how much.
 
 - **v1 target:** groups of up to about 50 members (decided). Rekey is one
   sealed copy per member; the directory three shards of at most 20.
-- **Idle cost** for a member: a directory read and write every half hour,
+- **Idle cost** for a member: one directory write a period, often made for
+  it by a member it's in session with; directory reads only on a cold start;
   plus warren's listening keepalives.
 - **Memory:** sessions use hysteria2's capped windows; a fetch holds a
   bounded window of pieces in memory; the roster is small.
@@ -373,16 +398,19 @@ so an app chooses where data lives and how much.
    socket, plus invite listeners), and `Authorize` given the listener key
    that was called.
 2. **Ed25519 key blinding** for rendezvous keys (scalar multiplication on
-   the curve, as in Tor's rend-spec-v3).
+   the curve, as in Tor's rend-spec-v3). A blinded key is a bare scalar, not
+   an `ed25519.PrivateKey`, so `endpoint.Listen`, `driver.Node.Listen` and
+   `dht.Node.ListenKey` move to a signer interface that can sign with one.
 3. **Mutable-item puts** from the endpoint, for the directory (the DHT
    supports them; the endpoint doesn't expose puts yet).
 4. Nothing in the data plane: sessions are hysteria2 over `Conn`.
 
 ## Phasing
 
-1. Keys, identity, roster (folding, gossip), logs, invites. Unit-tested.
-2. Warren: multiple listeners, listener-aware `Authorize`; directory over
-   mutable items. Discovery and sessions between members in the simulator.
+1. Keys, identity, roster (folding, gossip), logs. Unit-tested.
+2. Warren: multiple listeners, a signer interface, listener-aware
+   `Authorize`; directory over mutable items. Discovery, sessions and
+   invites between members in the simulator.
 3. Content: encryption, tree, announcements; single-source fetch.
 4. Swarming: bitfields, rarest-first, streaming order, work stealing,
    resume, storage budget.
@@ -393,7 +421,8 @@ so an app chooses where data lives and how much.
 1. **Group size:** up to about 50 members in v1, so pairwise rekey and three
    directory shards. A tree scheme (MLS/TreeKEM) is the path past
    that.
-2. **Roles:** admin (add, remove, rekey) and member (post, fetch).
+2. **Roles:** admin (add, remove, rekey), member (post, fetch), and mirror
+   (stores and serves ciphertext only).
 3. **Serving:** every member serves what it holds by default; the app can
    turn serving off or cap it per device.
 4. **Logs:** the library includes a signed per-member log. Blob
