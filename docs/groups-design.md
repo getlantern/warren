@@ -127,25 +127,25 @@ The roster is a set of operations signed by member keys, kept by members
 
 - `genesis` (founder key, group name, shard count, and `G` and
   `epochKey[0]` sealed to the founder);
-- `add` (member key, display name, role or `mirror`, and the current `G`
-  and every epoch key so far sealed to the new member; a mirror gets `G`
-  only) by an admin;
+- `add` (member key, display name, role, and the current `G` and every
+  epoch key so far sealed to the new member; a mirror gets `G` only) by an
+  admin, or by the owner when the role is `admin`;
 - `remove` (member key; the remover's view of that member: the hashes of its
   latest roster operations and the head of its log the remover has seen,
   sequence number and entry hash; and the rekey, see *Removal*) by an admin,
-  as one operation;
+  or by the owner when the removed key is an admin, as one operation;
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
-- `deliver` (the current `G`, and for a member but not a mirror every epoch
-  key made by a counting operation at or after the recipient's `add` that
-  wasn't sealed to it, sealed to one member already added) by any member:
-  it grants no rights, and only fills in keys a member missed (*Removal*).
-  The recipient checks the keys against the commitment of the operation
-  that made them (*Keys*), so a forged key is ignored. A `deliver` that
-  doesn't count (its recipient was removed concurrently) has still handed
-  over its keys: those the sender held before it learned of the removal,
-  which the removal's rekey supersedes.
+- `deliver` (the current `G`, and for a member but not a mirror any epoch
+  keys it lacks, sealed to one member already added) by any member: it
+  grants no rights, and only fills in keys a member missed (*Removal*). The
+  recipient checks each key against the commitment of the operation that
+  made it (*Keys*), so a forged key is ignored. A sender never delivers a
+  key made by, or causally after, an operation that removes the recipient.
+  A `deliver` that doesn't count (its author or recipient was removed
+  concurrently) has still handed over its keys, so it is treated like a
+  key sealed to a removed member (*Removal*, step 3).
 
 Every operation names the genesis's hash, which is the group's ID, and
 carries a Lamport clock and its causal parents (the hashes of the latest
@@ -155,32 +155,18 @@ operations the author had seen). Folding is deterministic:
   causal order, with concurrent operations ordered by Lamport clock and
   then by operation hash;
 - `genesis` is valid only as the root: no parents, signed by the founder key
-  it names, and it makes the founder the first admin;
-- each other operation is checked **when applied**: `add`, `remove`,
-  `rekey` and `invite` count only if the author is an admin at that point,
-  and `deliver` only if the author is a member and the recipient is a member
-  at that point;
+  it names, and it makes the founder the group's **owner**;
+- each other operation is checked **when applied**, against the roster the
+  fold has built up to that point: `add`, `remove`, `rekey` and `invite`
+  count only if the author is an admin or the owner then, and adding or
+  removing an admin only if the author is the owner; `deliver` counts only
+  if its author and recipient are members then. An operation whose author's
+  own `add` didn't count therefore never counts;
 - the **current keys** are those made by the last key-making operation that
   counts in the total order. Two concurrent rekeys by different admins
   therefore resolve the same way on every member, and the losing rekey's
   epoch key stays readable (*Keys*);
 - **remove wins** over a concurrent `add` of the same key;
-- **removals are decided as a set** before the fold applies them in the
-  total order. A removal counts if its author was an admin in the state of
-  its causal parents and either no counting removal removes its author, or
-  it is part of a **cycle of concurrent removals** (A removing B while B
-  removes A, or longer), in which case every removal in the cycle counts.
-  Otherwise, a removal whose author is removed by a counting removal is
-  judged by the view rule below. Removals whose authors nobody removes are
-  decided first, so the rule is never circular outside a cycle. If the
-  counting removals would leave no admin, only the removals in the cycle
-  whose author is most **senior** (whose `add` comes earliest in the total
-  order) count. So a compromised admin, once removed, can take down only
-  the admins who removed it at the same time, never anyone else, and the
-  admins who remain can add them back. A group that wants to recover from a
-  compromised admin needs at least three admins: with two, the senior one
-  wins. Seniority among admins added concurrently is decided by Lamport
-  clock and then hash, which the adding admin can influence when it adds;
 - operations by a removed author count only if the `remove` names them, or
   their descendants, in its view of that author. That depends only on the
   `remove`'s content, not on when anything arrives, so every member folds
@@ -188,11 +174,25 @@ operations the author had seen). Folding is deterministic:
   past. A legitimate operation by that author the remover hadn't seen yet is
   dropped too: the price of a rule everyone applies alike.
 
+**Why one owner.** Only the owner changes who is an admin, and the owner is
+never removed, so no two operations can remove each other's authors. Without
+a trusted clock, every rule for admins removing each other at once lets a
+compromised admin either strike back at its remover, make itself
+unremovable, or grant itself authority through an admin it adds; a single
+owner rules that out. The owner's operations form one chain, each naming
+the owner's previous operation; two owner operations naming the same
+predecessor are proof the owner key forked, and members then stop accepting
+admin changes and tell the app. The cost: a lost or compromised owner key
+can't be replaced in v1. The group keeps working but its admins are fixed,
+and if the owner key is compromised, the members recreate the group.
+
 Members exchange operations they lack at the start of every session
 (*Sessions*), so the roster converges by gossip.
 
-Roles in v1: `admin` (add, remove, rekey), `member` (post, fetch) and
-`mirror` (store and serve ciphertext only).
+Roles in v1: the `owner` (the founder: everything an admin does, plus
+adding and removing admins), `admin` (add and remove members and mirrors,
+rekey, invite), `member` (post, fetch) and `mirror` (store and serve
+ciphertext only).
 
 ## Discovery
 
@@ -365,8 +365,9 @@ Removing a member:
    key, abandoning requests in flight, since admission was checked only when
    those sessions opened.
 3. **Concurrent changes.** If, after folding, the current keys turn out to
-   have been sealed to a member the fold removed (two admins removing two
-   members at once), they are superseded: an admin issues a `rekey` sealed
+   have been sealed or delivered to a member the fold removed (two admins
+   removing two members at once, or a `deliver` to a member being removed),
+   they are superseded: an admin issues a `rekey` sealed
    only to the members the fold keeps. Until that `rekey` arrives, a member
    **publishes nothing**: the app's posts and blobs wait in a queue. Anything
    published before a member learned of the concurrent removal was readable
@@ -498,7 +499,8 @@ so an app chooses where data lives and how much.
 1. **Group size:** up to about 50 members in v1, so pairwise rekey and three
    directory shards. A tree scheme (MLS/TreeKEM) is the path past
    that.
-2. **Roles:** admin (add, remove, rekey), member (post, fetch), and mirror
+2. **Roles:** owner (the founder, who alone adds and removes admins), admin
+   (add and remove members, rekey, invite), member (post, fetch), and mirror
    (stores and serves ciphertext only).
 3. **Serving:** every member serves what it holds by default; the app can
    turn serving off or cap it per device.
