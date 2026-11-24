@@ -577,8 +577,8 @@ func TestGetTimingOnEarlyHit(t *testing.T) {
 			tids[s.To] = m.T
 		}
 	}
-	if tids[addr(1)] == nil {
-		t.Fatal("no query to the first contact")
+	if tids[addr(1)] == nil || tids[addr(2)] == nil {
+		t.Fatal("both contacts weren't queried")
 	}
 	n.HandlePacket(t0.Add(120*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0], V: v}}))
 	gets := func() []GetDone {
@@ -592,8 +592,11 @@ func TestGetTimingOnEarlyHit(t *testing.T) {
 		return out
 	}
 	got := gets()
-	if len(got) != 1 || string(got[0].Value) != string(v) {
-		t.Fatalf("%d completions, want one carrying the value", len(got))
+	if len(got) != 1 {
+		t.Fatalf("%d completions, want 1", len(got))
+	}
+	if string(got[0].Value) != string(v) {
+		t.Fatalf("value %q, want %q", got[0].Value, v)
 	}
 	done := got[0]
 	// The other contact's query times out later; the finished get stays
@@ -645,6 +648,13 @@ func TestRebindCountsAbandonedQueriesOnce(t *testing.T) {
 		return out
 	}
 	n.Rebound(t0.Add(50 * time.Millisecond))
+	// Rebound starts its own lookup on the new socket; none of ours may
+	// survive, or a late reply or timeout could still settle them.
+	for tid, tx := range n.txns {
+		if tx.lookup != nil && tx.lookup.op == op {
+			t.Fatalf("transaction %d of the abandoned lookup survives the rebind", tid)
+		}
+	}
 	got := dones()
 	if len(got) != 1 {
 		t.Fatalf("%d completions after the rebind, want one", len(got))
