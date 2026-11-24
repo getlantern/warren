@@ -23,6 +23,7 @@ package dht
 // misbehaving holder can drop them but not read or forge them.
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -83,15 +84,28 @@ const (
 	OfferWindow = 2 * offerMaxSkew * time.Second
 
 	signalAttemptTimeout = 4 * time.Second // answers wait on the provider gathering a fresh socket; dead holders are caught by the ack
-	offerMaxSkew         = 60              // seconds between signer and verifier clocks
-	sessionLifetime      = time.Minute
-	forwardTTL           = 2 * time.Minute
-	pendingAnswerTTL     = 30 * time.Second
-	maxBindings          = 512
-	maxPendingAnswers    = 256
-	maxSessions          = 64
-	maxHolders           = 4
-	holderMaxFailures    = 2
+	// parallelOffers is how many holders a caller offers to at once: the
+	// provider takes the first copy and answers through every holder that
+	// relays one, so a dead or slow holder costs nothing while another works.
+	parallelOffers = 2
+	// epochOverlap is how long after an epoch starts a caller also looks up
+	// the previous epoch's record at once, rather than only after missing
+	// the current one: the provider's new record may not have spread yet,
+	// or the two clocks may disagree about the epoch.
+	epochOverlap = 10 * time.Minute
+	// offerRetry is how soon a caller retries an offer it couldn't send for
+	// a full transaction table, and offerBusyLimit how long it keeps trying.
+	offerRetry        = 100 * time.Millisecond
+	offerBusyLimit    = 2 * signalAttemptTimeout
+	offerMaxSkew      = 60 // seconds between signer and verifier clocks
+	sessionLifetime   = time.Minute
+	forwardTTL        = 2 * time.Minute
+	pendingAnswerTTL  = 30 * time.Second
+	maxBindings       = 512
+	maxPendingAnswers = 256
+	maxSessions       = 64
+	maxHolders        = 4
+	holderMaxFailures = 2
 )
 
 // RecordSalt is the BEP 44 salt of provider's record in epoch.
@@ -410,6 +424,7 @@ func (n *Node) ListenKey(now time.Time, priv ed25519.PrivateKey, x *ecdh.Private
 // mappings on the new network. Routing contacts stay: their addresses
 // didn't change.
 func (n *Node) Rebound(now time.Time) {
+	n.rtt = rttEstimator{} // round trips on the old network say nothing about the new
 	n.reflections, n.destOrder = nil, nil
 	n.gen++
 	// Queries in flight went out from the old socket: abandon them, so a
@@ -779,19 +794,41 @@ type signalOp struct {
 	priv      ed25519.PrivateKey
 	provider  [32]byte
 	payload   []byte
-	epoch     int64
-	triedPrev bool
+	epoch     int64 // the current epoch's
+	triedPrev bool  // the previous epoch's record is being or was looked up
+	searching int   // record lookups still running
+	lookups   []*lookup
+	cur       *lookup // the current epoch's record lookup
+	curDone   bool    // it has finished
+	prev      *lookup // the previous epoch's lookup, once it found a usable record
 	holders   []*cand
-	attempt   int
-	offer     *MutableItem
-	answer    []byte // expected answer salt
-	answerKey []byte
-	deadline  time.Time // current attempt's answer
-	// ackBy is when the current holder must have acknowledged the offer.
-	// A dead holder is detected after one round trip, not the whole answer
-	// window.
-	ackBy time.Time
-	acked bool
+	next      int // the next holder to offer to
+	tries     []*offerTry
+	// answerBy is the end of the answer window of the latest holder given up
+	// on without a reply: its ack may have been lost while it relayed, so
+	// the signal doesn't fail before it. (A holder that rejected the offer
+	// won't relay, and doesn't count.)
+	answerBy time.Time
+	// retryAt is set, always ahead, when an offer couldn't be sent for a
+	// full transaction table; busySince, the first such failure since the
+	// last offer sent, bounds how long that may go on.
+	retryAt, busySince time.Time
+	offer              *MutableItem
+	answer             []byte // expected answer salt
+	answerKey          []byte
+}
+
+// offerTry is one holder an offer is out with.
+type offerTry struct {
+	attempt  int       // the holder's index in holders
+	deadline time.Time // for the answer
+	// ackBy is the adaptive short timeout: unacked by then, the try is late
+	// and the next holder is brought in, as a lookup widens past a slow
+	// query. lapseBy is Config.ShortTimeout: unacked by then, the holder is
+	// given up on. A dead holder costs about a round trip; a slow live one
+	// still relays.
+	ackBy, lapseBy time.Time
+	acked, late    bool
 }
 
 // Signal sends payload to provider through the DHT and returns its answer
@@ -807,52 +844,132 @@ func (n *Node) Signal(now time.Time, priv ed25519.PrivateKey, provider [32]byte,
 	n.nextOp++
 	s := &signalOp{op: n.nextOp, priv: priv, provider: provider, payload: payload, epoch: epochOf(now)}
 	n.signals = append(n.signals, s)
-	n.findRecord(now, s)
+	n.findRecord(now, s, s.epoch)
+	// The overlap lookup leaves the slots startInternal reserves for
+	// maintenance; without a slot, the miss fallback covers it.
+	if s.searching > 0 && !s.triedPrev && len(n.lookups) < n.cfg.MaxLookups-4 &&
+		now.Sub(time.Unix(s.epoch*int64(RecordEpoch/time.Second), 0)) < epochOverlap {
+		// Near the epoch's start, look up the previous epoch's record at
+		// once too. If the node is at its lookup cap, the miss fallback in
+		// recordFound still covers it.
+		started := s.searching
+		n.findRecord(now, s, s.epoch-1)
+		s.triedPrev = s.searching > started
+	}
 	return s.op, nil
 }
 
-func (n *Node) findRecord(now time.Time, s *signalOp) {
-	salt := RecordSalt(s.provider, s.epoch)
+func (n *Node) findRecord(now time.Time, s *signalOp, epoch int64) {
+	salt := RecordSalt(s.provider, epoch)
 	key := s.provider
 	l := n.startLookup(now, n.primary, getItem, MutableTarget(s.provider, salt), record{}, nil, true)
 	if l == nil {
-		n.signalFailed(s, ErrBusy)
+		if s.searching == 0 {
+			n.signalFailed(s, ErrBusy)
+		}
 		return
+	}
+	s.searching++
+	s.lookups = append(s.lookups, l)
+	if epoch == s.epoch {
+		s.cur = l
 	}
 	l.key, l.salt = &key, salt
 	l.onDone = func(now time.Time, l *lookup) { n.recordFound(now, s, l) }
 	n.step(now, l)
 }
 
-func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
-	x, ok := [32]byte{}, false
-	if l.best != nil {
-		x, ok = decodeRecord(l.best.V)
+// usableRecord reports a record lookup's verified record, if it has one a
+// caller can offer to: holders that gave a write token and a valid key.
+func usableRecord(l *lookup) ([]*cand, *ecdh.PublicKey, bool) {
+	if l.best == nil {
+		return nil, nil, false
 	}
+	x, ok := decodeRecord(l.best.V)
 	if !ok {
-		if !s.triedPrev {
-			s.triedPrev = true
-			s.epoch--
-			n.findRecord(now, s)
-			return
-		}
-		n.signalFailed(s, ErrNoRecord)
-		return
+		return nil, nil, false
 	}
+	var holders []*cand
 	for _, c := range l.holders {
 		if c.token != nil {
-			s.holders = append(s.holders, c)
+			holders = append(holders, c)
 		}
 	}
-	if len(s.holders) == 0 {
-		n.signalFailed(s, ErrNoRecord)
-		return
-	}
 	xPub, err := ecdh.X25519().NewPublicKey(x[:])
-	if err != nil {
+	if len(holders) == 0 || err != nil {
+		return nil, nil, false
+	}
+	// NewPublicKey accepts a low-order point that ECDH then rejects; check
+	// now, before this record is chosen over the other epoch's.
+	if ecdhProbe != nil {
+		if _, err := ecdhProbe.ECDH(xPub); err != nil {
+			return nil, nil, false
+		}
+	}
+	return holders, xPub, true
+}
+
+// ecdhProbe is a fixed key for checking a record's key is usable; the secret
+// it derives is discarded. It is nil where X25519 is unavailable (FIPS-only
+// mode), and startOffer's own ECDH then fails the signal.
+var ecdhProbe, _ = ecdh.X25519().NewPrivateKey(bytes.Repeat([]byte{0x42}, 32))
+
+// recordFound takes a finished record lookup. The current epoch's record is
+// preferred: a previous epoch's can be a restarted provider's old one, with
+// a key it no longer holds, so it is used only once the current epoch's
+// lookup has missed (or found nothing usable).
+func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
+	s.searching--
+	if s.offer != nil || !slices.Contains(n.signals, s) {
+		return // an offer is already out, or the signal ended
+	}
+	// A lookup from before a rebind holds write tokens bound to the old
+	// address, which holders reject: it can't supply an offer.
+	usable := func(l *lookup) bool {
+		_, _, ok := usableRecord(l)
+		return ok && l.gen == n.gen
+	}
+	if l != s.cur {
+		if usable(l) {
+			s.prev = l
+		}
+		if !s.curDone {
+			return // wait for the current epoch's lookup
+		}
+	} else {
+		s.curDone = true
+		if usable(l) {
+			n.startOffer(now, s, l)
+			return
+		}
+	}
+	switch {
+	case s.prev != nil && s.prev.gen == n.gen:
+		n.startOffer(now, s, s.prev)
+	case s.searching > 0:
+		// the previous epoch's lookup is still running
+	case !s.triedPrev:
+		s.triedPrev = true
+		n.findRecord(now, s, s.epoch-1)
+	default:
+		n.signalFailed(s, ErrNoRecord)
+	}
+}
+
+// startOffer seals the payload to l's record and offers it to its holders,
+// ending any other record lookup still running.
+func (n *Node) startOffer(now time.Time, s *signalOp, l *lookup) {
+	holders, xPub, ok := usableRecord(l)
+	if !ok {
 		n.signalFailed(s, ErrNoRecord)
 		return
 	}
+	for _, o := range s.lookups {
+		if o != l {
+			n.cancelLookup(o)
+		}
+	}
+	s.holders = holders
 	e, _ := ecdh.X25519().NewPrivateKey(n.randBytes(32))
 	shared, err := e.ECDH(xPub)
 	if err != nil {
@@ -860,7 +977,7 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 		return
 	}
 	ePub := e.PublicKey().Bytes()
-	offerKey, answerKey, err := signalKeys(shared, ePub, x[:])
+	offerKey, answerKey, err := signalKeys(shared, ePub, xPub.Bytes())
 	if err != nil {
 		n.signalFailed(s, err)
 		return
@@ -873,26 +990,106 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 		return
 	}
 	s.offer, s.answer, s.answerKey = &m, answerSalt(salt), answerKey
-	n.sendOffer(now, s)
+	n.fillOffers(now, s)
 }
 
-func (n *Node) sendOffer(now time.Time, s *signalOp) {
-	if s.attempt >= len(s.holders) {
-		n.signalFailed(s, ErrNoAnswer)
+// fillOffers keeps the offer out with parallelOffers holders that aren't
+// late. With none out and the last answer window closed, it fails the
+// signal: ErrNoAnswer once every holder has been tried, or ErrBusy if the
+// transaction table has stayed full for offerBusyLimit. Every path that ends
+// an offer try calls it, and it leaves retryAt and answerBy each zero or
+// ahead, so a signal never waits on a time already past.
+func (n *Node) fillOffers(now time.Time, s *signalOp) {
+	s.retryAt = time.Time{}
+	if !now.Before(s.answerBy) {
+		s.answerBy = time.Time{} // passed: never a wakeup in the past
+	}
+	for s.next < len(s.holders) {
+		current := 0
+		for _, t := range s.tries {
+			if !t.late {
+				current++
+			}
+		}
+		if current >= parallelOffers {
+			break
+		}
+		h := s.holders[s.next]
+		a := s.offer.args()
+		a.Token = h.token
+		attempt := s.next
+		if !n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: attempt}) {
+			// The transaction table is full, a local and passing condition:
+			// keep this holder and try again shortly.
+			s.retryAt = now.Add(offerRetry)
+			if s.busySince.IsZero() {
+				s.busySince = now
+			}
+			break
+		}
+		s.busySince = time.Time{}
+		s.next++
+		s.tries = append(s.tries, &offerTry{attempt: attempt, deadline: now.Add(signalAttemptTimeout),
+			ackBy: now.Add(n.shortTimeout()), lapseBy: now.Add(n.cfg.ShortTimeout)})
+	}
+	if len(s.tries) > 0 || now.Before(s.answerBy) {
 		return
 	}
-	h := s.holders[s.attempt]
-	a := s.offer.args()
-	a.Token = h.token
-	n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: s.attempt})
-	s.deadline = now.Add(signalAttemptTimeout)
-	s.ackBy, s.acked = now.Add(n.cfg.ShortTimeout), false
+	switch {
+	case s.next >= len(s.holders):
+		n.signalFailed(s, ErrNoAnswer)
+	case !s.retryAt.IsZero() && !now.Before(s.busySince.Add(offerBusyLimit)):
+		n.signalFailed(s, ErrBusy) // a retry, not an unreachable provider
+	}
 }
 
-func (n *Node) offerAcked(s *signalOp, attempt int, ok bool) {
-	if s.attempt == attempt && ok {
-		s.acked = true
+// offerAcked records a holder's reply to an offer. A rejection (a KRPC
+// error, such as a stale token) means the holder won't relay: it is dropped
+// at once and the next holder brought in.
+func (n *Node) offerAcked(now time.Time, s *signalOp, attempt int, ok bool) {
+	rejected := false
+	s.tries = slices.DeleteFunc(s.tries, func(t *offerTry) bool {
+		if t.attempt != attempt {
+			return false
+		}
+		if ok {
+			t.acked = true
+			return false
+		}
+		rejected = true
+		return true
+	})
+	if rejected && slices.Contains(n.signals, s) {
+		n.fillOffers(now, s)
 	}
+}
+
+// wakeup is when the signal next needs attention: a pending retry, its
+// earliest outstanding offer's ack or answer time or, with none out,
+// answerBy. Each is ahead or zero: fillOffers resets retryAt each time it
+// runs and clears answerBy once it passes.
+func (s *signalOp) wakeup() time.Time {
+	w := s.retryAt
+	if len(s.tries) == 0 && !s.answerBy.IsZero() && (w.IsZero() || s.answerBy.Before(w)) {
+		w = s.answerBy
+	}
+	for _, t := range s.tries {
+		d := t.deadline
+		// Each try wakes at its next deadline, never past its answer window
+		// (a ShortTimeout above signalAttemptTimeout would otherwise put
+		// the ack or lapse time after it).
+		switch {
+		case t.acked:
+		case !t.late && t.ackBy.Before(d):
+			d = t.ackBy
+		case t.late && t.lapseBy.Before(d):
+			d = t.lapseBy
+		}
+		if w.IsZero() || d.Before(w) {
+			w = d
+		}
+	}
+	return w
 }
 
 // acceptAnswer completes a pending Signal whose answer salt matches.
@@ -930,9 +1127,27 @@ func (n *Node) removeSignal(s *signalOp) {
 
 func (n *Node) signalTimeouts(now time.Time) {
 	for _, s := range slices.Clone(n.signals) {
-		if s.offer != nil && (!now.Before(s.deadline) || (!s.acked && !now.Before(s.ackBy))) {
-			s.attempt++
-			n.sendOffer(now, s)
+		if s.offer == nil {
+			continue
+		}
+		changed := false
+		for _, t := range s.tries {
+			if !t.acked && !t.late && !now.Before(t.ackBy) {
+				t.late, changed = true, true
+			}
+		}
+		before := len(s.tries)
+		s.tries = slices.DeleteFunc(s.tries, func(t *offerTry) bool {
+			givenUp := !t.acked && !now.Before(t.lapseBy) && now.Before(t.deadline)
+			if givenUp && t.deadline.After(s.answerBy) {
+				s.answerBy = t.deadline // its answer could still come
+			}
+			return !now.Before(t.deadline) || (!t.acked && !now.Before(t.lapseBy))
+		})
+		windowClosed := len(s.tries) == 0 && !now.Before(s.answerBy)
+		retry := !s.retryAt.IsZero() && !now.Before(s.retryAt)
+		if changed || len(s.tries) < before || windowClosed || retry {
+			n.fillOffers(now, s)
 		}
 	}
 }

@@ -52,10 +52,13 @@ type Config struct {
 	Version      []byte
 	Rand         *rand.Rand
 
-	K                   int
-	Alpha               int
-	MaxInflight         int
-	QueryTimeout        time.Duration
+	K            int
+	Alpha        int
+	MaxInflight  int
+	QueryTimeout time.Duration
+	// ShortTimeout is the most a lookup query may go unanswered before the
+	// lookup stops counting it as active and widens: the node adapts it to
+	// measured round trips, down to 250 ms.
 	ShortTimeout        time.Duration
 	LookupTimeout       time.Duration
 	MaxLookups          int
@@ -94,10 +97,14 @@ func (c *Config) setDefaults() {
 	}
 	def(&c.K, 8)
 	def(&c.Alpha, 3)
-	def(&c.MaxInflight, 6)
+	def(&c.MaxInflight, 16)
 	def(&c.MaxLookups, 16)
 	def(&c.MaxCandidates, 128)
-	def(&c.MaxTransactions, 256)
+	// Room for every lookup's queries in flight, plus puts, keepalives and
+	// offers.
+	// Transaction IDs are 16 bits; stay well inside them.
+	def(&c.MaxTransactions, max(512, c.MaxLookups*c.MaxInflight+128))
+	c.MaxTransactions = min(c.MaxTransactions, 1<<15) // set or not
 	def(&c.MaxItems, 4096)
 	def(&c.EvictAfterFailures, 2)
 	dur(&c.QueryTimeout, 3*time.Second)
