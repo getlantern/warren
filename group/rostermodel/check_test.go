@@ -233,6 +233,23 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 	if leak := leaked(f, epochs, gs); leak != "" {
 		return fmt.Errorf("after recovery, %s", leak)
 	}
+	// Every epoch key a member holds stays readable to every other member,
+	// including those made by a rekey that lost the total order.
+	for k, role := range f.Roles {
+		if role == Mirror {
+			continue
+		}
+		for j, other := range f.Roles {
+			if other == Mirror {
+				continue
+			}
+			for e := range epochs[j] {
+				if !epochs[k][e] {
+					return fmt.Errorf("after recovery, %v %v lacks an epoch key %v holds", role, k, j)
+				}
+			}
+		}
+	}
 	for k, role := range f.Roles {
 		if !gs[k][f.Current] {
 			return fmt.Errorf("after recovery, %v %v lacks the current group secret", role, k)
@@ -330,6 +347,9 @@ func explore(t *testing.T, rules Rules, pred func(Store, *Result) bool, depth in
 // key-maker that hadn't seen a removal, which then also sealed them to the
 // removed member, so the written condition fires.
 func TestRosterModel(t *testing.T) {
+	if *depth < 0 {
+		t.Fatalf("-roster.depth must be at least 0, not %d", *depth)
+	}
 	maxPasses = 0
 	states, failure := explore(t, Rules{}, docPredicate, *depth)
 	t.Logf("%d states explored to depth %d; folds took at most %d passes", states, *depth, maxPasses)

@@ -476,9 +476,10 @@ every interleaving of an owner, two admins and a member writing, syncing,
 and acting as compromised or removed authors (5.1 million states at depth
 6, about six minutes; `go test` runs depth 4 in seconds). It checks that the owner keeps its role, only the owner makes admins,
 backdated operations by removed authors never count, the view rule settles
-(in at most three passes), no off-roster key or mirror keeps the current keys
-once the corrective rekey and deliveries run, and every member ends with
-them. Mutation tests confirm each property catches its broken rule. It found
+(in at most three passes), and once the corrective rekey and deliveries run,
+no off-roster key holds the current group secret or epoch key, mirrors hold
+the current group secret but no current epoch key, and every member holds
+the current keys and every epoch key any other member holds. Mutation tests confirm each property catches its broken rule. It found
 two rules above that were wrong as first written (concurrent duplicate
 `add`s, and `deliver` withholding after any `remove`), and writing it pinned
 the total order down as an algorithm.
