@@ -70,8 +70,8 @@ Invites don't carry it (*Invites*). Keys derived from `G` with HKDF-SHA256
 
 **Epoch keys** wrap content keys (*Content*, *Logs*). `epochKey[0]` is random,
 made by the founder; each later one is made on a rekey (*Removal*). Epoch
-keys travel only sealed to individual members (in `add`, `rekey` and
-`deliver` operations), so a blind mirror, which gets `G` but no epoch keys,
+keys travel only sealed to individual members (in `genesis`, `add`,
+`remove`, `rekey` and `deliver` operations), so a blind mirror, which gets `G` but no epoch keys,
 can't read content. Each epoch key is named by the hash of the operation
 that made it, and every encrypted entry names the epoch key it used, so a
 member keeps every epoch key sealed to it and can read content written under
@@ -137,10 +137,15 @@ The roster is a set of operations signed by member keys, kept by members
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
-- `deliver` (the current `G`, and for a member but not a mirror any epoch
-  keys it lacks, sealed to one member already added) by any member: it grants no rights, and only fills in keys a member
-  missed (*Removal*). The recipient checks the keys against the commitment
-  of the operation that made them (*Keys*), so a bad `deliver` is ignored.
+- `deliver` (the current `G`, and for a member but not a mirror every epoch
+  key made by a counting operation at or after the recipient's `add` that
+  wasn't sealed to it, sealed to one member already added) by any member:
+  it grants no rights, and only fills in keys a member missed (*Removal*).
+  The recipient checks the keys against the commitment of the operation
+  that made them (*Keys*), so a forged key is ignored. A `deliver` that
+  doesn't count (its recipient was removed concurrently) has still handed
+  over its keys: those the sender held before it learned of the removal,
+  which the removal's rekey supersedes.
 
 Every operation names the genesis's hash, which is the group's ID, and
 carries a Lamport clock and its causal parents (the hashes of the latest
@@ -160,18 +165,22 @@ operations the author had seen). Folding is deterministic:
   therefore resolve the same way on every member, and the losing rekey's
   epoch key stays readable (*Keys*);
 - **remove wins** over a concurrent `add` of the same key;
-- **concurrent removals between admins** (neither in the other's causal
-  history, say A removing B while B removes A) apply in order of their
-  authors' **seniority** (whose `add` comes earlier in the total order; the
-  founder first). Once an author is removed, its own concurrent removals
-  count only under the view rule below. So the most senior author's
-  removals always stand (a removal that would leave no admin is ignored),
-  and a removed
-  admin can't strike back at a more senior one by signing a removal with
-  old parents. The cost: a junior admin can't remove a senior one who
-  removes it in return; another admin has to settle it. Seniority is fixed
-  by history: a hash decides it only between admins added concurrently, and
-  an admin can't grind its own position after the fact;
+- **removals are decided as a set** before the fold applies them in the
+  total order. A removal counts if its author was an admin in the state of
+  its causal parents and either no counting removal removes its author, or
+  it is part of a **cycle of concurrent removals** (A removing B while B
+  removes A, or longer), in which case every removal in the cycle counts.
+  Otherwise, a removal whose author is removed by a counting removal is
+  judged by the view rule below. Removals whose authors nobody removes are
+  decided first, so the rule is never circular outside a cycle. If the
+  counting removals would leave no admin, only the removals in the cycle
+  whose author is most **senior** (whose `add` comes earliest in the total
+  order) count. So a compromised admin, once removed, can take down only
+  the admins who removed it at the same time, never anyone else, and the
+  admins who remain can add them back. A group that wants to recover from a
+  compromised admin needs at least three admins: with two, the senior one
+  wins. Seniority among admins added concurrently is decided by Lamport
+  clock and then hash, which the adding admin can influence when it adds;
 - operations by a removed author count only if the `remove` names them, or
   their descendants, in its view of that author. That depends only on the
   `remove`'s content, not on when anything arrives, so every member folds
@@ -301,8 +310,9 @@ before removal. The `remove` operation records the head of that log the
 removing admin had seen (sequence number and entry hash), and members accept
 only entries on the chain ending at that head: nothing past it, and nothing
 below it that the head's hash chain doesn't lead to, so the removed member
-can't sign a different history below the cutoff. If two admins remove the
-same member concurrently and one head is on the other's chain, the later
+can't sign a different history below the cutoff. Only removals that count
+after folding set a cutoff. If two counting removals by different admins
+remove the same member concurrently and one head is on the other's chain, the later
 head applies (both admins saw those entries); if neither is, the two heads
 are proof of a fork and the log is handled as forked. Entries a member had
 already accepted past the final cutoff are withdrawn, and the app told.
@@ -362,8 +372,8 @@ Removing a member:
    published before a member learned of the concurrent removal was readable
    by the removed member; that window is as short as gossip and can't be
    closed. A member added concurrently with a
-   removal (one the removing admin didn't know of) gets `G'` and the new
-   epoch key from any member that notices, in a `deliver` operation.
+   removal (one the removing admin didn't know of) gets `G'` and any epoch
+   keys it lacks from any member that notices, in a `deliver` operation.
 4. **Members offline during a key change.** For 24 hours after any
    operation that replaces `G` (a `remove` or a `rekey`, including a
    corrective one), the remaining members also listen under their
