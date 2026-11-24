@@ -129,7 +129,9 @@ The roster is a set of operations signed by member keys, kept by members
   `epochKey[0]` sealed to the founder);
 - `add` (member key, display name, role, and the current `G` and every
   epoch key so far sealed to the new member; a mirror gets `G` only) by an
-  admin, or by the owner when the role is `admin`;
+  admin, or by the owner when the role is `admin`. An `add` of a key already
+  on the roster changes its role; promoting to or demoting from `admin` is
+  owner only;
 - `remove` (member key; the remover's view of that member: the hashes of its
   latest roster operations and the head of its log the remover has seen,
   sequence number and entry hash; and the rekey, see *Removal*) by an admin,
@@ -143,9 +145,10 @@ The roster is a set of operations signed by member keys, kept by members
   recipient checks each key against the commitment of the operation that
   made it (*Keys*), so a forged key is ignored. A sender never delivers a
   key made by, or causally after, an operation that removes the recipient.
-  A `deliver` that doesn't count (its author or recipient was removed
-  concurrently) has still handed over its keys, so it is treated like a
-  key sealed to a removed member (*Removal*, step 3).
+  A `deliver` to a recipient removed concurrently doesn't count but has
+  still handed over its keys, so it is treated like a key sealed to a
+  removed member (*Removal*, step 3). One whose author was removed
+  concurrently leaks nothing: the author already held those keys.
 
 Every operation names the genesis's hash, which is the group's ID, and
 carries a Lamport clock and its causal parents (the hashes of the latest
@@ -159,14 +162,21 @@ operations the author had seen). Folding is deterministic:
 - each other operation is checked **when applied**, against the roster the
   fold has built up to that point: `add`, `remove`, `rekey` and `invite`
   count only if the author is an admin or the owner then, and adding or
-  removing an admin only if the author is the owner; `deliver` counts only
-  if its author and recipient are members then. An operation whose author's
+  removing an admin only if the author is the owner; a `remove` of the
+  owner key never counts, whoever signs it; `deliver` counts only if its
+  author and recipient are members then. An operation whose author's
   own `add` didn't count therefore never counts;
 - the **current keys** are those made by the last key-making operation that
   counts in the total order. Two concurrent rekeys by different admins
   therefore resolve the same way on every member, and the losing rekey's
   epoch key stays readable (*Keys*);
-- **remove wins** over a concurrent `add` of the same key;
+- **remove wins** over a concurrent `add` or role change of the same key,
+  if its author had authority over the target's role in the remove's
+  causal parents (an admin removing a member the owner is concurrently
+  promoting removes it; the owner can add it back);
+- a `remove` of a key that is no longer on the roster when applied changes
+  no keys (its keys don't become current, though members keep them), but
+  its log head still counts toward the cutoff (*Logs*);
 - operations by a removed author count only if the `remove` names them, or
   their descendants, in its view of that author. That depends only on the
   `remove`'s content, not on when anything arrives, so every member folds
@@ -180,9 +190,14 @@ a trusted clock, every rule for admins removing each other at once lets a
 compromised admin either strike back at its remover, make itself
 unremovable, or grant itself authority through an admin it adds; a single
 owner rules that out. The owner's operations form one chain, each naming
-the owner's previous operation; two owner operations naming the same
-predecessor are proof the owner key forked, and members then stop accepting
-admin changes and tell the app. The cost: a lost or compromised owner key
+the owner's previous operation. Two owner operations naming the same
+predecessor are proof the owner key forked: every owner operation after the
+fork point, on either branch, stops counting, no further admin changes
+count, and the app is told. That depends only on the operations, so every
+member holding both branches folds the same roster. Before the owner signs
+after a restart or a restore from backup, the library fetches the owner's
+latest operation from members, so a stale backup doesn't fork the chain.
+The cost: a lost or compromised owner key
 can't be replaced in v1. The group keeps working but its admins are fixed,
 and if the owner key is compromised, the members recreate the group.
 
@@ -311,8 +326,9 @@ removing admin had seen (sequence number and entry hash), and members accept
 only entries on the chain ending at that head: nothing past it, and nothing
 below it that the head's hash chain doesn't lead to, so the removed member
 can't sign a different history below the cutoff. Only removals that count
-after folding set a cutoff. If two counting removals by different admins
-remove the same member concurrently and one head is on the other's chain, the later
+after folding set a cutoff, including a second removal of a key already
+removed (*Roster*). If two such removals of the same member, by admins or
+the owner, are concurrent and one head is on the other's chain, the later
 head applies (both admins saw those entries); if neither is, the two heads
 are proof of a fork and the log is handled as forked. Entries a member had
 already accepted past the final cutoff are withdrawn, and the app told.
@@ -343,7 +359,7 @@ storage budget the app sets, evicting the least recently used. A partial downloa
 pieces on disk.
 
 **Blind mirrors** (an always-on device that serves without reading) are
-added with a `mirror` flag: they receive `G` (to find the directory) but no
+added with the `mirror` role: they receive `G` (to find the directory) but no
 epoch keys, so they fetch and serve ciphertext and verify pieces by the tree
 but can't unwrap blob keys or read logs. A mirror fetches every blob in the
 inventories it receives, up to its storage budget; it learns blob IDs and
@@ -379,8 +395,9 @@ Removing a member:
    operation that replaces `G` (a `remove` or a `rekey`, including a
    corrective one), the remaining members also listen under their
    rendezvous keys from each `G` superseded in that window. A member that
-   missed the change reaches them there, and gets it by roster gossip. A member offline longer is out until an admin re-invites
-   it (*Invites*): it holds only secrets the removed member also holds, so
+   missed the change reaches them there, and gets it by roster gossip. A
+   member offline longer is out until an admin re-invites it (the owner, if
+   it was an admin; see *Invites*): it holds only secrets the removed member also holds, so
    nothing else can tell them apart.
 
 What the removed member keeps: everything from before its removal. What it
@@ -424,7 +441,8 @@ carries neither `G` nor any member key.
   invitee then leaves the join session for normal ones.
 - Single-use invites are spent at the first `add` against them; all are
   refused after expiry or after a removal (*Removal*). An admin re-invites a
-  member that was offline through a removal the same way.
+  member that was offline through a removal the same way; re-adding a
+  former admin takes the owner.
 
 A leaked invite lets its holder ask to join, nothing more: it can't
 impersonate the admin, read the directory or content, find members, or
@@ -437,8 +455,8 @@ g, err := group.Create(ep, store, group.Policy{Name: "family"})
 g, err := group.Join(ctx, ep, store, invite)
 
 invite, err := g.Invite(group.InviteOptions{Uses: 1, Expires: 24 * time.Hour})
-err = g.Add(ctx, memberKey, "Alice", group.RoleMember) // admin only
-err = g.Remove(ctx, memberKey)                         // admin only, rekeys
+err = g.Add(ctx, memberKey, "Alice", group.RoleMember) // admin only; owner only for RoleAdmin
+err = g.Remove(ctx, memberKey)                         // admin only; owner only for an admin; rekeys
 
 id, err := g.Publish(ctx, file, meta)  // a blob, announced in our log; meta encrypted
 r, err := g.Open(ctx, id)              // io.ReadSeeker; fetches as read
