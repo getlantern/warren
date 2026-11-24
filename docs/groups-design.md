@@ -137,8 +137,8 @@ The roster is a set of operations signed by member keys, kept by members
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
-- `deliver` (the current `G`, and for a member but not a mirror the current
-  epoch key, sealed to one member already added) by any member: it grants no rights, and only fills in keys a member
+- `deliver` (the current `G`, and for a member but not a mirror any epoch
+  keys it lacks, sealed to one member already added) by any member: it grants no rights, and only fills in keys a member
   missed (*Removal*). The recipient checks the keys against the commitment
   of the operation that made them (*Keys*), so a bad `deliver` is ignored.
 
@@ -161,14 +161,17 @@ operations the author had seen). Folding is deterministic:
   epoch key stays readable (*Keys*);
 - **remove wins** over a concurrent `add` of the same key;
 - **concurrent removals between admins** (neither in the other's causal
-  history, say A removing B while B removes A) are decided together, not
-  one after the other: each counts if its author was an admin in the state
-  of its causal parents, and the view rule below doesn't drop one for not
-  naming the other. They all apply, unless that would leave no admin: then
-  only the removals by the **most senior** author stand (whose `add` comes
-  earlier in the total order) stands. Seniority is fixed by history: a hash
-  decides it only between admins added concurrently, and an admin can't
-  grind its own position after the fact;
+  history, say A removing B while B removes A) apply in order of their
+  authors' **seniority** (whose `add` comes earlier in the total order; the
+  founder first). Once an author is removed, its own concurrent removals
+  count only under the view rule below. So the most senior author's
+  removals always stand (a removal that would leave no admin is ignored),
+  and a removed
+  admin can't strike back at a more senior one by signing a removal with
+  old parents. The cost: a junior admin can't remove a senior one who
+  removes it in return; another admin has to settle it. Seniority is fixed
+  by history: a hash decides it only between admins added concurrently, and
+  an admin can't grind its own position after the fact;
 - operations by a removed author count only if the `remove` names them, or
   their descendants, in its view of that author. That depends only on the
   `remove`'s content, not on when anything arrives, so every member folds
