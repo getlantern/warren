@@ -86,7 +86,7 @@ func Author(s Store, rules Rules, kind Kind, author, target Key, role Role) *Op 
 	epochs, gs := held(s, author)
 	switch kind {
 	case Add:
-		can := a == Owner || (a == Admin && role != Admin)
+		can := (a == Owner || (a == Admin && role != Admin)) && (role == Member || role == Mirror || role == Admin)
 		// The add carries the current group secret, so an author that
 		// hasn't been given it yet waits.
 		if !can || f.Roles[target] != None || f.Removed[target] != 0 || !gs[f.Current] {

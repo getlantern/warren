@@ -270,22 +270,28 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 		case Add:
 			can := author == Owner || (author == Admin && (o.Role != Admin || mutation == "admins add admins")) ||
 				((author == Member || author == Mirror) && mutation == "members add")
-			if !can || o.Role == None || o.Role == Owner {
+			if !can || (o.Role != Member && o.Role != Mirror && o.Role != Admin) {
 				break
 			}
 			cur := r.Roles[o.Target]
+			concurrent := !slices.ContainsFunc(added[o.Target], func(a ID) bool { return hist(o.ID)[a] })
 			switch {
 			case cur == None && !ever[o.Target]:
 				ok = true
-			case cur != None && cur != Owner && rank(o.Role) > rank(cur) && !slices.ContainsFunc(added[o.Target], func(a ID) bool { return hist(o.ID)[a] }):
-				// A concurrent add of a key already added: it has sealed
-				// its role's keys regardless, so the key takes the higher
-				// role (admin over member over mirror).
-				ok = true
+			case cur != None && cur != Owner && concurrent:
+				// A concurrent add of a key already added has sealed its
+				// role's keys regardless, so the key takes the higher role
+				// (admin over member over mirror). Either way the add is
+				// evidence the key was admitted, so a later add that saw it
+				// is a role change and never counts.
+				added[o.Target] = append(added[o.Target], o.ID)
+				ok = rank(o.Role) > rank(cur)
 			}
 			if ok {
 				r.Roles[o.Target] = o.Role
-				added[o.Target] = append(added[o.Target], o.ID)
+				if cur == None {
+					added[o.Target] = append(added[o.Target], o.ID)
+				}
 				ever[o.Target] = true
 			}
 		case Remove:
