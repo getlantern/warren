@@ -839,7 +839,7 @@ func (n *Node) Signal(now time.Time, priv ed25519.PrivateKey, provider [32]byte,
 	n.findRecord(now, s, s.epoch)
 	// The overlap lookup leaves the slots startInternal reserves for
 	// maintenance; without a slot, the miss fallback covers it.
-	if s.searching > 0 && !s.triedPrev && len(n.lookups) < max(n.cfg.MaxLookups-4, 1) &&
+	if s.searching > 0 && !s.triedPrev && len(n.lookups) < n.cfg.MaxLookups-4 &&
 		now.Sub(time.Unix(s.epoch*int64(RecordEpoch/time.Second), 0)) < epochOverlap {
 		// Near the epoch's start, look up the previous epoch's record at
 		// once too. If the node is at its lookup cap, the miss fallback in
@@ -982,10 +982,17 @@ func (n *Node) fillOffers(now time.Time, s *signalOp) {
 		a := s.offer.args()
 		a.Token = h.token
 		attempt := s.next
-		s.next++
 		if !n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: attempt}) {
-			continue // the transaction table is full: count it as this holder failing
+			// The transaction table is full, a local and passing condition:
+			// keep this holder. With offers out, their timers call fillOffers
+			// again; with none, fail with ErrBusy, which says retry, not that
+			// the provider is unreachable.
+			if len(s.tries) == 0 {
+				n.signalFailed(s, ErrBusy)
+			}
+			return
 		}
+		s.next++
 		s.tries = append(s.tries, &offerTry{attempt: attempt, deadline: now.Add(signalAttemptTimeout),
 			ackBy: now.Add(n.shortTimeout()), lapseBy: now.Add(n.cfg.ShortTimeout)})
 	}

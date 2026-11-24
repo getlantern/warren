@@ -103,7 +103,8 @@ func (c *Config) setDefaults() {
 	// Room for every lookup's queries in flight, plus puts, keepalives and
 	// offers.
 	// Transaction IDs are 16 bits; stay well inside them.
-	def(&c.MaxTransactions, min(max(512, c.MaxLookups*c.MaxInflight+128), 1<<15))
+	def(&c.MaxTransactions, max(512, c.MaxLookups*c.MaxInflight+128))
+	c.MaxTransactions = min(c.MaxTransactions, 1<<15) // set or not
 	def(&c.MaxItems, 4096)
 	def(&c.EvictAfterFailures, 2)
 	dur(&c.QueryTimeout, 3*time.Second)

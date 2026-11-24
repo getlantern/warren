@@ -297,10 +297,11 @@ func TestEpochLookupsPreferCurrent(t *testing.T) {
 	}
 }
 
-// An offer that can't be sent (the transaction table is full) counts as
-// that holder failing: the next holder is tried, and a signal none of whose
-// offers can be sent fails at once rather than waiting.
-func TestUnsentOfferCountsAsFailedHolder(t *testing.T) {
+// An offer that can't be sent (the transaction table is full) keeps its
+// holder: with an offer already out, the rest wait for that offer's timers
+// to try again; with none out, the signal fails with ErrBusy, not
+// ErrNoAnswer.
+func TestUnsentOfferKeepsHolders(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(102)), Rand: rng(103)})
 	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
 	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
@@ -309,8 +310,13 @@ func TestUnsentOfferCountsAsFailedHolder(t *testing.T) {
 	n.signals = append(n.signals, s)
 	n.cfg.MaxTransactions = len(n.txns) + 1 // room for one offer only
 	n.fillOffers(t0, s)
-	if len(s.tries) != 1 || s.tries[0].attempt != 0 || s.next != 3 {
-		t.Fatalf("tries %d next %d: want the first holder's offer out and the rest counted failed", len(s.tries), s.next)
+	if len(s.tries) != 1 || s.tries[0].attempt != 0 || s.next != 1 {
+		t.Fatalf("tries %d next %d: want the first holder's offer out and the rest kept", len(s.tries), s.next)
+	}
+	n.cfg.MaxTransactions = 512 // room again: the first offer's timer brings in the next
+	n.signalTimeouts(t0.Add(2 * time.Second))
+	if s.next < 2 {
+		t.Fatalf("once there was room, next is %d: the kept holders weren't tried", s.next)
 	}
 
 	n2 := New(Config{ID: outsiderID(rng(104)), Rand: rng(105)})
@@ -318,8 +324,15 @@ func TestUnsentOfferCountsAsFailedHolder(t *testing.T) {
 	n2.signals = append(n2.signals, s2)
 	n2.cfg.MaxTransactions = 0 // nothing can be sent
 	n2.fillOffers(t0, s2)
-	if slices.Contains(n2.signals, s2) {
-		t.Fatal("a signal none of whose offers could be sent kept waiting")
+	_, events := n2.Drain()
+	busy := false
+	for _, e := range events {
+		if f, ok := e.(SignalFailed); ok && f.Op == 5 && f.Err == ErrBusy {
+			busy = true
+		}
+	}
+	if !busy || slices.Contains(n2.signals, s2) {
+		t.Fatal("a signal none of whose offers could be sent didn't fail with ErrBusy")
 	}
 }
 
@@ -395,12 +408,10 @@ func TestSignalWakeupNeverInPast(t *testing.T) {
 		if now.After(t0.Add(time.Minute)) {
 			t.Fatal("the signal never ended")
 		}
-		n.signalTimeouts(now)
+		n.Tick(now)
 		n.Drain()
-		if slices.Contains(n.signals, s) {
-			if w := s.wakeup(); !w.After(now) {
-				t.Fatalf("at %v the signal's wakeup is %v, not ahead", now.Sub(t0), w.Sub(t0))
-			}
+		if w := n.NextWakeup(); !w.After(now) {
+			t.Fatalf("at %v NextWakeup is %v, not ahead", now.Sub(t0), w.Sub(t0))
 		}
 	}
 }
