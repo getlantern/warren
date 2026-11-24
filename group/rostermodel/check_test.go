@@ -142,7 +142,7 @@ func actions(w world, rules Rules) []action {
 			// Re-adding N as a member is a role change once N is a mirror,
 			// and a re-add once it's removed: neither may count.
 			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin))
-			if f.Roles[N] == Mirror || f.Removed[N] != 0 {
+			if f.Roles[N] != None || f.Removed[N] != 0 {
 				as = append(as, rogue(r, Add, N, Member))
 			}
 		case Member:
@@ -328,6 +328,7 @@ func explore(t *testing.T, rules Rules, pred func(Store, *Result) bool, depth in
 	if depth < 0 {
 		t.Fatalf("-roster.depth must be at least 0, not %d", depth)
 	}
+	admitted.Clear()
 	start := setup(t, rules)
 	// seen records the most depth left any visit had, so a state first
 	// reached deep is explored again when a shorter path reaches it.
@@ -402,6 +403,38 @@ func TestMutations(t *testing.T) {
 			}
 			t.Logf("caught: %s", failure)
 		})
+	}
+}
+
+// TestRemovedReAdd replays a trace past the default depth: an admin that
+// saw a key removed re-adds it after the merged fold drops the removal.
+func TestRemovedReAdd(t *testing.T) {
+	w := setup(t, Rules{})
+	steps := []action{}
+	for _, a := range []struct {
+		r Key
+		f func(world) bool
+	}{
+		{O, func(w world) bool { return Author(w[O], Rules{}, Remove, O, A, None) != nil }},
+		{A, func(w world) bool { return Author(w[A], Rules{}, Add, A, N, Member) != nil }},
+		{A, func(w world) bool { return Author(w[A], Rules{}, Remove, A, N, None) != nil }},
+		{B, func(w world) bool {
+			for id, o := range w[A] {
+				w[B][id] = o
+			}
+			return true
+		}},
+		{B, rogue(B, Add, N, Member).do},
+	} {
+		steps = append(steps, action{do: a.f})
+	}
+	for i, s := range steps {
+		if !s.do(w) {
+			t.Fatalf("step %d didn't apply", i)
+		}
+	}
+	if err := check(w.union(), Rules{}, docPredicate); err != nil {
+		t.Fatal(err)
 	}
 }
 

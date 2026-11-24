@@ -240,8 +240,10 @@ func Fold(s Store) (*Result, error) {
 }
 
 // admitted caches, per add, whether its author had already admitted the
-// target. An ID hashes the op's parents, so its history, and the answer,
-// never change.
+// target. An ID hashes the op's content and its parents' IDs, so it commits
+// to the op's whole history and the answer never changes. That holds here
+// because seal computes every ID; a real roster taking ops from peers must
+// verify each ID against its content before caching by it.
 var admitted sync.Map // admittedKey -> bool
 
 type admittedKey struct {
@@ -268,15 +270,20 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 		if v, ok := admitted.Load(k); ok {
 			return v.(bool)
 		}
-		view := Store{}
+		view, complete := Store{}, true
 		for id := range byID.History(o.ID) {
-			if byID[id] != nil {
-				view[id] = byID[id]
+			if byID[id] == nil {
+				complete = false
+				continue
 			}
+			view[id] = byID[id]
 		}
 		f, err := Fold(view)
+		// A history with no fixpoint can't show the key wasn't admitted.
 		v := err != nil || f.Roles[o.Target] != None || f.Removed[o.Target] != 0
-		admitted.Store(k, v)
+		if complete {
+			admitted.Store(k, v)
+		}
 		return v
 	}
 	for i, o := range order {
@@ -303,9 +310,9 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			case cur == None && !ever[o.Target] && !sawTarget(o):
 				ok = true
 			case cur != None && cur != Owner && rank(o.Role) > rank(cur) && !sawTarget(o):
-				// The author didn't have the key on its own roster, so this
-				// add is concurrent with the one that admitted it, not a
-				// role change. Both have sealed their role's keys, so the
+				// The author hadn't admitted the key (on its roster or
+				// removed since), so this add is concurrent with the one that
+				// admitted it, not a role change. Both have sealed their role's keys, so the
 				// key takes the higher role (admin over member over mirror).
 				ok = true
 			}
