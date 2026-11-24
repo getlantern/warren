@@ -91,9 +91,7 @@ const (
 	// the previous epoch's record at once, rather than only after missing
 	// the current one: the provider's new record may not have spread yet,
 	// or the two clocks may disagree about the epoch.
-	epochOverlap = 10 * time.Minute
-	// offerRetry is how soon a caller retries an offer it couldn't send.
-	offerRetry        = 100 * time.Millisecond
+	epochOverlap      = 10 * time.Minute
 	offerMaxSkew      = 60 // seconds between signer and verifier clocks
 	sessionLifetime   = time.Minute
 	forwardTTL        = 2 * time.Minute
@@ -801,14 +799,15 @@ type signalOp struct {
 	holders   []*cand
 	next      int // the next holder to offer to
 	tries     []*offerTry
-	// retryAt: an offer couldn't be sent (the transaction table was full);
-	// try the same holder again then. lingerUntil: the last answer window
-	// of a holder given up on, through which an answer could still come
-	// (its ack may have been lost) before the signal fails.
-	retryAt, lingerUntil time.Time
-	offer                *MutableItem
-	answer               []byte // expected answer salt
-	answerKey            []byte
+	// answerBy is the end of the answer window of the latest holder given up
+	// on without a reply: its ack may have been lost while it relayed, so
+	// once every holder is tried and none is still out, the signal fails
+	// only then. (A holder that rejected the offer won't relay, and doesn't
+	// count.)
+	answerBy  time.Time
+	offer     *MutableItem
+	answer    []byte // expected answer salt
+	answerKey []byte
 }
 
 // offerTry is one holder an offer is out with.
@@ -840,7 +839,7 @@ func (n *Node) Signal(now time.Time, priv ed25519.PrivateKey, provider [32]byte,
 	n.findRecord(now, s, s.epoch)
 	// The overlap lookup leaves the slots startInternal reserves for
 	// maintenance; without a slot, the miss fallback covers it.
-	if s.searching > 0 && len(n.lookups) < n.cfg.MaxLookups-4 &&
+	if s.searching > 0 && !s.triedPrev && len(n.lookups) < max(n.cfg.MaxLookups-4, 1) &&
 		now.Sub(time.Unix(s.epoch*int64(RecordEpoch/time.Second), 0)) < epochOverlap {
 		// Near the epoch's start, look up the previous epoch's record at
 		// once too. If the node is at its lookup cap, the miss fallback in
@@ -965,10 +964,10 @@ func (n *Node) startOffer(now time.Time, s *signalOp, l *lookup) {
 }
 
 // fillOffers keeps the offer out with parallelOffers holders that aren't
-// late, and fails the signal once every holder has been tried and every
-// answer window has closed without an answer.
+// late, and fails the signal once every holder has been tried, none is
+// still out, and the last answer window has closed. Every path that ends an
+// offer try calls it, so a signal never waits on a time already past.
 func (n *Node) fillOffers(now time.Time, s *signalOp) {
-	s.retryAt = time.Time{}
 	for s.next < len(s.holders) {
 		current := 0
 		for _, t := range s.tries {
@@ -982,15 +981,15 @@ func (n *Node) fillOffers(now time.Time, s *signalOp) {
 		h := s.holders[s.next]
 		a := s.offer.args()
 		a.Token = h.token
-		if !n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: s.next}) {
-			s.retryAt = now.Add(offerRetry) // keep this holder for the retry
-			break
-		}
-		s.tries = append(s.tries, &offerTry{attempt: s.next, deadline: now.Add(signalAttemptTimeout),
-			ackBy: now.Add(n.shortTimeout()), lapseBy: now.Add(n.cfg.ShortTimeout)})
+		attempt := s.next
 		s.next++
+		if !n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: attempt}) {
+			continue // the transaction table is full: count it as this holder failing
+		}
+		s.tries = append(s.tries, &offerTry{attempt: attempt, deadline: now.Add(signalAttemptTimeout),
+			ackBy: now.Add(n.shortTimeout()), lapseBy: now.Add(n.cfg.ShortTimeout)})
 	}
-	if len(s.tries) == 0 && s.retryAt.IsZero() && s.next >= len(s.holders) && !now.Before(s.lingerUntil) {
+	if len(s.tries) == 0 && s.next >= len(s.holders) && !now.Before(s.answerBy) {
 		n.signalFailed(s, ErrNoAnswer)
 	}
 }
@@ -1016,18 +1015,13 @@ func (n *Node) offerAcked(now time.Time, s *signalOp, attempt int, ok bool) {
 	}
 }
 
-// wakeup is when the signal's earliest outstanding offer must be acked or
-// answered, or zero if none is out.
+// wakeup is when the signal next needs attention: its earliest outstanding
+// offer's ack or answer time or, with none out, answerBy (ahead or zero:
+// fillOffers fails the signal once it passes).
 func (s *signalOp) wakeup() time.Time {
 	var w time.Time
-	pending := []time.Time{s.retryAt}
 	if len(s.tries) == 0 {
-		pending = append(pending, s.lingerUntil) // with tries out, their own deadlines wake us
-	}
-	for _, d := range pending {
-		if !d.IsZero() && (w.IsZero() || d.Before(w)) {
-			w = d
-		}
+		w = s.answerBy
 	}
 	for _, t := range s.tries {
 		d := t.deadline
@@ -1091,14 +1085,14 @@ func (n *Node) signalTimeouts(now time.Time) {
 		}
 		before := len(s.tries)
 		s.tries = slices.DeleteFunc(s.tries, func(t *offerTry) bool {
-			if !t.acked && !now.Before(t.lapseBy) && now.Before(t.deadline) && t.deadline.After(s.lingerUntil) {
-				s.lingerUntil = t.deadline // its answer could still come
+			givenUp := !t.acked && !now.Before(t.lapseBy) && now.Before(t.deadline)
+			if givenUp && t.deadline.After(s.answerBy) {
+				s.answerBy = t.deadline // its answer could still come
 			}
 			return !now.Before(t.deadline) || (!t.acked && !now.Before(t.lapseBy))
 		})
-		retry := !s.retryAt.IsZero() && !now.Before(s.retryAt)
-		lingered := len(s.tries) == 0 && !s.lingerUntil.IsZero() && !now.Before(s.lingerUntil)
-		if changed || len(s.tries) < before || retry || lingered {
+		windowClosed := len(s.tries) == 0 && !now.Before(s.answerBy)
+		if changed || len(s.tries) < before || windowClosed {
 			n.fillOffers(now, s)
 		}
 	}

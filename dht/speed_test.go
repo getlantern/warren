@@ -297,24 +297,29 @@ func TestEpochLookupsPreferCurrent(t *testing.T) {
 	}
 }
 
-// An offer that couldn't be sent (the transaction table was full) keeps its
-// holder for a retry rather than skipping it.
-func TestUnsentOfferRetriesSameHolder(t *testing.T) {
+// An offer that can't be sent (the transaction table is full) counts as
+// that holder failing: the next holder is tried, and a signal none of whose
+// offers can be sent fails at once rather than waiting.
+func TestUnsentOfferCountsAsFailedHolder(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(102)), Rand: rng(103)})
 	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
 	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
-	s := &signalOp{op: 4, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}}}
+	holders := []*cand{{addr: addr(1), token: []byte("tok")}, {addr: addr(2), token: []byte("tok")}, {addr: addr(3), token: []byte("tok")}}
+	s := &signalOp{op: 4, offer: &m, holders: holders}
 	n.signals = append(n.signals, s)
-	limit := n.cfg.MaxTransactions
-	n.cfg.MaxTransactions = 0 // every send fails
+	n.cfg.MaxTransactions = len(n.txns) + 1 // room for one offer only
 	n.fillOffers(t0, s)
-	if len(s.tries) != 0 || !slices.Contains(n.signals, s) || s.next != 0 {
-		t.Fatalf("an unsent offer consumed its holder or failed the signal (tries %d, next %d)", len(s.tries), s.next)
+	if len(s.tries) != 1 || s.tries[0].attempt != 0 || s.next != 3 {
+		t.Fatalf("tries %d next %d: want the first holder's offer out and the rest counted failed", len(s.tries), s.next)
 	}
-	n.cfg.MaxTransactions = limit
-	n.signalTimeouts(t0.Add(offerRetry))
-	if len(s.tries) != 1 || s.tries[0].attempt != 0 {
-		t.Fatal("the retry didn't offer to the same holder")
+
+	n2 := New(Config{ID: outsiderID(rng(104)), Rand: rng(105)})
+	s2 := &signalOp{op: 5, offer: &m, holders: holders}
+	n2.signals = append(n2.signals, s2)
+	n2.cfg.MaxTransactions = 0 // nothing can be sent
+	n2.fillOffers(t0, s2)
+	if slices.Contains(n2.signals, s2) {
+		t.Fatal("a signal none of whose offers could be sent kept waiting")
 	}
 }
 
@@ -370,17 +375,33 @@ func TestExpireSurvivesCancelledLookup(t *testing.T) {
 	}
 }
 
-// A passed lingerUntil, with offers still out, never makes NextWakeup a time
-// already gone (the driver would spin).
-func TestStaleLingerDoesntSpin(t *testing.T) {
+// Across a signal's whole life, with holders that never answer, NextWakeup
+// is never a time already past (the driver would spin).
+func TestSignalWakeupNeverInPast(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(108)), Rand: rng(109)})
-	s := &signalOp{op: 6, offer: &MutableItem{}, lingerUntil: t0.Add(-time.Second),
-		tries: []*offerTry{{attempt: 0, acked: true, deadline: t0.Add(time.Second)}}}
+	for range 8 {
+		n.rtt.sample(50 * time.Millisecond) // offers go late at 250 ms
+	}
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 6, offer: &m}
+	for i := 1; i <= 5; i++ {
+		s.holders = append(s.holders, &cand{addr: addr(i), token: []byte("tok")})
+	}
 	n.signals = append(n.signals, s)
 	n.nextMaint = t0.Add(time.Hour)
-	n.Tick(t0)
-	if w := n.NextWakeup(); !w.After(t0) {
-		t.Fatalf("NextWakeup %v before now: the driver would spin", w.Sub(t0))
+	n.fillOffers(t0, s)
+	for now := t0; slices.Contains(n.signals, s); now = now.Add(50 * time.Millisecond) {
+		if now.After(t0.Add(time.Minute)) {
+			t.Fatal("the signal never ended")
+		}
+		n.signalTimeouts(now)
+		n.Drain()
+		if slices.Contains(n.signals, s) {
+			if w := s.wakeup(); !w.After(now) {
+				t.Fatalf("at %v the signal's wakeup is %v, not ahead", now.Sub(t0), w.Sub(t0))
+			}
+		}
 	}
 }
 
