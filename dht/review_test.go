@@ -2,6 +2,7 @@ package dht
 
 import (
 	"crypto/ed25519"
+	"crypto/sha1"
 	"net/netip"
 	"testing"
 	"time"
@@ -551,5 +552,86 @@ func TestSettledIgnoresDistantReplies(t *testing.T) {
 	}
 	if done.Timing.Settled != 150*time.Millisecond || done.Timing.Total != 200*time.Millisecond {
 		t.Fatalf("settled %v total %v, want 150ms and 200ms: a reply outside K moved Settled", done.Timing.Settled, done.Timing.Total)
+	}
+}
+
+// An immutable get that finds its value stops there, reporting the time to
+// the value as its total.
+func TestGetTimingOnEarlyHit(t *testing.T) {
+	r := rng(84)
+	n := New(Config{ID: outsiderID(r), Rand: rng(85)})
+	ids := []krpc.NodeID{outsiderID(r), outsiderID(r)}
+	for i, id := range ids {
+		n.primary.heard(id, addr(i+1), t0)
+	}
+	v := []byte("5:hello")
+	op, err := n.Get(t0, krpc.NodeID(sha1.Sum(v)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sends, _ := n.Drain()
+	tids := map[netip.AddrPort][]byte{}
+	for _, s := range sends {
+		var m krpc.Msg
+		if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+			tids[s.To] = m.T
+		}
+	}
+	if tids[addr(1)] == nil {
+		t.Fatal("no query to the first contact")
+	}
+	n.HandlePacket(t0.Add(120*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0], V: v}}))
+	_, events := n.Drain()
+	var done *GetDone
+	for _, e := range events {
+		if d, ok := e.(GetDone); ok && d.Op == op {
+			done = &d
+		}
+	}
+	if done == nil || string(done.Value) != string(v) {
+		t.Fatal("the get didn't finish on the value")
+	}
+	want := Timing{First: 120 * time.Millisecond, Settled: 120 * time.Millisecond, Total: 120 * time.Millisecond}
+	if done.Timing != want || done.Failures != 0 {
+		t.Fatalf("timing %+v failures %d, want %+v and none", done.Timing, done.Failures, want)
+	}
+}
+
+// A rebind counts each query it abandons as one failure, and a stale reply
+// that arrives afterwards changes nothing.
+func TestRebindCountsAbandonedQueriesOnce(t *testing.T) {
+	r := rng(86)
+	n := New(Config{ID: outsiderID(r), Rand: rng(87)})
+	ids := []krpc.NodeID{outsiderID(r), outsiderID(r)}
+	for i, id := range ids {
+		n.primary.heard(id, addr(i+1), t0)
+	}
+	op, err := n.FindNode(t0, outsiderID(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sends, _ := n.Drain()
+	tids := map[netip.AddrPort][]byte{}
+	for _, s := range sends {
+		var m krpc.Msg
+		if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+			tids[s.To] = m.T
+		}
+	}
+	n.Rebound(t0.Add(50 * time.Millisecond))
+	// A reply to a query abandoned by the rebind finds no transaction.
+	n.HandlePacket(t0.Add(80*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0]}}))
+	_, events := n.Drain()
+	var done *LookupDone
+	for _, e := range events {
+		if d, ok := e.(LookupDone); ok && d.Op == op {
+			done = &d
+		}
+	}
+	if done == nil {
+		t.Fatal("the lookup didn't finish once its queries were abandoned")
+	}
+	if done.Failures != len(ids) || done.Timing.First != 0 {
+		t.Fatalf("failures %d first %v, want %d abandoned and no response", done.Failures, done.Timing.First, len(ids))
 	}
 }
