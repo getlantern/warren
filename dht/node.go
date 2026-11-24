@@ -615,7 +615,7 @@ func (n *Node) handleReply(now time.Time, from netip.AddrPort, m *krpc.Msg) {
 			n.keepaliveReply(now, t.holder, m)
 		}
 	case txOffer:
-		n.offerAcked(t.signal, t.attempt, m.Y == krpc.Response)
+		n.offerAcked(now, t.signal, t.attempt, m.Y == krpc.Response)
 	case txAnswerToken:
 		n.answerToken(now, from, m, t.session)
 	}
@@ -858,6 +858,9 @@ func (n *Node) expire(now time.Time) {
 	slices.Sort(tids)
 	for _, tid := range tids {
 		t := n.txns[tid]
+		if t == nil {
+			continue // settled meanwhile: a lookup cancelled while handling an earlier one
+		}
 		if now.Sub(t.sent) >= n.cfg.QueryTimeout {
 			delete(n.txns, tid)
 			n.timedOut(now, t)

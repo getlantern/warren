@@ -61,7 +61,7 @@ func TestParallelOffers(t *testing.T) {
 	if got := offersTo(); len(got) != 2 || got[0] != addr(1).String() || got[1] != addr(2).String() {
 		t.Fatalf("first offers went to %v, want the first two holders", got)
 	}
-	n.offerAcked(s, 0, true) // the first holder acks, the second stays silent
+	n.offerAcked(t0, s, 0, true) // the first holder acks, the second stays silent
 	n.signalTimeouts(t0.Add(time.Second + time.Millisecond))
 	if got := offersTo(); len(got) != 1 || got[0] != addr(3).String() {
 		t.Fatalf("after the second holder missed its ack, offers went to %v, want the third", got)
@@ -206,7 +206,7 @@ func TestLateHolderStillRelays(t *testing.T) {
 	if len(s.tries) != 4 {
 		t.Fatalf("%d offers out after the first two went late, want 4", len(s.tries))
 	}
-	n.offerAcked(s, 0, true) // the first holder acks at 400 ms, late but alive
+	n.offerAcked(t0.Add(400*time.Millisecond), s, 0, true) // the first holder acks at 400 ms, late but alive
 	n.signalTimeouts(t0.Add(time.Second + time.Millisecond))
 	kept := false
 	for _, tr := range s.tries {
@@ -235,32 +235,165 @@ func TestRebindResetsShortTimeout(t *testing.T) {
 	}
 }
 
-// With both epochs' lookups running, a record that can't be used (no holder
-// gave a token) waits for the other lookup; a usable one cancels it.
-func TestEpochLookupsCooperate(t *testing.T) {
-	n := New(Config{ID: outsiderID(rng(100)), Rand: rng(101)})
+// With both epochs' lookups running, the current epoch's record is
+// preferred (a previous epoch's can be a restarted provider's old one, with
+// a key it no longer holds): a previous record waits for the current lookup,
+// is used if the current one finds nothing usable, and is cancelled by a
+// usable current one.
+func TestEpochLookupsPreferCurrent(t *testing.T) {
 	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
 	x, _ := ecdh.X25519().NewPrivateKey(make([]byte, 32))
-	rec := func(holders ...*cand) *lookup {
-		return &lookup{best: &MutableItem{V: encodeRecord([32]byte(x.PublicKey().Bytes()))}, holders: holders}
+	rec := func(at int, token bool) *lookup {
+		h := &cand{addr: addr(at)}
+		if token {
+			h.token = []byte("tok")
+		}
+		return &lookup{best: &MutableItem{V: encodeRecord([32]byte(x.PublicKey().Bytes()))}, holders: []*cand{h}}
 	}
-	unusable, usable := rec(&cand{addr: addr(1)}), rec(&cand{addr: addr(2), token: []byte("tok")})
-	s := &signalOp{op: 3, priv: priv, payload: []byte("hi"), searching: 2, lookups: []*lookup{unusable, usable}}
+	setup := func(cur, prev *lookup) (*Node, *signalOp) {
+		n := New(Config{ID: outsiderID(rng(100)), Rand: rng(101)})
+		s := &signalOp{op: 3, priv: priv, payload: []byte("hi"), searching: 2, lookups: []*lookup{cur, prev}, cur: cur, triedPrev: true}
+		n.signals = append(n.signals, s)
+		n.lookups = append(n.lookups, cur, prev)
+		return n, s
+	}
+	offeredTo := func(s *signalOp) netip.AddrPort {
+		if s.offer == nil || len(s.holders) == 0 {
+			return netip.AddrPort{}
+		}
+		return s.holders[0].addr
+	}
+
+	// A usable previous record arrives first: it waits, and the current wins.
+	cur, prev := rec(1, true), rec(2, true)
+	n, s := setup(cur, prev)
+	n.recordFound(t0, s, prev)
+	if s.offer != nil {
+		t.Fatal("the previous epoch's record was used before the current lookup finished")
+	}
+	n.recordFound(t0, s, cur)
+	if offeredTo(s) != addr(1) {
+		t.Fatalf("offered via %v, want the current epoch's holder", offeredTo(s))
+	}
+
+	// The current record is unusable (no token): the previous one is used.
+	cur, prev = rec(1, false), rec(2, true)
+	n, s = setup(cur, prev)
+	n.recordFound(t0, s, cur)
+	if s.offer != nil || !slices.Contains(n.signals, s) {
+		t.Fatal("an unusable current record ended or misdirected the signal while the previous lookup ran")
+	}
+	n.recordFound(t0, s, prev)
+	if offeredTo(s) != addr(2) {
+		t.Fatalf("offered via %v, want the previous epoch's holder", offeredTo(s))
+	}
+
+	// A usable current record cancels the previous lookup still running.
+	cur, prev = rec(1, true), rec(2, true)
+	n, s = setup(cur, prev)
+	n.recordFound(t0, s, cur)
+	if offeredTo(s) != addr(1) || !prev.finished || slices.Contains(n.lookups, prev) {
+		t.Fatal("a usable current record didn't take the offer and cancel the previous lookup")
+	}
+}
+
+// An offer that couldn't be sent (the transaction table was full) keeps its
+// holder for a retry rather than skipping it.
+func TestUnsentOfferRetriesSameHolder(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(102)), Rand: rng(103)})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 4, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}}}
 	n.signals = append(n.signals, s)
-	n.lookups = append(n.lookups, unusable, usable)
-	n.recordFound(t0, s, unusable)
-	if !slices.Contains(n.signals, s) || s.offer != nil {
-		t.Fatal("an unusable record ended the signal while the other epoch's lookup ran")
+	limit := n.cfg.MaxTransactions
+	n.cfg.MaxTransactions = 0 // every send fails
+	n.fillOffers(t0, s)
+	if len(s.tries) != 0 || !slices.Contains(n.signals, s) || s.next != 0 {
+		t.Fatalf("an unsent offer consumed its holder or failed the signal (tries %d, next %d)", len(s.tries), s.next)
 	}
-	other := &lookup{}
-	s.searching++
-	s.lookups = append(s.lookups, other)
-	n.lookups = append(n.lookups, other)
-	n.recordFound(t0, s, usable)
+	n.cfg.MaxTransactions = limit
+	n.signalTimeouts(t0.Add(offerRetry))
+	if len(s.tries) != 1 || s.tries[0].attempt != 0 {
+		t.Fatal("the retry didn't offer to the same holder")
+	}
+}
+
+// After the last holder is given up on, the signal stays open through that
+// holder's answer window: its ack may have been lost while it relayed.
+func TestSignalWaitsOutLastAnswerWindow(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(104)), Rand: rng(105)})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 5, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}}}
+	n.signals = append(n.signals, s)
+	n.fillOffers(t0, s)
+	n.signalTimeouts(t0.Add(2 * time.Second)) // unacked past ShortTimeout: given up on
+	if !slices.Contains(n.signals, s) {
+		t.Fatal("the signal failed with the holder's answer window still open")
+	}
+	n.signalTimeouts(t0.Add(signalAttemptTimeout + time.Millisecond))
+	if slices.Contains(n.signals, s) {
+		t.Fatal("the signal outlived every answer window")
+	}
+}
+
+// A record lookup that finishes while expire walks the transactions, and
+// cancels the other epoch's lookup (deleting transactions expire has yet to
+// visit), doesn't crash it.
+func TestExpireSurvivesCancelledLookup(t *testing.T) {
+	r := rng(106)
+	n := New(Config{ID: outsiderID(r), Rand: rng(107)})
+	start := time.Unix(epochOf(t0)*int64(RecordEpoch/time.Second), 0).Add(time.Minute)
+	for i := 1; i <= 4; i++ {
+		n.primary.heard(outsiderID(r), addr(i), start)
+	}
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	if _, err := n.Signal(start, priv, [32]byte{1}, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	s := n.signals[0]
+	if len(s.lookups) != 2 {
+		t.Fatalf("setup: %d record lookups, want both epochs'", len(s.lookups))
+	}
+	x, _ := ecdh.X25519().NewPrivateKey(make([]byte, 32))
+	cur := s.lookups[0]
+	cur.best = &MutableItem{V: encodeRecord([32]byte(x.PublicKey().Bytes()))}
+	cur.holders = []*cand{{addr: addr(1), token: []byte("tok")}}
+	for _, c := range cur.cands {
+		if c.state != inflight {
+			c.state = failed // its in-flight queries are all that keep it open
+		}
+	}
+	n.Tick(start.Add(2 * time.Second)) // they lapse: cur finishes, cancelling the other
 	if s.offer == nil {
-		t.Fatal("a usable record didn't start the offer")
+		t.Fatal("setup: the current record didn't start the offer")
 	}
-	if !other.finished || slices.Contains(n.lookups, other) {
-		t.Fatal("the other epoch's lookup kept running after the offer started")
+}
+
+// A passed lingerUntil, with offers still out, never makes NextWakeup a time
+// already gone (the driver would spin).
+func TestStaleLingerDoesntSpin(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(108)), Rand: rng(109)})
+	s := &signalOp{op: 6, offer: &MutableItem{}, lingerUntil: t0.Add(-time.Second),
+		tries: []*offerTry{{attempt: 0, acked: true, deadline: t0.Add(time.Second)}}}
+	n.signals = append(n.signals, s)
+	n.nextMaint = t0.Add(time.Hour)
+	n.Tick(t0)
+	if w := n.NextWakeup(); !w.After(t0) {
+		t.Fatalf("NextWakeup %v before now: the driver would spin", w.Sub(t0))
+	}
+}
+
+// A holder that rejects the offer is dropped at once, not waited on.
+func TestRejectedOfferDropsHolder(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(110)), Rand: rng(111)})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 7, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}}}
+	n.signals = append(n.signals, s)
+	n.fillOffers(t0, s)
+	n.offerAcked(t0.Add(50*time.Millisecond), s, 0, false)
+	if slices.Contains(n.signals, s) {
+		t.Fatal("a signal whose only holder rejected the offer kept waiting")
 	}
 }
