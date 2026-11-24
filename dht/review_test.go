@@ -3,8 +3,8 @@ package dht
 import (
 	"crypto/ed25519"
 	"crypto/sha1"
-	"encoding/binary"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -650,13 +650,23 @@ func TestRebindCountsAbandonedQueriesOnce(t *testing.T) {
 		}
 		return out
 	}
+	var before []*txn // the lookup's queries from the old socket
+	for _, tx := range n.txns {
+		if tx.lookup != nil && tx.lookup.op == op {
+			before = append(before, tx)
+		}
+	}
 	n.Rebound(t0.Add(50 * time.Millisecond))
 	// None of the queries sent from the old socket may survive, or a late
-	// reply or timeout could still settle them. (A lookup with candidates
-	// left would carry on from the new socket with new transactions.)
-	for to, t0id := range tids {
-		if tx := n.txns[binary.BigEndian.Uint16(t0id)]; tx != nil && tx.to == to {
-			t.Fatalf("the query to %v, sent before the rebind, survives it", to)
+	// reply or timeout could still settle them; and the lookup, finished
+	// with every candidate abandoned, owns none at all. (Rebound's own
+	// refresh lookup may query the same contacts.)
+	for _, tx := range n.txns {
+		if slices.Contains(before, tx) {
+			t.Fatalf("the query to %v, sent before the rebind, survives it", tx.to)
+		}
+		if tx.lookup != nil && tx.lookup.op == op {
+			t.Fatalf("the finished lookup still owns a query to %v", tx.to)
 		}
 	}
 	got := dones()
