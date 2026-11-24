@@ -818,14 +818,22 @@ from the shutdown simulation: widening early with a short timeout filled the
 frontier with newly dead foreign nodes right after a border cut, and
 isolation-mode reads fell below 98 % until lapsed queries left it.
 
-Measured live, the old and new defaults side by side at the same moment
-(150 hits each, warren only):
+Measured live, the old and new code side by side at the same moment (150
+hits each, warren only; an earlier run showed the same shape, at 1.69 to
+1.19 s p50 and 3.83 to 2.49 s p90):
 
 | | before | after |
 |---|---|---|
-| hit, p50 / p90 / p99 | 1,692 / 3,825 / 9,536 ms | 1,194 / 2,494 / 5,312 ms |
-| hits found | 149 of 150 | 150 of 150 |
-| queries a hit | 13.2 | 14.6 |
+| hit, p50 / p90 / p99 | 1,357 / 3,929 / 6,922 ms | 1,009 / 1,834 / 3,378 ms |
+| hits found | 148 of 150 | 150 of 150 |
+| queries a hit | 12.8 | 14.4 |
+
+Signaling offers to two holders at once (see *Signaling*), and a holder
+that misses its ack at the adaptive short timeout is late, not dropped: the
+next one is brought in, and the late one is given up on only at 1 s. A
+holder that rejects the offer is dropped at once. An offer the node can't
+send for a full transaction table keeps its holder and retries; the signal
+fails with `ErrBusy` only if the table stays full for 8 seconds.
 
 Against libtorrent in one run (a slower network than the baseline's), the hit
 p90 went from 5.0 to 2.0 times libtorrent's and the p99 from 4.1 to 1.5 times;
