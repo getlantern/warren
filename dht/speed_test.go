@@ -319,20 +319,49 @@ func TestUnsentOfferKeepsHolders(t *testing.T) {
 		t.Fatalf("once there was room, next is %d: the kept holders weren't tried", s.next)
 	}
 
+	// A table that stays full: the signal keeps retrying, then fails with
+	// ErrBusy (a retry), not ErrNoAnswer, after offerBusyLimit.
 	n2 := New(Config{ID: outsiderID(rng(104)), Rand: rng(105)})
 	s2 := &signalOp{op: 5, offer: &m, holders: holders}
 	n2.signals = append(n2.signals, s2)
 	n2.cfg.MaxTransactions = 0 // nothing can be sent
 	n2.fillOffers(t0, s2)
-	_, events := n2.Drain()
-	busy := false
-	for _, e := range events {
-		if f, ok := e.(SignalFailed); ok && f.Op == 5 && f.Err == ErrBusy {
-			busy = true
+	var failed *SignalFailed
+	for now := t0; failed == nil && now.Before(t0.Add(offerBusyLimit+time.Second)); now = now.Add(offerRetry) {
+		n2.signalTimeouts(now)
+		if now.Before(t0.Add(offerBusyLimit)) && !slices.Contains(n2.signals, s2) {
+			t.Fatalf("the signal ended at %v, before the busy limit", now.Sub(t0))
+		}
+		_, events := n2.Drain()
+		for _, e := range events {
+			if f, ok := e.(SignalFailed); ok && f.Op == 5 {
+				failed = &f
+			}
 		}
 	}
-	if !busy || slices.Contains(n2.signals, s2) {
-		t.Fatal("a signal none of whose offers could be sent didn't fail with ErrBusy")
+	if failed == nil || failed.Err != ErrBusy {
+		t.Fatalf("a signal whose table stayed full failed with %v, want ErrBusy", failed)
+	}
+}
+
+// A full transaction table doesn't end a signal while a holder given up on
+// may still relay an answer.
+func TestBusyTableWaitsForAnswerWindow(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(112)), Rand: rng(113)})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 8, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}, {addr: addr(2), token: []byte("tok")}}}
+	n.signals = append(n.signals, s)
+	s.offeredAt = t0.Add(-offerBusyLimit) // the table has been full long enough for ErrBusy
+	n.cfg.MaxTransactions = len(n.txns) + 1 // room for the first offer only
+	n.fillOffers(t0, s)
+	n.signalTimeouts(t0.Add(2 * time.Second)) // the first holder is given up on; the second can't be sent
+	if !slices.Contains(n.signals, s) {
+		t.Fatal("the signal ended with the first holder's answer window still open")
+	}
+	n.signalTimeouts(t0.Add(signalAttemptTimeout + time.Millisecond))
+	if slices.Contains(n.signals, s) {
+		t.Fatal("the signal outlived the answer window with the table still full")
 	}
 }
 

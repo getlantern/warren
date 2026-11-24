@@ -91,7 +91,11 @@ const (
 	// the previous epoch's record at once, rather than only after missing
 	// the current one: the provider's new record may not have spread yet,
 	// or the two clocks may disagree about the epoch.
-	epochOverlap      = 10 * time.Minute
+	epochOverlap = 10 * time.Minute
+	// offerRetry is how soon a caller retries an offer it couldn't send for
+	// a full transaction table, and offerBusyLimit how long it keeps trying.
+	offerRetry        = 100 * time.Millisecond
+	offerBusyLimit    = 2 * signalAttemptTimeout
 	offerMaxSkew      = 60 // seconds between signer and verifier clocks
 	sessionLifetime   = time.Minute
 	forwardTTL        = 2 * time.Minute
@@ -801,13 +805,15 @@ type signalOp struct {
 	tries     []*offerTry
 	// answerBy is the end of the answer window of the latest holder given up
 	// on without a reply: its ack may have been lost while it relayed, so
-	// once every holder is tried and none is still out, the signal fails
-	// only then. (A holder that rejected the offer won't relay, and doesn't
-	// count.)
-	answerBy  time.Time
-	offer     *MutableItem
-	answer    []byte // expected answer salt
-	answerKey []byte
+	// the signal doesn't fail before it. (A holder that rejected the offer
+	// won't relay, and doesn't count.)
+	answerBy time.Time
+	// retryAt is set, always ahead, when an offer couldn't be sent for a
+	// full transaction table; offeredAt bounds how long that may go on.
+	retryAt, offeredAt time.Time
+	offer              *MutableItem
+	answer             []byte // expected answer salt
+	answerKey          []byte
 }
 
 // offerTry is one holder an offer is out with.
@@ -964,10 +970,16 @@ func (n *Node) startOffer(now time.Time, s *signalOp, l *lookup) {
 }
 
 // fillOffers keeps the offer out with parallelOffers holders that aren't
-// late, and fails the signal once every holder has been tried, none is
-// still out, and the last answer window has closed. Every path that ends an
-// offer try calls it, so a signal never waits on a time already past.
+// late. With none out and the last answer window closed, it fails the
+// signal: ErrNoAnswer once every holder has been tried, or ErrBusy if the
+// transaction table has stayed full for offerBusyLimit. Every path that ends
+// an offer try calls it, and it leaves retryAt either zero or ahead, so a
+// signal never waits on a time already past.
 func (n *Node) fillOffers(now time.Time, s *signalOp) {
+	if s.offeredAt.IsZero() {
+		s.offeredAt = now
+	}
+	s.retryAt = time.Time{}
 	for s.next < len(s.holders) {
 		current := 0
 		for _, t := range s.tries {
@@ -984,20 +996,22 @@ func (n *Node) fillOffers(now time.Time, s *signalOp) {
 		attempt := s.next
 		if !n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: attempt}) {
 			// The transaction table is full, a local and passing condition:
-			// keep this holder. With offers out, their timers call fillOffers
-			// again; with none, fail with ErrBusy, which says retry, not that
-			// the provider is unreachable.
-			if len(s.tries) == 0 {
-				n.signalFailed(s, ErrBusy)
-			}
-			return
+			// keep this holder and try again shortly.
+			s.retryAt = now.Add(offerRetry)
+			break
 		}
 		s.next++
 		s.tries = append(s.tries, &offerTry{attempt: attempt, deadline: now.Add(signalAttemptTimeout),
 			ackBy: now.Add(n.shortTimeout()), lapseBy: now.Add(n.cfg.ShortTimeout)})
 	}
-	if len(s.tries) == 0 && s.next >= len(s.holders) && !now.Before(s.answerBy) {
+	if len(s.tries) > 0 || now.Before(s.answerBy) {
+		return
+	}
+	switch {
+	case s.next >= len(s.holders):
 		n.signalFailed(s, ErrNoAnswer)
+	case !s.retryAt.IsZero() && !now.Before(s.offeredAt.Add(offerBusyLimit)):
+		n.signalFailed(s, ErrBusy) // a retry, not an unreachable provider
 	}
 }
 
@@ -1022,12 +1036,13 @@ func (n *Node) offerAcked(now time.Time, s *signalOp, attempt int, ok bool) {
 	}
 }
 
-// wakeup is when the signal next needs attention: its earliest outstanding
-// offer's ack or answer time or, with none out, answerBy (ahead or zero:
-// fillOffers fails the signal once it passes).
+// wakeup is when the signal next needs attention: a pending retry, its
+// earliest outstanding offer's ack or answer time or, with none out,
+// answerBy. Each is ahead or zero: fillOffers resets retryAt each time it
+// runs, and fails the signal once answerBy passes with nothing else left.
 func (s *signalOp) wakeup() time.Time {
-	var w time.Time
-	if len(s.tries) == 0 {
+	w := s.retryAt
+	if len(s.tries) == 0 && !s.answerBy.IsZero() && (w.IsZero() || s.answerBy.Before(w)) {
 		w = s.answerBy
 	}
 	for _, t := range s.tries {
@@ -1099,7 +1114,8 @@ func (n *Node) signalTimeouts(now time.Time) {
 			return !now.Before(t.deadline) || (!t.acked && !now.Before(t.lapseBy))
 		})
 		windowClosed := len(s.tries) == 0 && !now.Before(s.answerBy)
-		if changed || len(s.tries) < before || windowClosed {
+		retry := !s.retryAt.IsZero() && !now.Before(s.retryAt)
+		if changed || len(s.tries) < before || windowClosed || retry {
 			n.fillOffers(now, s)
 		}
 	}
