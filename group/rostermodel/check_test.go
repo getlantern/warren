@@ -139,7 +139,12 @@ func actions(w world, rules Rules) []action {
 			if r == A {
 				other = B
 			}
+			// Re-adding N as a member is a role change once N is a mirror,
+			// and a re-add once it's removed: neither may count.
 			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin))
+			if f.Roles[N] == Mirror || f.Removed[N] != 0 {
+				as = append(as, rogue(r, Add, N, Member))
+			}
 		case Member:
 			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None))
 		}

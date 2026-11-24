@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"sync"
 )
 
 // Key is a member key.
@@ -238,6 +239,17 @@ func Fold(s Store) (*Result, error) {
 	return nil, ErrNoFixpoint
 }
 
+// admitted caches, per add, whether its author had already admitted the
+// target. An ID hashes the op's parents, so its history, and the answer,
+// never change.
+var admitted sync.Map // admittedKey -> bool
+
+type admittedKey struct {
+	mutation string
+	id       ID
+}
+
+// apply folds order once, skipping dropped.
 func apply(order []*Op, dropped map[ID]bool) *Result {
 	r := &Result{Order: order, Counts: map[ID]bool{}, Roles: map[Key]Role{}, Removed: map[Key]ID{}}
 	ever := map[Key]bool{}
@@ -245,18 +257,27 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 	for _, o := range order {
 		byID[o.ID] = o
 	}
-	// sawTarget reports whether an add's author already had its target on
-	// the roster: the fold of the add's own causal history.
+	// sawTarget reports whether an add's author had already admitted its
+	// target, on the roster now or removed since, in the fold of the add's
+	// own causal history.
 	sawTarget := func(o *Op) bool {
 		if mutation == "role changes count" {
 			return false
 		}
+		k := admittedKey{mutation, o.ID}
+		if v, ok := admitted.Load(k); ok {
+			return v.(bool)
+		}
 		view := Store{}
 		for id := range byID.History(o.ID) {
-			view[id] = byID[id]
+			if byID[id] != nil {
+				view[id] = byID[id]
+			}
 		}
 		f, err := Fold(view)
-		return err != nil || f.Roles[o.Target] != None
+		v := err != nil || f.Roles[o.Target] != None || f.Removed[o.Target] != 0
+		admitted.Store(k, v)
+		return v
 	}
 	for i, o := range order {
 		if dropped[o.ID] {
@@ -279,7 +300,7 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			}
 			cur := r.Roles[o.Target]
 			switch {
-			case cur == None && !ever[o.Target]:
+			case cur == None && !ever[o.Target] && !sawTarget(o):
 				ok = true
 			case cur != None && cur != Owner && rank(o.Role) > rank(cur) && !sawTarget(o):
 				// The author didn't have the key on its own roster, so this
