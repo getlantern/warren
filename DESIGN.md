@@ -754,8 +754,10 @@ measures:
 
 - how fast each fills its routing table;
 - **hits**: immutable gets for items a third (warren) node stored, so neither
-  measured node has walked toward them; the time to the value is what
-  signaling pays to find a provider's record;
+  measured node has walked toward them; the time to the first matching value
+  is a proxy for signaling's provider-record lookup, which understates it:
+  that lookup is a mutable get, which keeps walking after a valid record
+  arrives until no query is left;
 - **misses**: gets to random targets, a full walk to the closest nodes.
 
 A finished lookup reports its `dht.Timing` (first response, when the K

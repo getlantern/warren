@@ -496,3 +496,60 @@ func TestLookupTiming(t *testing.T) {
 		t.Fatalf("timing %+v failures %d, want %+v and none", done.Timing, done.Failures, want)
 	}
 }
+
+// A reply from beyond the K closest responders leaves Settled alone; only a
+// change to the K closest moves it.
+func TestSettledIgnoresDistantReplies(t *testing.T) {
+	r := rng(82)
+	n := New(Config{ID: outsiderID(r), Rand: rng(83), K: 2})
+	target := outsiderID(r)
+	near := func(byteIdx int) krpc.NodeID { // differs from target first at byteIdx
+		id := target
+		id[byteIdx] ^= 0x80
+		return id
+	}
+	nearest, middle, far := near(19), near(10), near(0)
+	n.primary.heard(middle, addr(1), t0)
+	n.primary.heard(far, addr(2), t0)
+	op, err := n.FindNode(t0, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var done *LookupDone
+	tids := map[netip.AddrPort][]byte{}
+	drain := func() {
+		sends, events := n.Drain()
+		for _, s := range sends {
+			var m krpc.Msg
+			if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+				tids[s.To] = m.T
+			}
+		}
+		for _, e := range events {
+			if d, ok := e.(LookupDone); ok && d.Op == op {
+				done = &d
+			}
+		}
+	}
+	reply := func(after time.Duration, from netip.AddrPort, id krpc.NodeID, nodes ...krpc.NodeInfo) {
+		t.Helper()
+		if tids[from] == nil {
+			t.Fatalf("no query to %v", from)
+		}
+		n.HandlePacket(t0.Add(after), from, krpc.AppendMarshal(nil, &krpc.Msg{T: tids[from], Y: krpc.Response, R: krpc.Return{ID: id, Nodes: nodes}}))
+		drain()
+	}
+	drain()
+	// The middle node answers and refers a nearer one; the nearer one
+	// answers; the far node, by then outside the K=2 closest responders,
+	// answers last.
+	reply(100*time.Millisecond, addr(1), middle, krpc.NodeInfo{ID: nearest, Addr: addr(3)})
+	reply(150*time.Millisecond, addr(3), nearest)
+	reply(200*time.Millisecond, addr(2), far)
+	if done == nil {
+		t.Fatal("the lookup never finished")
+	}
+	if done.Timing.Settled != 150*time.Millisecond || done.Timing.Total != 200*time.Millisecond {
+		t.Fatalf("settled %v total %v, want 150ms and 200ms: a reply outside K moved Settled", done.Timing.Settled, done.Timing.Total)
+	}
+}
