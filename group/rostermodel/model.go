@@ -72,9 +72,10 @@ type Op struct {
 	Parents []ID
 	Lamport uint64
 	Seals   []Seal
-	// Malicious marks an operation written by a removed author after it
-	// learned of its removal. The fold doesn't read it; properties do.
-	Malicious bool
+	// Backdated marks an operation written by a removed author after it
+	// learned of its removal; Rogue, one written by an admin without the
+	// authority for it. The fold reads neither; properties do.
+	Backdated, Rogue bool
 }
 
 func (o *Op) makesKeys() bool {
@@ -91,22 +92,26 @@ func (o *Op) seal() {
 	w(uint64(o.Target))
 	w(uint64(o.Role))
 	w(o.Lamport)
-	if o.Malicious {
-		w(1)
+	flags := uint64(0)
+	if o.Backdated {
+		flags |= 1
 	}
-	for _, p := range o.Parents {
-		w(uint64(p))
+	if o.Rogue {
+		flags |= 2
 	}
+	w(flags)
+	list := func(ids []ID) {
+		w(uint64(len(ids)))
+		for _, id := range ids {
+			w(uint64(id))
+		}
+	}
+	list(o.Parents)
+	w(uint64(len(o.Seals)))
 	for _, s := range o.Seals {
 		w(uint64(s.To))
-		for _, e := range s.Epochs {
-			w(uint64(e))
-		}
-		w(0)
-		for _, g := range s.Gs {
-			w(uint64(g))
-		}
-		w(0)
+		list(s.Epochs)
+		list(s.Gs)
 	}
 	o.ID = ID(binary.BigEndian.Uint64(h.Sum(nil)))
 }
@@ -236,7 +241,7 @@ func Fold(s Store) (*Result, error) {
 func apply(order []*Op, dropped map[ID]bool) *Result {
 	r := &Result{Order: order, Counts: map[ID]bool{}, Roles: map[Key]Role{}, Removed: map[Key]ID{}}
 	ever := map[Key]bool{}
-	added := map[Key]ID{}
+	added := map[Key][]ID{}
 	var hist func(ID) map[ID]bool
 	cache := map[ID]map[ID]bool{}
 	byID := map[ID]*Op{}
@@ -271,14 +276,15 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			switch {
 			case cur == None && !ever[o.Target]:
 				ok = true
-			case cur != None && cur != Owner && rank(o.Role) > rank(cur) && !hist(o.ID)[added[o.Target]]:
+			case cur != None && cur != Owner && rank(o.Role) > rank(cur) && !slices.ContainsFunc(added[o.Target], func(a ID) bool { return hist(o.ID)[a] }):
 				// A concurrent add of a key already added: it has sealed
 				// its role's keys regardless, so the key takes the higher
 				// role (admin over member over mirror).
 				ok = true
 			}
 			if ok {
-				r.Roles[o.Target], added[o.Target] = o.Role, o.ID
+				r.Roles[o.Target] = o.Role
+				added[o.Target] = append(added[o.Target], o.ID)
 				ever[o.Target] = true
 			}
 		case Remove:

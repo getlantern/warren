@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about two minutes)")
+var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about six minutes)")
 
 const (
 	O Key = iota + 1 // owner
@@ -99,7 +99,7 @@ func actions(w world, rules Rules) []action {
 		}
 		as = append(as, action{desc, func(w world) bool {
 			if malicious {
-				return AuthorMalicious(w[r], kind, r, target, role) != nil
+				return AuthorBackdated(w[r], kind, r, target, role) != nil
 			}
 			return Author(w[r], rules, kind, r, target, role) != nil
 		}})
@@ -134,7 +134,7 @@ func actions(w world, rules Rules) []action {
 			as = append(as, rogue(r, Remove, O, None), rogue(r, Add, N, Admin))
 		}
 		if f.Removed[r] != 0 {
-			op(r, Add, N, Admin, true)
+			op(r, Add, N, Member, true)
 			op(r, Deliver, N, None, true)
 			op(r, Remove, M, None, true)
 		}
@@ -163,7 +163,7 @@ func rogue(r Key, kind Kind, target Key, role Role) action {
 	return action{fmt.Sprintf("%v %v %v as %v (rogue)", r, kind, target, role), func(w world) bool {
 		s := w[r]
 		o := newOp(s, kind, r, target, role, s.Heads(), 0)
-		o.Malicious = true
+		o.Rogue = true
 		finish(s, o)
 		return true
 	}}
@@ -189,7 +189,7 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 		}
 	}
 	for _, o := range f.Order {
-		if o.Malicious && f.Counts[o.ID] && f.Removed[o.Author] != 0 {
+		if o.Backdated && f.Counts[o.ID] && f.Removed[o.Author] != 0 {
 			return fmt.Errorf("backdated %v by removed %v counts", o.Kind, o.Author)
 		}
 	}
@@ -210,7 +210,10 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 		return fmt.Errorf("owner can't issue the corrective rekey")
 	}
 	for range 8 {
-		f2, _ := Fold(r)
+		f2, err := Fold(r)
+		if err != nil {
+			return fmt.Errorf("during recovery: %w", err)
+		}
 		grew := false
 		for _, k := range sortedKeys(f2.Roles) {
 			for _, t := range sortedKeys(f2.Roles) {
@@ -223,7 +226,9 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 			break
 		}
 	}
-	f, _ = Fold(r)
+	if f, err = Fold(r); err != nil {
+		return fmt.Errorf("after recovery: %w", err)
+	}
 	epochs, gs = r.Holdings()
 	if leak := leaked(f, epochs, gs); leak != "" {
 		return fmt.Errorf("after recovery, %s", leak)
@@ -341,7 +346,7 @@ func TestRosterModel(t *testing.T) {
 // TestMutations breaks each rule in turn and checks the explorer catches it,
 // so a passing TestRosterModel means the properties have teeth.
 func TestMutations(t *testing.T) {
-	for _, m := range []string{"no view rule", "admins add admins", "owner removable"} {
+	for _, m := range []string{"no view rule", "admins add admins", "owner removable", "deliver off the roster"} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m
 			defer func() { mutation = "" }()

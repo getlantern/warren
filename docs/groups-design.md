@@ -148,10 +148,10 @@ The roster is a set of operations signed by member keys, kept by members
   keys it lacks, sealed to one member already added) by any member: it
   grants no rights, and only fills in keys a member missed (*Removal*). The
   recipient checks each key against the commitment of the operation that
-  made it (*Keys*), so a forged key is ignored. A sender never delivers a
-  key made by, or causally after, a counting `remove` of the recipient. (A
-  `remove` that doesn't count must not withhold anything: its target is
-  still a member and would never get another key.)
+  made it (*Keys*), so a forged key is ignored. A sender delivers only to
+  a recipient on its own folded roster, which a counting `remove` takes it
+  off, and withholds nothing else: withholding after a `remove` that doesn't
+  count would starve a member still on the roster.
   A `deliver` to a recipient removed concurrently doesn't count but has
   still handed over its keys, so it is treated like a key sealed to a
   removed member (*Removal*, step 3). One whose author was removed

@@ -11,8 +11,10 @@ const self ID = 0
 type Rules struct {
 	// DeliverAfterAnyRemove makes a sender withhold from a recipient every
 	// key made by, or causally after, any remove of the recipient in the
-	// sender's store, counting or not (the doc's literal text). Otherwise
-	// only counting removes withhold.
+	// sender's store, counting or not: the design's first wording, which
+	// starves a member whose remove didn't count. Otherwise a sender
+	// withholds nothing beyond delivering only to keys on its own roster,
+	// which a counting remove already takes the recipient off.
 	DeliverAfterAnyRemove bool
 }
 
@@ -85,7 +87,7 @@ func Author(s Store, rules Rules, kind Kind, author, target Key, role Role) *Op 
 	switch kind {
 	case Add:
 		can := a == Owner || (a == Admin && role != Admin)
-		if !can || f.Roles[target] != None {
+		if !can || f.Roles[target] != None || f.Removed[target] != 0 {
 			return nil
 		}
 		sl := Seal{To: target}
@@ -118,11 +120,11 @@ func Author(s Store, rules Rules, kind Kind, author, target Key, role Role) *Op 
 		}
 	case Deliver:
 		t := f.Roles[target]
-		if a == None || t == None {
+		if a == None || (t == None && mutation != "deliver off the roster") {
 			return nil
 		}
 		tEpochs, tGs := held(s, target)
-		withheld := withheldFrom(s, f, rules, target)
+		withheld := withheldFrom(s, rules, target)
 		sl := Seal{To: target}
 		if gs[f.Current] && !tGs[f.Current] && !withheld[f.Current] {
 			sl.Gs = []ID{f.Current}
@@ -146,10 +148,13 @@ func Author(s Store, rules Rules, kind Kind, author, target Key, role Role) *Op 
 
 // withheldFrom returns the key-making operations a sender must not deliver
 // to target: those made by, or causally after, a remove of target.
-func withheldFrom(s Store, f *Result, rules Rules, target Key) map[ID]bool {
+func withheldFrom(s Store, rules Rules, target Key) map[ID]bool {
+	if !rules.DeliverAfterAnyRemove {
+		return nil
+	}
 	var removes []ID
 	for _, o := range s {
-		if o.Kind == Remove && o.Target == target && (rules.DeliverAfterAnyRemove || f.Counts[o.ID]) {
+		if o.Kind == Remove && o.Target == target {
 			removes = append(removes, o.ID)
 		}
 	}
@@ -168,11 +173,11 @@ func withheldFrom(s Store, f *Result, rules Rules, target Key) map[ID]bool {
 	return out
 }
 
-// AuthorMalicious writes an operation by a removed author with parents from
+// AuthorBackdated writes an operation by a removed author with parents from
 // before it saw its removal, so it looks concurrent with that removal, and
 // a low Lamport clock, so it sorts early. It seals whatever the author
 // holds. It returns nil unless s holds a remove of author.
-func AuthorMalicious(s Store, kind Kind, author, target Key, role Role) *Op {
+func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
 	pre := Store{}
 	for id, o := range s {
 		removedBefore := o.Kind == Remove && o.Target == author
@@ -189,7 +194,7 @@ func AuthorMalicious(s Store, kind Kind, author, target Key, role Role) *Op {
 		return nil
 	}
 	o := newOp(s, kind, author, target, role, pre.Heads(), 1)
-	o.Malicious = true
+	o.Backdated = true
 	epochs, gs := held(pre, author)
 	switch kind {
 	case Add, Deliver:
