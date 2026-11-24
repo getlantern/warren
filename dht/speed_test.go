@@ -474,9 +474,10 @@ func TestBusyRetryWakeupNeverInPast(t *testing.T) {
 	n.nextMaint = t0.Add(time.Hour)
 	n.cfg.MaxTransactions = len(n.txns) + 2 // two offers out
 	n.fillOffers(t0, s)
-	n.cfg.MaxTransactions = 0 // and then the table stays full: the third holder waits
+	n.cfg.MaxTransactions = 0                              // and then the table stays full: the third holder waits
 	n.offerAcked(t0.Add(100*time.Millisecond), s, 1, true) // the second acks; the first never does
 	n.Drain()
+	var failed *SignalFailed
 	for now := t0.Add(100 * time.Millisecond); slices.Contains(n.signals, s); {
 		if now.After(t0.Add(time.Minute)) {
 			t.Fatal("the signal never ended")
@@ -487,6 +488,29 @@ func TestBusyRetryWakeupNeverInPast(t *testing.T) {
 		}
 		now = w
 		n.Tick(now)
-		n.Drain()
+		_, events := n.Drain()
+		for _, e := range events {
+			if f, ok := e.(SignalFailed); ok && f.Op == 9 {
+				failed = &f
+			}
+		}
+	}
+	if failed == nil || failed.Err != ErrBusy {
+		t.Fatalf("the signal ended with %v, want ErrBusy (a holder unsent on a full table)", failed)
+	}
+}
+
+// The busy limit counts from the first failed send since the last offer
+// that went out: a table that fills late doesn't inherit an old failure.
+func TestBusyLimitRestartsAfterASend(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(116)), Rand: rng(117)})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 10, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}, {addr: addr(2), token: []byte("tok")}}}
+	n.signals = append(n.signals, s)
+	s.busySince = t0.Add(-time.Hour) // an old failure
+	n.fillOffers(t0, s)              // the first offer goes out
+	if !s.busySince.IsZero() {
+		t.Fatal("a sent offer didn't clear the old busy time")
 	}
 }

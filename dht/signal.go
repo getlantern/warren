@@ -1044,7 +1044,7 @@ func (n *Node) offerAcked(now time.Time, s *signalOp, attempt int, ok bool) {
 // wakeup is when the signal next needs attention: a pending retry, its
 // earliest outstanding offer's ack or answer time or, with none out,
 // answerBy. Each is ahead or zero: fillOffers resets retryAt each time it
-// runs, and fails the signal once answerBy passes with nothing else left.
+// runs and clears answerBy once it passes.
 func (s *signalOp) wakeup() time.Time {
 	w := s.retryAt
 	if len(s.tries) == 0 && !s.answerBy.IsZero() && (w.IsZero() || s.answerBy.Before(w)) {
@@ -1056,7 +1056,7 @@ func (s *signalOp) wakeup() time.Time {
 		case t.acked:
 		case !t.late:
 			d = t.ackBy
-		default:
+		case t.lapseBy.Before(d):
 			d = t.lapseBy
 		}
 		if w.IsZero() || d.Before(w) {
