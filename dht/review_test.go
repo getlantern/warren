@@ -581,15 +581,26 @@ func TestGetTimingOnEarlyHit(t *testing.T) {
 		t.Fatal("no query to the first contact")
 	}
 	n.HandlePacket(t0.Add(120*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0], V: v}}))
-	_, events := n.Drain()
-	var done *GetDone
-	for _, e := range events {
-		if d, ok := e.(GetDone); ok && d.Op == op {
-			done = &d
+	gets := func() []GetDone {
+		_, events := n.Drain()
+		var out []GetDone
+		for _, e := range events {
+			if d, ok := e.(GetDone); ok && d.Op == op {
+				out = append(out, d)
+			}
 		}
+		return out
 	}
-	if done == nil || string(done.Value) != string(v) {
-		t.Fatal("the get didn't finish on the value")
+	got := gets()
+	if len(got) != 1 || string(got[0].Value) != string(v) {
+		t.Fatalf("%d completions, want one carrying the value", len(got))
+	}
+	done := got[0]
+	// The other contact's query times out later; the finished get stays
+	// finished.
+	n.Tick(t0.Add(10 * time.Second))
+	if extra := gets(); len(extra) != 0 {
+		t.Fatalf("a finished get completed again: %+v", extra)
 	}
 	want := Timing{First: 120 * time.Millisecond, Settled: 120 * time.Millisecond, Total: 120 * time.Millisecond}
 	if done.Timing != want || done.Failures != 0 {
@@ -618,20 +629,34 @@ func TestRebindCountsAbandonedQueriesOnce(t *testing.T) {
 			tids[s.To] = m.T
 		}
 	}
-	n.Rebound(t0.Add(50 * time.Millisecond))
-	// A reply to a query abandoned by the rebind finds no transaction.
-	n.HandlePacket(t0.Add(80*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0]}}))
-	_, events := n.Drain()
-	var done *LookupDone
-	for _, e := range events {
-		if d, ok := e.(LookupDone); ok && d.Op == op {
-			done = &d
+	for i := range ids {
+		if tids[addr(i+1)] == nil {
+			t.Fatalf("no query to %v", addr(i+1))
 		}
 	}
-	if done == nil {
-		t.Fatal("the lookup didn't finish once its queries were abandoned")
+	dones := func() []LookupDone {
+		_, events := n.Drain()
+		var out []LookupDone
+		for _, e := range events {
+			if d, ok := e.(LookupDone); ok && d.Op == op {
+				out = append(out, d)
+			}
+		}
+		return out
 	}
-	if done.Failures != len(ids) || done.Timing.First != 0 {
-		t.Fatalf("failures %d first %v, want %d abandoned and no response", done.Failures, done.Timing.First, len(ids))
+	n.Rebound(t0.Add(50 * time.Millisecond))
+	got := dones()
+	if len(got) != 1 {
+		t.Fatalf("%d completions after the rebind, want one", len(got))
+	}
+	if d := got[0]; d.Failures != len(ids) || d.Timing.First != 0 || d.Timing.Total != 50*time.Millisecond {
+		t.Fatalf("failures %d first %v total %v, want %d abandoned, no response, 50ms", d.Failures, d.Timing.First, d.Timing.Total, len(ids))
+	}
+	// A reply to an abandoned query finds no transaction, and no timeout
+	// fires for one later: nothing more is reported.
+	n.HandlePacket(t0.Add(80*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0]}}))
+	n.Tick(t0.Add(10 * time.Second))
+	if extra := dones(); len(extra) != 0 {
+		t.Fatalf("an abandoned lookup completed again: %+v", extra)
 	}
 }
