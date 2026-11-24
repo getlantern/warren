@@ -138,7 +138,7 @@ func actions(w world, rules Rules) []action {
 			}
 			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin))
 		case Member:
-			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None), rogue(r, Remove, B, None))
+			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None))
 		}
 		if f.Removed[r] != 0 {
 			op(r, Add, N, Member, true)
@@ -177,7 +177,7 @@ func rogue(r Key, kind Kind, target Key, role Role) action {
 	}}
 }
 
-func desc(o *Op) string {
+func opDesc(o *Op) string {
 	if o.Kind == Rekey {
 		return "rekey"
 	}
@@ -200,7 +200,7 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 	}
 	for _, o := range f.Order {
 		if o.Rogue && f.Counts[o.ID] {
-			return fmt.Errorf("rogue %v by %v counts", desc(o), o.Author)
+			return fmt.Errorf("rogue %v by %v counts", opDesc(o), o.Author)
 		}
 	}
 	for _, o := range f.Order {

@@ -481,10 +481,11 @@ no off-roster key holds the current group secret or epoch key, mirrors hold
 the current group secret but no current epoch key, and every member holds
 the current keys and every epoch key any other member holds. Admins and
 members also sign, as compromised devices would, the operations their role
-has no authority for, and none may count. (No explored replica is a mirror,
-so mirrors' authority, the same rule as members', isn't explored.) Mutation tests break each authority rule,
-the view rule, delivery's roster check and the corrective rekey in turn, and
-the explorer catches each. It found
+has no authority for, and none may count. Mutation tests break each admin
+and member authority rule, the view rule, delivery's roster check and the
+corrective rekey in turn, and the explorer catches each. No explored replica
+is a mirror, so mirrors' authority (the same rule as members') isn't
+explored. It found
 two rules above that were wrong as first written (concurrent duplicate
 `add`s, and `deliver` withholding after any `remove`), and writing it pinned
 the total order down as an algorithm.

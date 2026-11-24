@@ -298,7 +298,7 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 				ok = true
 			}
 		case Rekey:
-			if author == Owner || author == Admin || (author != None && mutation == "members rekey") {
+			if author == Owner || author == Admin || ((author == Member || author == Mirror) && mutation == "members rekey") {
 				r.Current = o.ID
 				ok = true
 			}
