@@ -419,6 +419,7 @@ func (n *Node) ListenKey(now time.Time, priv ed25519.PrivateKey, x *ecdh.Private
 // mappings on the new network. Routing contacts stay: their addresses
 // didn't change.
 func (n *Node) Rebound(now time.Time) {
+	n.rtt = rttEstimator{} // round trips on the old network say nothing about the new
 	n.reflections, n.destOrder = nil, nil
 	n.gen++
 	// Queries in flight went out from the old socket: abandon them, so a
@@ -791,6 +792,7 @@ type signalOp struct {
 	epoch     int64 // the current epoch's
 	triedPrev bool  // the previous epoch's record is being or was looked up
 	searching int   // record lookups still running
+	lookups   []*lookup
 	holders   []*cand
 	next      int // the next holder to offer to
 	tries     []*offerTry
@@ -803,10 +805,13 @@ type signalOp struct {
 type offerTry struct {
 	attempt  int       // the holder's index in holders
 	deadline time.Time // for the answer
-	// ackBy is when the holder must have acknowledged the offer: a dead
-	// holder is detected after about a round trip, not the answer window.
-	ackBy time.Time
-	acked bool
+	// ackBy is the adaptive short timeout: unacked by then, the try is late
+	// and the next holder is brought in, as a lookup widens past a slow
+	// query. lapseBy is Config.ShortTimeout: unacked by then, the holder is
+	// given up on. A dead holder costs about a round trip; a slow live one
+	// still relays.
+	ackBy, lapseBy time.Time
+	acked, late    bool
 }
 
 // Signal sends payload to provider through the DHT and returns its answer
@@ -845,6 +850,7 @@ func (n *Node) findRecord(now time.Time, s *signalOp, epoch int64) {
 		return
 	}
 	s.searching++
+	s.lookups = append(s.lookups, l)
 	l.key, l.salt = &key, salt
 	l.onDone = func(now time.Time, l *lookup) { n.recordFound(now, s, l) }
 	n.step(now, l)
@@ -871,19 +877,25 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 		}
 		return
 	}
+	var holders []*cand
 	for _, c := range l.holders {
 		if c.token != nil {
-			s.holders = append(s.holders, c)
+			holders = append(holders, c)
 		}
 	}
-	if len(s.holders) == 0 {
-		n.signalFailed(s, ErrNoRecord)
-		return
-	}
 	xPub, err := ecdh.X25519().NewPublicKey(x[:])
-	if err != nil {
-		n.signalFailed(s, ErrNoRecord)
-		return
+	if len(holders) == 0 || err != nil {
+		if s.searching == 0 {
+			n.signalFailed(s, ErrNoRecord)
+		}
+		return // the other epoch's lookup may still give a usable record
+	}
+	s.holders = holders
+	// This record will do: stop the other epoch's lookup, if still running.
+	for _, o := range s.lookups {
+		if o != l {
+			n.cancelLookup(o)
+		}
 	}
 	e, _ := ecdh.X25519().NewPrivateKey(n.randBytes(32))
 	shared, err := e.ECDH(xPub)
@@ -908,15 +920,27 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 	n.fillOffers(now, s)
 }
 
-// fillOffers keeps the offer out with up to parallelOffers holders, and
-// fails the signal once every holder has been tried without an answer.
+// fillOffers keeps the offer out with parallelOffers holders that aren't
+// late, and fails the signal once every holder has been tried without an
+// answer.
 func (n *Node) fillOffers(now time.Time, s *signalOp) {
-	for len(s.tries) < parallelOffers && s.next < len(s.holders) {
+	for s.next < len(s.holders) {
+		current := 0
+		for _, t := range s.tries {
+			if !t.late {
+				current++
+			}
+		}
+		if current >= parallelOffers {
+			break
+		}
 		h := s.holders[s.next]
 		a := s.offer.args()
 		a.Token = h.token
-		n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: s.next})
-		s.tries = append(s.tries, &offerTry{attempt: s.next, deadline: now.Add(signalAttemptTimeout), ackBy: now.Add(n.shortTimeout())})
+		if n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: s.next}) {
+			s.tries = append(s.tries, &offerTry{attempt: s.next, deadline: now.Add(signalAttemptTimeout),
+				ackBy: now.Add(n.shortTimeout()), lapseBy: now.Add(n.cfg.ShortTimeout)})
+		}
 		s.next++
 	}
 	if len(s.tries) == 0 {
@@ -938,8 +962,12 @@ func (s *signalOp) wakeup() time.Time {
 	var w time.Time
 	for _, t := range s.tries {
 		d := t.deadline
-		if !t.acked && t.ackBy.Before(d) {
+		switch {
+		case t.acked:
+		case !t.late:
 			d = t.ackBy
+		default:
+			d = t.lapseBy
 		}
 		if w.IsZero() || d.Before(w) {
 			w = d
@@ -986,11 +1014,17 @@ func (n *Node) signalTimeouts(now time.Time) {
 		if s.offer == nil {
 			continue
 		}
+		changed := false
+		for _, t := range s.tries {
+			if !t.acked && !t.late && !now.Before(t.ackBy) {
+				t.late, changed = true, true
+			}
+		}
 		before := len(s.tries)
 		s.tries = slices.DeleteFunc(s.tries, func(t *offerTry) bool {
-			return !now.Before(t.deadline) || (!t.acked && !now.Before(t.ackBy))
+			return !now.Before(t.deadline) || (!t.acked && !now.Before(t.lapseBy))
 		})
-		if len(s.tries) < before {
+		if changed || len(s.tries) < before {
 			n.fillOffers(now, s)
 		}
 	}

@@ -1,8 +1,10 @@
 package dht
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -182,4 +184,83 @@ func (n *Node) lastTID(to netip.AddrPort) []byte {
 		}
 	}
 	return nil
+}
+
+// A holder that acks late, after the adaptive short timeout but before
+// Config.ShortTimeout, brings in the next holder without being dropped.
+func TestLateHolderStillRelays(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(96)), Rand: rng(97)})
+	for range 8 {
+		n.rtt.sample(50 * time.Millisecond) // adaptive short timeout: 250 ms
+	}
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 2, offer: &m}
+	for i := 1; i <= 4; i++ {
+		s.holders = append(s.holders, &cand{addr: addr(i), token: []byte("tok")})
+	}
+	n.signals = append(n.signals, s)
+	n.fillOffers(t0, s)
+	n.Drain()
+	n.signalTimeouts(t0.Add(300 * time.Millisecond)) // both late: two more holders
+	if len(s.tries) != 4 {
+		t.Fatalf("%d offers out after the first two went late, want 4", len(s.tries))
+	}
+	n.offerAcked(s, 0, true) // the first holder acks at 400 ms, late but alive
+	n.signalTimeouts(t0.Add(time.Second + time.Millisecond))
+	kept := false
+	for _, tr := range s.tries {
+		kept = kept || (tr.attempt == 0 && tr.acked)
+	}
+	if !kept {
+		t.Fatal("a holder that acked late was dropped")
+	}
+	if !slices.Contains(n.signals, s) {
+		t.Fatal("the signal failed with a holder still relaying")
+	}
+}
+
+// A rebind forgets the old network's round trips.
+func TestRebindResetsShortTimeout(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(98)), Rand: rng(99)})
+	for range 8 {
+		n.rtt.sample(40 * time.Millisecond)
+	}
+	if n.shortTimeout() == n.cfg.ShortTimeout {
+		t.Fatal("setup: the short timeout didn't adapt")
+	}
+	n.Rebound(t0)
+	if got := n.shortTimeout(); got != n.cfg.ShortTimeout {
+		t.Fatalf("after a rebind the short timeout is %v, want the %v ceiling until new round trips are timed", got, n.cfg.ShortTimeout)
+	}
+}
+
+// With both epochs' lookups running, a record that can't be used (no holder
+// gave a token) waits for the other lookup; a usable one cancels it.
+func TestEpochLookupsCooperate(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(100)), Rand: rng(101)})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	x, _ := ecdh.X25519().NewPrivateKey(make([]byte, 32))
+	rec := func(holders ...*cand) *lookup {
+		return &lookup{best: &MutableItem{V: encodeRecord([32]byte(x.PublicKey().Bytes()))}, holders: holders}
+	}
+	unusable, usable := rec(&cand{addr: addr(1)}), rec(&cand{addr: addr(2), token: []byte("tok")})
+	s := &signalOp{op: 3, priv: priv, payload: []byte("hi"), searching: 2, lookups: []*lookup{unusable, usable}}
+	n.signals = append(n.signals, s)
+	n.lookups = append(n.lookups, unusable, usable)
+	n.recordFound(t0, s, unusable)
+	if !slices.Contains(n.signals, s) || s.offer != nil {
+		t.Fatal("an unusable record ended the signal while the other epoch's lookup ran")
+	}
+	other := &lookup{}
+	s.searching++
+	s.lookups = append(s.lookups, other)
+	n.lookups = append(n.lookups, other)
+	n.recordFound(t0, s, usable)
+	if s.offer == nil {
+		t.Fatal("a usable record didn't start the offer")
+	}
+	if !other.finished || slices.Contains(n.lookups, other) {
+		t.Fatal("the other epoch's lookup kept running after the offer started")
+	}
 }

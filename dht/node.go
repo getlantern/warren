@@ -523,6 +523,21 @@ func (n *Node) removeLookup(l *lookup) {
 	n.lookups = slices.DeleteFunc(n.lookups, func(x *lookup) bool { return x == l })
 }
 
+// cancelLookup ends a lookup no longer wanted, without completing it, and
+// frees its queries' transactions: replies to them are dropped.
+func (n *Node) cancelLookup(l *lookup) {
+	if l.finished {
+		return
+	}
+	l.finished = true
+	n.removeLookup(l)
+	for tid, t := range n.txns {
+		if t.lookup == l && t.kind == txLookup {
+			delete(n.txns, tid)
+		}
+	}
+}
+
 func (n *Node) putResolved(now time.Time, l *lookup, t *txn, ok bool) {
 	if ok {
 		l.putAcks++

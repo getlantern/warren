@@ -100,7 +100,7 @@ func (c *Config) setDefaults() {
 	def(&c.MaxInflight, 16)
 	def(&c.MaxLookups, 16)
 	def(&c.MaxCandidates, 128)
-	def(&c.MaxTransactions, 256)
+	def(&c.MaxTransactions, 512) // MaxLookups x MaxInflight, plus room for puts, keepalives and offers
 	def(&c.MaxItems, 4096)
 	def(&c.EvictAfterFailures, 2)
 	dur(&c.QueryTimeout, 3*time.Second)

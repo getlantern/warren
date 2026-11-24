@@ -68,7 +68,7 @@ func main() {
 	noMiss := flag.Bool("no-miss", false, "skip the miss phase")
 	flag.IntVar(&tune.MaxInflight, "inflight", 0, "warren: most queries in flight per lookup (0: default)")
 	flag.IntVar(&tune.Alpha, "alpha", 0, "warren: active queries per lookup (0: default)")
-	flag.DurationVar(&tune.ShortTimeout, "short", 0, "warren: a query stops counting as active after this (0: default)")
+	flag.DurationVar(&tune.ShortTimeout, "short", 0, "warren: ceiling of the adaptive short timeout, and when a slow query stops holding the lookup open (0: default)")
 	flag.DurationVar(&tune.QueryTimeout, "timeout", 0, "warren: a query fails after this (0: default)")
 	flag.Parse()
 	if *concurrency < 1 || *lookups < 1 {
