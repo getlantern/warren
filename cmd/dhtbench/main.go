@@ -74,6 +74,9 @@ func main() {
 	if *concurrency < 1 || *lookups < 1 {
 		log.Fatal("-concurrency and -lookups must be at least 1")
 	}
+	if tune.MaxInflight < 0 || tune.Alpha < 0 || tune.ShortTimeout < 0 || tune.QueryTimeout < 0 {
+		log.Fatal("-inflight, -alpha, -short and -timeout can't be negative (0 means the default)")
+	}
 
 	seeds := resolve(natprobe.DefaultBootstrap)
 	if len(seeds) == 0 {

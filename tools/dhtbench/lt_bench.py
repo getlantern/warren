@@ -71,8 +71,9 @@ def batch(label, targets):
     while queue or pending:
         while queue and len(pending) < concurrency:
             t = bytes.fromhex(queue.pop(0)).hex()  # lowercase, as alerts report it
-            s.dht_get_immutable_item(lt.sha1_hash(bytes.fromhex(t)))
-            pending[t] = time.monotonic()
+            target = lt.sha1_hash(bytes.fromhex(t))
+            pending[t] = time.monotonic()  # timed from the call, as warren's are
+            s.dht_get_immutable_item(target)
         s.wait_for_alert(200)
         for a in s.pop_alerts():
             if isinstance(a, lt.dht_immutable_item_alert):
