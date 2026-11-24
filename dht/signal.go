@@ -809,8 +809,9 @@ type signalOp struct {
 	// won't relay, and doesn't count.)
 	answerBy time.Time
 	// retryAt is set, always ahead, when an offer couldn't be sent for a
-	// full transaction table; offeredAt bounds how long that may go on.
-	retryAt, offeredAt time.Time
+	// full transaction table; busySince, the first such failure since the
+	// last offer sent, bounds how long that may go on.
+	retryAt, busySince time.Time
 	offer              *MutableItem
 	answer             []byte // expected answer salt
 	answerKey          []byte
@@ -973,13 +974,13 @@ func (n *Node) startOffer(now time.Time, s *signalOp, l *lookup) {
 // late. With none out and the last answer window closed, it fails the
 // signal: ErrNoAnswer once every holder has been tried, or ErrBusy if the
 // transaction table has stayed full for offerBusyLimit. Every path that ends
-// an offer try calls it, and it leaves retryAt either zero or ahead, so a
-// signal never waits on a time already past.
+// an offer try calls it, and it leaves retryAt and answerBy each zero or
+// ahead, so a signal never waits on a time already past.
 func (n *Node) fillOffers(now time.Time, s *signalOp) {
-	if s.offeredAt.IsZero() {
-		s.offeredAt = now
-	}
 	s.retryAt = time.Time{}
+	if !now.Before(s.answerBy) {
+		s.answerBy = time.Time{} // passed: never a wakeup in the past
+	}
 	for s.next < len(s.holders) {
 		current := 0
 		for _, t := range s.tries {
@@ -998,8 +999,12 @@ func (n *Node) fillOffers(now time.Time, s *signalOp) {
 			// The transaction table is full, a local and passing condition:
 			// keep this holder and try again shortly.
 			s.retryAt = now.Add(offerRetry)
+			if s.busySince.IsZero() {
+				s.busySince = now
+			}
 			break
 		}
+		s.busySince = time.Time{}
 		s.next++
 		s.tries = append(s.tries, &offerTry{attempt: attempt, deadline: now.Add(signalAttemptTimeout),
 			ackBy: now.Add(n.shortTimeout()), lapseBy: now.Add(n.cfg.ShortTimeout)})
@@ -1010,7 +1015,7 @@ func (n *Node) fillOffers(now time.Time, s *signalOp) {
 	switch {
 	case s.next >= len(s.holders):
 		n.signalFailed(s, ErrNoAnswer)
-	case !s.retryAt.IsZero() && !now.Before(s.offeredAt.Add(offerBusyLimit)):
+	case !s.retryAt.IsZero() && !now.Before(s.busySince.Add(offerBusyLimit)):
 		n.signalFailed(s, ErrBusy) // a retry, not an unreachable provider
 	}
 }

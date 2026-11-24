@@ -352,10 +352,11 @@ func TestBusyTableWaitsForAnswerWindow(t *testing.T) {
 	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
 	s := &signalOp{op: 8, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}, {addr: addr(2), token: []byte("tok")}}}
 	n.signals = append(n.signals, s)
-	s.offeredAt = t0.Add(-offerBusyLimit) // the table has been full long enough for ErrBusy
 	n.cfg.MaxTransactions = len(n.txns) + 1 // room for the first offer only
 	n.fillOffers(t0, s)
 	n.signalTimeouts(t0.Add(2 * time.Second)) // the first holder is given up on; the second can't be sent
+	s.busySince = t0.Add(-offerBusyLimit)     // as if the table had been full long enough for ErrBusy
+	n.signalTimeouts(t0.Add(2*time.Second + offerRetry))
 	if !slices.Contains(n.signals, s) {
 		t.Fatal("the signal ended with the first holder's answer window still open")
 	}
@@ -456,5 +457,36 @@ func TestRejectedOfferDropsHolder(t *testing.T) {
 	n.offerAcked(t0.Add(50*time.Millisecond), s, 0, false)
 	if slices.Contains(n.signals, s) {
 		t.Fatal("a signal whose only holder rejected the offer kept waiting")
+	}
+}
+
+// With an answer window closing while an unsent holder waits on a full
+// table, NextWakeup stays ahead through the signal's whole life.
+func TestBusyRetryWakeupNeverInPast(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(114)), Rand: rng(115)})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 9, offer: &m}
+	for i := 1; i <= 3; i++ {
+		s.holders = append(s.holders, &cand{addr: addr(i), token: []byte("tok")})
+	}
+	n.signals = append(n.signals, s)
+	n.nextMaint = t0.Add(time.Hour)
+	n.cfg.MaxTransactions = len(n.txns) + 2 // two offers out
+	n.fillOffers(t0, s)
+	n.cfg.MaxTransactions = 0 // and then the table stays full: the third holder waits
+	n.offerAcked(t0.Add(100*time.Millisecond), s, 1, true) // the second acks; the first never does
+	n.Drain()
+	for now := t0.Add(100 * time.Millisecond); slices.Contains(n.signals, s); {
+		if now.After(t0.Add(time.Minute)) {
+			t.Fatal("the signal never ended")
+		}
+		w := n.NextWakeup()
+		if !w.After(now) {
+			t.Fatalf("at %v NextWakeup is %v, not ahead", now.Sub(t0), w.Sub(t0))
+		}
+		now = w
+		n.Tick(now)
+		n.Drain()
 	}
 }
