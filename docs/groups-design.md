@@ -131,10 +131,11 @@ The roster is a set of operations signed by member keys, kept by members
   epoch key so far sealed to the new member; a mirror gets `G` only) by an
   admin, or by the owner when the role is `admin`. A role is fixed when the
   key is added: v1 has no role changes, and an `add` of a key already on
-  the roster never counts, with one exception: two concurrent `add`s of the
-  same key have both sealed their keys, so the key takes the role holding
-  more (admin over member over mirror) rather than leaving a mirror with
-  epoch keys. To change a device's role, it is removed and
+  the roster never counts, with one exception: an `add` whose author didn't
+  have the key on its own roster (the fold of the `add`'s causal history)
+  is concurrent with the one that admitted it, not a role change, and both
+  have sealed their keys, so the key takes the role holding more (admin over
+  member over mirror) rather than leaving a mirror with epoch keys. To change a device's role, it is removed and
   added again under a fresh member key (a full removal, see *Open
   problems*);
 - `remove` (member key; the remover's view of that member: the hashes of its

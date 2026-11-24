@@ -131,6 +131,9 @@ func actions(w world, rules Rules) []action {
 		}
 		// A compromised device signing what its role has no authority for.
 		switch f.Roles[r] {
+		case Owner:
+			// v1 has no role changes, not even by the owner.
+			as = append(as, rogue(r, Add, M, Admin))
 		case Admin:
 			other := A
 			if r == A {
@@ -383,7 +386,7 @@ func TestRosterModel(t *testing.T) {
 func TestMutations(t *testing.T) {
 	for _, m := range []string{
 		"no view rule", "admins add admins", "admins remove admins", "owner removable",
-		"members add", "members remove", "members rekey", "deliver off the roster",
+		"members add", "members remove", "members rekey", "deliver off the roster", "role changes count",
 	} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m

@@ -241,18 +241,22 @@ func Fold(s Store) (*Result, error) {
 func apply(order []*Op, dropped map[ID]bool) *Result {
 	r := &Result{Order: order, Counts: map[ID]bool{}, Roles: map[Key]Role{}, Removed: map[Key]ID{}}
 	ever := map[Key]bool{}
-	added := map[Key][]ID{}
-	var hist func(ID) map[ID]bool
-	cache := map[ID]map[ID]bool{}
-	byID := map[ID]*Op{}
+	byID := Store{}
 	for _, o := range order {
 		byID[o.ID] = o
 	}
-	hist = func(id ID) map[ID]bool {
-		if cache[id] == nil {
-			cache[id] = Store(byID).History(id)
+	// sawTarget reports whether an add's author already had its target on
+	// the roster: the fold of the add's own causal history.
+	sawTarget := func(o *Op) bool {
+		if mutation == "role changes count" {
+			return false
 		}
-		return cache[id]
+		view := Store{}
+		for id := range byID.History(o.ID) {
+			view[id] = byID[id]
+		}
+		f, err := Fold(view)
+		return err != nil || f.Roles[o.Target] != None
 	}
 	for i, o := range order {
 		if dropped[o.ID] {
@@ -274,24 +278,18 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 				break
 			}
 			cur := r.Roles[o.Target]
-			concurrent := !slices.ContainsFunc(added[o.Target], func(a ID) bool { return hist(o.ID)[a] })
 			switch {
 			case cur == None && !ever[o.Target]:
 				ok = true
-			case cur != None && cur != Owner && concurrent:
-				// A concurrent add of a key already added has sealed its
-				// role's keys regardless, so the key takes the higher role
-				// (admin over member over mirror). Either way the add is
-				// evidence the key was admitted, so a later add that saw it
-				// is a role change and never counts.
-				added[o.Target] = append(added[o.Target], o.ID)
-				ok = rank(o.Role) > rank(cur)
+			case cur != None && cur != Owner && rank(o.Role) > rank(cur) && !sawTarget(o):
+				// The author didn't have the key on its own roster, so this
+				// add is concurrent with the one that admitted it, not a
+				// role change. Both have sealed their role's keys, so the
+				// key takes the higher role (admin over member over mirror).
+				ok = true
 			}
 			if ok {
 				r.Roles[o.Target] = o.Role
-				if cur == None {
-					added[o.Target] = append(added[o.Target], o.ID)
-				}
 				ever[o.Target] = true
 			}
 		case Remove:
