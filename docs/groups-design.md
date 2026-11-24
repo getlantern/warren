@@ -129,9 +129,9 @@ The roster is a set of operations signed by member keys, kept by members
   `epochKey[0]` sealed to the founder);
 - `add` (member key, display name, role, and the current `G` and every
   epoch key so far sealed to the new member; a mirror gets `G` only) by an
-  admin, or by the owner when the role is `admin`. An `add` of a key already
-  on the roster changes its role; promoting to or demoting from `admin` is
-  owner only;
+  admin, or by the owner when the role is `admin`. A role is fixed when the
+  key is added: v1 has no role changes. To change a device's role, it is
+  removed and added again under a fresh member key;
 - `remove` (member key; the remover's view of that member: the hashes of its
   latest roster operations and the head of its log the remover has seen,
   sequence number and entry hash; and the rekey, see *Removal*) by an admin,
@@ -170,13 +170,10 @@ operations the author had seen). Folding is deterministic:
   counts in the total order. Two concurrent rekeys by different admins
   therefore resolve the same way on every member, and the losing rekey's
   epoch key stays readable (*Keys*);
-- **remove wins** over a concurrent `add` or role change of the same key,
-  if its author had authority over the target's role in the remove's
-  causal parents (an admin removing a member the owner is concurrently
-  promoting removes it; the owner can add it back);
-- a `remove` of a key that is no longer on the roster when applied changes
-  no keys (its keys don't become current, though members keep them), but
-  its log head still counts toward the cutoff (*Logs*);
+- **a removed key never returns**: an `add` of a key that was ever removed
+  doesn't count, and a `remove` of a key that is no longer on the roster
+  when applied doesn't count either (members keep any keys it sealed to
+  them, so content written under them stays readable);
 - operations by a removed author count only if the `remove` names them, or
   their descendants, in its view of that author. That depends only on the
   `remove`'s content, not on when anything arrives, so every member folds
@@ -189,15 +186,9 @@ never removed, so no two operations can remove each other's authors. Without
 a trusted clock, every rule for admins removing each other at once lets a
 compromised admin either strike back at its remover, make itself
 unremovable, or grant itself authority through an admin it adds; a single
-owner rules that out. The owner's operations form one chain, each naming
-the owner's previous operation. Two owner operations naming the same
-predecessor are proof the owner key forked: every owner operation after the
-fork point, on either branch, stops counting, no further admin changes
-count, and the app is told. That depends only on the operations, so every
-member holding both branches folds the same roster. Before the owner signs
-after a restart or a restore from backup, the library fetches the owner's
-latest operation from members, so a stale backup doesn't fork the chain.
-The cost: a lost or compromised owner key
+owner rules that out. The owner's operations fold like any others; its
+authority is absolute, so nothing it signs, even from a stale backup, can
+conflict with its own authority. The cost: a lost or compromised owner key
 can't be replaced in v1. The group keeps working but its admins are fixed,
 and if the owner key is compromised, the members recreate the group.
 
@@ -325,12 +316,10 @@ before removal. The `remove` operation records the head of that log the
 removing admin had seen (sequence number and entry hash), and members accept
 only entries on the chain ending at that head: nothing past it, and nothing
 below it that the head's hash chain doesn't lead to, so the removed member
-can't sign a different history below the cutoff. Only removals that count
-after folding set a cutoff, including a second removal of a key already
-removed (*Roster*). If two such removals of the same member, by admins or
-the owner, are concurrent and one head is on the other's chain, the later
-head applies (both admins saw those entries); if neither is, the two heads
-are proof of a fork and the log is handled as forked. Entries a member had
+can't sign a different history below the cutoff. Only the removal that
+counts sets the cutoff: if two admins remove the same member concurrently,
+the one first in the total order counts and the other doesn't (*Roster*),
+so entries only the second remover had seen are dropped too. Entries a member had
 already accepted past the final cutoff are withdrawn, and the app told.
 Without a trusted clock an entry written offline just before removal
 can't be told from one backdated after, so this cut is the rule: a removed
@@ -396,8 +385,9 @@ Removing a member:
    corrective one), the remaining members also listen under their
    rendezvous keys from each `G` superseded in that window. A member that
    missed the change reaches them there, and gets it by roster gossip. A
-   member offline longer is out until an admin re-invites it (the owner, if
-   it was an admin; see *Invites*): it holds only secrets the removed member also holds, so
+   member offline longer is out until an admin removes its old key and
+   re-invites it under a new one (the owner does both if it was an admin;
+   see *Invites*): it holds only secrets the removed member also holds, so
    nothing else can tell them apart.
 
 What the removed member keeps: everything from before its removal. What it
@@ -441,8 +431,8 @@ carries neither `G` nor any member key.
   invitee then leaves the join session for normal ones.
 - Single-use invites are spent at the first `add` against them; all are
   refused after expiry or after a removal (*Removal*). An admin re-invites a
-  member that was offline through a removal the same way; re-adding a
-  former admin takes the owner.
+  member that was offline through a removal the same way, removing its old
+  key; for a former admin, the owner does both.
 
 A leaked invite lets its holder ask to join, nothing more: it can't
 impersonate the admin, read the directory or content, find members, or
