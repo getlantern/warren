@@ -137,8 +137,8 @@ func actions(w world, rules Rules) []action {
 				other = B
 			}
 			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin))
-		case Member, Mirror:
-			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None))
+		case Member:
+			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None), rogue(r, Remove, B, None))
 		}
 		if f.Removed[r] != 0 {
 			op(r, Add, N, Member, true)
@@ -166,7 +166,7 @@ func actions(w world, rules Rules) []action {
 }
 
 // rogue writes an operation its author has no authority for, sealing
-// nothing, as a compromised admin could.
+// nothing, as a compromised device could.
 func rogue(r Key, kind Kind, target Key, role Role) action {
 	return action{fmt.Sprintf("%v %v %v as %v (rogue)", r, kind, target, role), func(w world) bool {
 		s := w[r]
@@ -175,6 +175,13 @@ func rogue(r Key, kind Kind, target Key, role Role) action {
 		finish(s, o)
 		return true
 	}}
+}
+
+func desc(o *Op) string {
+	if o.Kind == Rekey {
+		return "rekey"
+	}
+	return fmt.Sprintf("%v %v", o.Kind, o.Target)
 }
 
 // maxPasses is the most passes any fold in a run needed.
@@ -193,7 +200,7 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 	}
 	for _, o := range f.Order {
 		if o.Rogue && f.Counts[o.ID] {
-			return fmt.Errorf("rogue %v %v by %v counts", o.Kind, o.Target, o.Author)
+			return fmt.Errorf("rogue %v by %v counts", desc(o), o.Author)
 		}
 	}
 	for _, o := range f.Order {
@@ -376,7 +383,7 @@ func TestRosterModel(t *testing.T) {
 func TestMutations(t *testing.T) {
 	for _, m := range []string{
 		"no view rule", "admins add admins", "admins remove admins", "owner removable",
-		"members add", "members rekey", "deliver off the roster",
+		"members add", "members remove", "members rekey", "deliver off the roster",
 	} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m

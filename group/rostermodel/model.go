@@ -73,8 +73,8 @@ type Op struct {
 	Lamport uint64
 	Seals   []Seal
 	// Backdated marks an operation written by a removed author after it
-	// learned of its removal; Rogue, one written by an admin without the
-	// authority for it. The fold reads neither; properties do.
+	// learned of its removal; Rogue, one written by a compromised device
+	// without its role's authority for it. The fold reads neither; properties do.
 	Backdated, Rogue bool
 }
 
@@ -269,7 +269,7 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			}
 		case Add:
 			can := author == Owner || (author == Admin && (o.Role != Admin || mutation == "admins add admins")) ||
-				(author != None && mutation == "members add")
+				((author == Member || author == Mirror) && mutation == "members add")
 			if !can || o.Role == None || o.Role == Owner {
 				break
 			}
@@ -290,7 +290,8 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			}
 		case Remove:
 			t := r.Roles[o.Target]
-			can := author == Owner || (author == Admin && (t != Admin || mutation == "admins remove admins"))
+			can := author == Owner || (author == Admin && (t != Admin || mutation == "admins remove admins")) ||
+				((author == Member || author == Mirror) && mutation == "members remove")
 			if can && t != None && (t != Owner || mutation == "owner removable") {
 				delete(r.Roles, o.Target)
 				r.Removed[o.Target], r.Current = o.ID, o.ID
