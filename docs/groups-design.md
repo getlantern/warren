@@ -71,7 +71,15 @@ Invites don't carry it (*Invites*). Keys derived from `G` with HKDF-SHA256
 made by the founder; each later one is made on a rekey (*Removal*). Epoch
 keys travel only sealed to individual members (in `add`, `rekey` and
 `deliver` operations), so a blind mirror, which gets `G` but no epoch keys,
-can't read content.
+can't read content. Each epoch key is named by the hash of the operation
+that made it, and every encrypted entry names the epoch key it used, so a
+member keeps every epoch key sealed to it and can read content written under
+any of them.
+
+Every operation that makes keys (`genesis`, `remove`, `rekey`) also carries
+a **commitment** to them: a hash of the new `G` and of the new epoch key,
+under a fixed label. A member checks any key it is given, whoever seals it,
+against the commitment of the operation that made it.
 
 **Periods** are one hour. Everything visible on the DHT (the directory's
 signing key and salts, members' rendezvous keys) derives from the period, so
@@ -122,26 +130,40 @@ The roster is a set of operations signed by member keys, kept by members
   and every epoch key so far sealed to the new member; a mirror gets `G`
   only) by an admin;
 - `remove` (member key; the remover's view of that member: the hashes of its
-  latest roster operations and the highest sequence number of its log the
-  remover has seen; and the rekey, see *Removal*) by an admin, as one
-  operation;
+  latest roster operations and the head of its log the remover has seen,
+  sequence number and entry hash; and the rekey, see *Removal*) by an admin,
+  as one operation;
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
 - `deliver` (the current `G` and epoch key sealed to one member already
-  added) by any member: it grants no rights, so it isn't admin-checked, and
-  only fills in keys a member missed (*Removal*).
+  added) by any member: it grants no rights, and only fills in keys a member
+  missed (*Removal*). The recipient checks the keys against the commitment
+  of the operation that made them (*Keys*), so a bad `deliver` is ignored.
 
-Operations carry a Lamport clock and their causal parents (the hashes of the
-latest operations the author had seen). Folding is deterministic:
+Every operation names the genesis's hash, which is the group's ID, and
+carries a Lamport clock and its causal parents (the hashes of the latest
+operations the author had seen). Folding is deterministic:
 
-- operations apply in causal order; each is checked **when applied**, and
-  counts only if its author is an admin at that point;
+- operations apply in one **total order** every member computes alike:
+  causal order, with concurrent operations ordered by Lamport clock and
+  then by operation hash;
+- `genesis` is valid only as the root: no parents, signed by the founder key
+  it names, and it makes the founder the first admin;
+- each other operation is checked **when applied**: `add`, `remove`,
+  `rekey` and `invite` count only if the author is an admin at that point,
+  and `deliver` only if the author is a member and the recipient is a member
+  at that point;
+- the **current keys** are those made by the last key-making operation that
+  counts in the total order. Two concurrent rekeys by different admins
+  therefore resolve the same way on every member, and the losing rekey's
+  epoch key stays readable (*Keys*);
 - **remove wins** over a concurrent `add` of the same key;
 - concurrent removals between admins all apply, unless that would leave no
-  admin: then the removal by the **more senior** admin (added earlier in
-  the fold) stands. Seniority is fixed by history, unlike a hash an author
-  could grind;
+  admin: then the removal by the **more senior** admin (whose `add` comes
+  earlier in the total order) stands. Seniority is fixed by history: a hash
+  decides it only between admins added concurrently, and an admin can't
+  grind its own position after the fact;
 - operations by a removed author count only if the `remove` names them, or
   their descendants, in its view of that author. That depends only on the
   `remove`'s content, not on when anything arrives, so every member folds
@@ -189,8 +211,9 @@ route directory traffic through relay routers (a later option).
 
 **BEP 44 compare-and-swap isn't atomic across storing nodes,** so two members
 writing a shard at once can each win on some replicas. A writer re-reads
-after its put and re-merges if its entry is missing; readers merge what
-they find across replicas; and sessions gossip liveness anyway.
+after its put and re-merges if its entry is missing; readers merge every
+distinct value they find across replicas (which needs a warren change, see
+*Warren changes needed*); and sessions gossip liveness anyway.
 
 ## Sessions
 
@@ -210,11 +233,17 @@ recovery and memory caps.
 - **A caller the callee doesn't know yet** (a member added since the
   callee last synced): signaling can't carry the proof, since admission
   comes before any session. The callee admits a caller whose key it doesn't
-  recognize into a **sync session** that serves nothing until the caller
-  presents a signed `add` chain admitting a member key whose blinded key is
-  the caller's. Only a holder of `G` can compute the callee's rendezvous key
-  to call it at all, so this opens the callee only to members, recently
-  removed members (refused once the chain is checked), and nobody else.
+  recognize only if the caller's key is the **sync key** for the call:
+  an ed25519 key whose seed is `HKDF(G, "sync" ‖ p ‖ callee's rendezvous
+  key)`. Signaling offers are signed by the caller key, so the key itself is
+  the proof that the caller holds `G`, and it reaches the callee before any
+  session exists. A DHT holder sees the callee's rendezvous key in its
+  record but can't compute the sync key. The callee admits such a caller
+  into a **sync session** that serves nothing until the caller presents a
+  signed `add` chain admitting a member key, and signs the session's secret
+  with that key. This opens the callee to members and recently removed
+  members (who hold `G` during the grace window, see *Removal*, and are
+  refused once the chain is checked), and nobody else.
 - On connect the two exchange roster heads and missing operations, then
   liveness (members each has reached lately), then log heads (*Logs*) and
   content inventories (*Swarming*).
@@ -260,15 +289,24 @@ another's log, so a member offline for a week catches up from whoever is
 around (unless a rekey happened meanwhile, see *Removal*).
 
 **Removal and logs.** A removed member's log keeps the entries it wrote
-before removal. The `remove` operation records the highest sequence number
-of that log the removing admin had seen, and members accept nothing past
-it. If two admins remove the same member concurrently, the higher of their
-cutoffs applies (both admins saw those entries). Entries a member had
-already accepted past the final cutoff are withdrawn, and the app told. Without a trusted clock an entry written offline just before removal
+before removal. The `remove` operation records the head of that log the
+removing admin had seen (sequence number and entry hash), and members accept
+only entries on the chain ending at that head: nothing past it, and nothing
+below it that the head's hash chain doesn't lead to, so the removed member
+can't sign a different history below the cutoff. If two admins remove the
+same member concurrently and one head is on the other's chain, the later
+head applies (both admins saw those entries); if neither is, the two heads
+are proof of a fork and the log is handled as forked. Entries a member had
+already accepted past the final cutoff are withdrawn, and the app told.
+Without a trusted clock an entry written offline just before removal
 can't be told from one backdated after, so this cut is the rule: a removed
 member's late offline writes are dropped rather than its forgeries kept.
 
 ## Swarming
+
+Each session exchanges **inventories**: the blob ID, size and piece size of
+every blob a side holds, readable without epoch keys. That is how a fetcher
+learns who has a blob, and how a blind mirror learns what to fetch.
 
 A fetcher asks every connected member for the pieces of a blob they hold
 (a bitfield, then updates as pieces arrive) and schedules:
@@ -289,7 +327,9 @@ pieces on disk.
 **Blind mirrors** (an always-on device that serves without reading) are
 added with a `mirror` flag: they receive `G` (to find the directory) but no
 epoch keys, so they fetch and serve ciphertext and verify pieces by the tree
-but can't unwrap blob keys or read logs. A rekey seals the new `G'` to
+but can't unwrap blob keys or read logs. A mirror fetches every blob in the
+inventories it receives, up to its storage budget; it learns blob IDs and
+sizes, which it would see by serving anyway. A rekey seals the new `G'` to
 mirrors as to members, and the new epoch key to members only.
 
 ## Removal
@@ -303,11 +343,17 @@ Removing a member:
    removal without the new keys.
 2. A member that learns of a `remove` applies it **before it publishes
    anything**, so it wraps new blob keys under the new epoch key and moves to
-   `G'`.
+   `G'`. Applying it also closes every session with the removed member's
+   key, abandoning requests in flight, since admission was checked only when
+   those sessions opened.
 3. **Concurrent changes.** If, after folding, the current keys turn out to
    have been sealed to a member the fold removed (two admins removing two
    members at once), they are superseded: an admin issues a `rekey` sealed
-   only to the members the fold keeps. A member added concurrently with a
+   only to the members the fold keeps. Until that `rekey` arrives, a member
+   **publishes nothing**: the app's posts and blobs wait in a queue. Anything
+   published before a member learned of the concurrent removal was readable
+   by the removed member; that window is as short as gossip and can't be
+   closed. A member added concurrently with a
    removal (one the removing admin didn't know of) gets `G'` and the new
    epoch key from any member that notices, in a `deliver` operation.
 4. **Members offline during a removal.** For 24 hours afterwards, the
@@ -342,8 +388,11 @@ carries neither `G` nor any member key.
 - The admin records the invite in the roster as an `invite` operation (the
   invite public key and expiry).
 - While the invite is valid, the admin listens under the invite key blinded
-  per period (*Identity*). The invitee computes that key from the invite's
-  public half and calls it with a fresh key of its own. Only the admin holds
+  per period, as in *Identity* but with the factor derived from
+  `HKDF(I, "invite blind" ‖ p)` instead of from `G`. The invitee computes
+  that key from the invite's public half and `I`, and calls it with a fresh
+  key of its own. Without `I`, the blinded key can't be linked to the invite
+  key. Only the admin holds
   the invite's private key, so only the admin can listen there, and one
   listener means no clash at holders.
 - That **join session** carries the invitee's new member key, display name,
@@ -399,10 +448,17 @@ so an app chooses where data lives and how much.
    that was called.
 2. **Ed25519 key blinding** for rendezvous keys (scalar multiplication on
    the curve, as in Tor's rend-spec-v3). A blinded key is a bare scalar, not
-   an `ed25519.PrivateKey`, so `endpoint.Listen`, `driver.Node.Listen` and
-   `dht.Node.ListenKey` move to a signer interface that can sign with one.
+   an `ed25519.PrivateKey`, so every API that takes or keeps a signing key
+   moves to a signer interface that can sign with one: listening
+   (`endpoint.Listen`, `driver.Node.Listen`, `dht.Node.Listen`/`ListenKey`),
+   calling (`endpoint.Connect`, `driver.Node.Signal`, `dht.Node.Signal`),
+   and the identity a `Conn` keeps to sign migration and resume offers.
 3. **Mutable-item puts** from the endpoint, for the directory (the DHT
-   supports them; the endpoint doesn't expose puts yet).
+   supports them; the endpoint doesn't expose puts yet), and **reads that
+   return every distinct value** the replicas hold, including different
+   values at the same sequence number. Today a get keeps one value per
+   sequence number and `driver.Node.GetMutable` returns only the newest, so
+   the directory merge (*Discovery*) would miss concurrent writes.
 4. Nothing in the data plane: sessions are hysteria2 over `Conn`.
 
 ## Phasing
