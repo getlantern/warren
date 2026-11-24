@@ -129,12 +129,20 @@ func actions(w world, rules Rules) []action {
 				}
 			}
 		}
-		if f.Roles[r] == Admin {
-			// A compromised admin signing what it has no authority for.
-			as = append(as, rogue(r, Remove, O, None), rogue(r, Add, N, Admin))
+		// A compromised device signing what its role has no authority for.
+		switch f.Roles[r] {
+		case Admin:
+			other := A
+			if r == A {
+				other = B
+			}
+			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin))
+		case Member, Mirror:
+			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None))
 		}
 		if f.Removed[r] != 0 {
 			op(r, Add, N, Member, true)
+			op(r, Rekey, 0, None, true)
 			op(r, Deliver, N, None, true)
 			op(r, Remove, M, None, true)
 		}
@@ -184,8 +192,8 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 		return fmt.Errorf("owner lost its role: %v", f.Roles[O])
 	}
 	for _, o := range f.Order {
-		if o.Kind == Add && o.Role == Admin && f.Counts[o.ID] && o.Author != O {
-			return fmt.Errorf("%v made %v an admin", o.Author, o.Target)
+		if o.Rogue && f.Counts[o.ID] {
+			return fmt.Errorf("rogue %v %v by %v counts", o.Kind, o.Target, o.Author)
 		}
 	}
 	for _, o := range f.Order {
@@ -302,6 +310,9 @@ func docPredicate(u Store, f *Result) bool {
 // explore runs every interleaving of actions to the given depth, checking
 // the union at each state, and returns the first violation with its trace.
 func explore(t *testing.T, rules Rules, pred func(Store, *Result) bool, depth int) (states int, failure string) {
+	if depth < 0 {
+		t.Fatalf("-roster.depth must be at least 0, not %d", depth)
+	}
 	start := setup(t, rules)
 	// seen records the most depth left any visit had, so a state first
 	// reached deep is explored again when a shorter path reaches it.
@@ -347,9 +358,6 @@ func explore(t *testing.T, rules Rules, pred func(Store, *Result) bool, depth in
 // key-maker that hadn't seen a removal, which then also sealed them to the
 // removed member, so the written condition fires.
 func TestRosterModel(t *testing.T) {
-	if *depth < 0 {
-		t.Fatalf("-roster.depth must be at least 0, not %d", *depth)
-	}
 	maxPasses = 0
 	states, failure := explore(t, Rules{}, docPredicate, *depth)
 	t.Logf("%d states explored to depth %d; folds took at most %d passes", states, *depth, maxPasses)
@@ -366,7 +374,10 @@ func TestRosterModel(t *testing.T) {
 // TestMutations breaks each rule in turn and checks the explorer catches it,
 // so a passing TestRosterModel means the properties have teeth.
 func TestMutations(t *testing.T) {
-	for _, m := range []string{"no view rule", "admins add admins", "owner removable", "deliver off the roster"} {
+	for _, m := range []string{
+		"no view rule", "admins add admins", "admins remove admins", "owner removable",
+		"members add", "members rekey", "deliver off the roster",
+	} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m
 			defer func() { mutation = "" }()

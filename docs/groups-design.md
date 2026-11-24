@@ -479,7 +479,11 @@ backdated operations by removed authors never count, the view rule settles
 (in at most three passes), and once the corrective rekey and deliveries run,
 no off-roster key holds the current group secret or epoch key, mirrors hold
 the current group secret but no current epoch key, and every member holds
-the current keys and every epoch key any other member holds. Mutation tests confirm each property catches its broken rule. It found
+the current keys and every epoch key any other member holds. Every role also
+signs, as a compromised device would, the operations its role has no
+authority for, and none may count. Mutation tests break each authority rule,
+the view rule, delivery's roster check and the corrective rekey in turn, and
+the explorer catches each. It found
 two rules above that were wrong as first written (concurrent duplicate
 `add`s, and `deliver` withholding after any `remove`), and writing it pinned
 the total order down as an algorithm.

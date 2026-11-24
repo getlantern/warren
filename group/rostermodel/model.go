@@ -268,7 +268,8 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 				ok = true
 			}
 		case Add:
-			can := author == Owner || (author == Admin && (o.Role != Admin || mutation == "admins add admins"))
+			can := author == Owner || (author == Admin && (o.Role != Admin || mutation == "admins add admins")) ||
+				(author != None && mutation == "members add")
 			if !can || o.Role == None || o.Role == Owner {
 				break
 			}
@@ -289,14 +290,14 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			}
 		case Remove:
 			t := r.Roles[o.Target]
-			can := author == Owner || (author == Admin && (t != Admin || mutation == "owner removable"))
+			can := author == Owner || (author == Admin && (t != Admin || mutation == "admins remove admins"))
 			if can && t != None && (t != Owner || mutation == "owner removable") {
 				delete(r.Roles, o.Target)
 				r.Removed[o.Target], r.Current = o.ID, o.ID
 				ok = true
 			}
 		case Rekey:
-			if author == Owner || author == Admin {
+			if author == Owner || author == Admin || (author != None && mutation == "members rekey") {
 				r.Current = o.ID
 				ok = true
 			}
