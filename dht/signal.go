@@ -23,6 +23,7 @@ package dht
 // misbehaving holder can drop them but not read or forge them.
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -898,8 +899,17 @@ func usableRecord(l *lookup) ([]*cand, *ecdh.PublicKey, bool) {
 	if len(holders) == 0 || err != nil {
 		return nil, nil, false
 	}
+	// NewPublicKey accepts a low-order point that ECDH then rejects; check
+	// now, before this record is chosen over the other epoch's.
+	if _, err := ecdhProbe.ECDH(xPub); err != nil {
+		return nil, nil, false
+	}
 	return holders, xPub, true
 }
+
+// ecdhProbe is a fixed key for checking a record's key is usable. The
+// secret it derives is discarded.
+var ecdhProbe, _ = ecdh.X25519().NewPrivateKey(bytes.Repeat([]byte{0x42}, 32))
 
 // recordFound takes a finished record lookup. The current epoch's record is
 // preferred: a previous epoch's can be a restarted provider's old one, with

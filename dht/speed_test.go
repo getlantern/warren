@@ -547,3 +547,24 @@ func TestStaleGenerationRecordNotOffered(t *testing.T) {
 		t.Fatal("an offer went out on a record lookup from before the rebind")
 	}
 }
+
+// A current record whose key is a low-order point (accepted by
+// NewPublicKey, rejected by ECDH) isn't usable, so the previous epoch's
+// usable record is offered instead of the signal failing.
+func TestLowOrderRecordKeyNotUsable(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	x, _ := ecdh.X25519().NewPrivateKey(make([]byte, 32))
+	n := New(Config{ID: outsiderID(rng(122)), Rand: rng(123)})
+	bad := &lookup{gen: n.gen, best: &MutableItem{V: encodeRecord([32]byte{})}, holders: []*cand{{addr: addr(1), token: []byte("tok")}}}
+	good := &lookup{gen: n.gen, best: &MutableItem{V: encodeRecord([32]byte(x.PublicKey().Bytes()))}, holders: []*cand{{addr: addr(2), token: []byte("tok")}}}
+	s := &signalOp{op: 13, priv: priv, payload: []byte("hi"), searching: 2, lookups: []*lookup{bad, good}, cur: bad, triedPrev: true}
+	n.signals = append(n.signals, s)
+	n.recordFound(t0, s, bad)
+	if s.offer != nil || !slices.Contains(n.signals, s) {
+		t.Fatal("a low-order record key was taken, or ended the signal")
+	}
+	n.recordFound(t0, s, good)
+	if s.offer == nil || s.holders[0].addr != addr(2) {
+		t.Fatal("the previous epoch's usable record wasn't offered")
+	}
+}
