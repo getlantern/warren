@@ -12,9 +12,9 @@ Murmur channels but not wire-compatible with them. It is a library (package
 ## Goals
 
 - **Outsiders learn nothing.** Without the group secret, nobody can tell a
-  group exists, who is in it, what it shares, or link a member's activity
-  across groups or across time. The DHT sees only rotating, keyed, opaque
-  targets and encrypted values.
+  group exists, who is in it, or what it shares, or link a member's
+  identifiers across groups or across time. The DHT sees only rotating,
+  keyed, opaque targets and encrypted values.
 - **Only members connect.** A device that isn't on the roster can't open a
   session to a member, so it can't read even metadata.
 - **Removal is real.** A removed member can't read content added after its
@@ -29,7 +29,8 @@ Murmur channels but not wire-compatible with them. It is a library (package
 Non-goals for v1: groups of thousands (see *Scale*), anonymity against a
 member (members see each other's addresses when they connect),
 deniability, and hiding from a DHT node that the same IP address is behind
-two groups (see *Identity*).
+two groups, or behind one rendezvous key after another across periods (see
+*Identity*): rotating identifiers don't hide a stable address.
 
 ## What Rust warren did, and what changes
 
@@ -136,8 +137,8 @@ The roster is a set of operations signed by member keys, kept by members
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
-- `deliver` (the current `G` and epoch key sealed to one member already
-  added) by any member: it grants no rights, and only fills in keys a member
+- `deliver` (the current `G`, and for a member but not a mirror the current
+  epoch key, sealed to one member already added) by any member: it grants no rights, and only fills in keys a member
   missed (*Removal*). The recipient checks the keys against the commitment
   of the operation that made them (*Keys*), so a bad `deliver` is ignored.
 
@@ -159,8 +160,12 @@ operations the author had seen). Folding is deterministic:
   therefore resolve the same way on every member, and the losing rekey's
   epoch key stays readable (*Keys*);
 - **remove wins** over a concurrent `add` of the same key;
-- concurrent removals between admins all apply, unless that would leave no
-  admin: then the removal by the **more senior** admin (whose `add` comes
+- **concurrent removals between admins** (neither in the other's causal
+  history, say A removing B while B removes A) are decided together, not
+  one after the other: each counts if its author was an admin in the state
+  of its causal parents, and the view rule below doesn't drop one for not
+  naming the other. They all apply, unless that would leave no admin: then
+  only the removals by the **most senior** author stand (whose `add` comes
   earlier in the total order) stands. Seniority is fixed by history: a hash
   decides it only between admins added concurrently, and an admin can't
   grind its own position after the fact;
@@ -356,10 +361,11 @@ Removing a member:
    closed. A member added concurrently with a
    removal (one the removing admin didn't know of) gets `G'` and the new
    epoch key from any member that notices, in a `deliver` operation.
-4. **Members offline during a removal.** For 24 hours afterwards, the
-   remaining members also listen under their rendezvous keys from the old
-   `G`. A member that missed the removal reaches them there, and gets it by
-   roster gossip. A member offline longer is out until an admin re-invites
+4. **Members offline during a key change.** For 24 hours after any
+   operation that replaces `G` (a `remove` or a `rekey`, including a
+   corrective one), the remaining members also listen under their
+   rendezvous keys from each `G` superseded in that window. A member that
+   missed the change reaches them there, and gets it by roster gossip. A member offline longer is out until an admin re-invites
    it (*Invites*): it holds only secrets the removed member also holds, so
    nothing else can tell them apart.
 
@@ -398,8 +404,10 @@ carries neither `G` nor any member key.
 - That **join session** carries the invitee's new member key, display name,
   and a proof that it knows `I` (a MAC over the session's secret), and
   nothing else. The admin approves with an `add`, which delivers `G` and the
-  epoch keys sealed to the new member, and the invitee leaves the join
-  session for normal ones.
+  epoch keys sealed to the new member. The join answer also carries the
+  genesis and the roster's operations (small for v1 groups), so the invitee
+  can check its own `add` and compute the members' rendezvous keys. The
+  invitee then leaves the join session for normal ones.
 - Single-use invites are spent at the first `add` against them; all are
   refused after expiry or after a removal (*Removal*). An admin re-invites a
   member that was offline through a removal the same way.
