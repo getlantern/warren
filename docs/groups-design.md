@@ -380,9 +380,10 @@ Removing a member:
    **publishes nothing**: the app's posts and blobs wait in a queue. Anything
    published before a member learned of the concurrent removal was readable
    by the removed member; that window is as short as gossip and can't be
-   closed. A member added concurrently with a
-   removal (one the removing admin didn't know of) gets `G'` and any epoch
-   keys it lacks from any member that notices, in a `deliver` operation.
+   closed. A member added concurrently with any key-making operation (a `remove`
+   or a `rekey` whose author didn't know of the `add`) gets the new `G` and
+   any epoch keys it lacks from any member that notices, in a `deliver`
+   operation.
 4. **Members offline during a key change.** For 24 hours after any
    operation that replaces `G` (a `remove` or a `rekey`, including a
    corrective one), the remaining members also listen under their
@@ -463,6 +464,10 @@ fold) before phase 1 builds the roster:
   operation, with no rekey, for a device that holds only secrets the group
   already gave it, is the likely fix.
 - **Owner compromise** is detectable only by people watching roster events.
+- **An owner offline past the grace window** can't come back the way other
+  members do, since its key can't be removed and re-invited. It needs a
+  path that keeps its authority: for example, a join-style session it opens
+  under its own key, through which an admin delivers the current keys.
 - **Concurrent removals of the same member** keep only the first remover's
   log cutoff, dropping entries only the second had seen.
 
