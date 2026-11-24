@@ -910,8 +910,14 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 	if s.offer != nil || !slices.Contains(n.signals, s) {
 		return // an offer is already out, or the signal ended
 	}
+	// A lookup from before a rebind holds write tokens bound to the old
+	// address, which holders reject: it can't supply an offer.
+	usable := func(l *lookup) bool {
+		_, _, ok := usableRecord(l)
+		return ok && l.gen == n.gen
+	}
 	if l != s.cur {
-		if _, _, ok := usableRecord(l); ok {
+		if usable(l) {
 			s.prev = l
 		}
 		if !s.curDone {
@@ -919,13 +925,13 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 		}
 	} else {
 		s.curDone = true
-		if _, _, ok := usableRecord(l); ok {
+		if usable(l) {
 			n.startOffer(now, s, l)
 			return
 		}
 	}
 	switch {
-	case s.prev != nil:
+	case s.prev != nil && s.prev.gen == n.gen:
 		n.startOffer(now, s, s.prev)
 	case s.searching > 0:
 		// the previous epoch's lookup is still running

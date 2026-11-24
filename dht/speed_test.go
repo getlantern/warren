@@ -528,3 +528,22 @@ func TestOfferWakesByAnswerDeadline(t *testing.T) {
 		t.Fatalf("the unacked offer wakes at %v, want its answer deadline %v", w.Sub(t0), signalAttemptTimeout)
 	}
 }
+
+// A record lookup that finished before a rebind holds write tokens bound to
+// the old address, so it can't supply an offer.
+func TestStaleGenerationRecordNotOffered(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	x, _ := ecdh.X25519().NewPrivateKey(make([]byte, 32))
+	n := New(Config{ID: outsiderID(rng(120)), Rand: rng(121)})
+	prev := &lookup{gen: n.gen, best: &MutableItem{V: encodeRecord([32]byte(x.PublicKey().Bytes()))},
+		holders: []*cand{{addr: addr(2), token: []byte("tok")}}}
+	cur := &lookup{gen: n.gen}
+	s := &signalOp{op: 12, priv: priv, payload: []byte("hi"), searching: 2, lookups: []*lookup{cur, prev}, cur: cur, triedPrev: true}
+	n.signals = append(n.signals, s)
+	n.recordFound(t0, s, prev) // usable, kept while the current lookup runs
+	n.Rebound(t0.Add(time.Second))
+	n.recordFound(t0.Add(2*time.Second), s, cur) // the current lookup misses
+	if s.offer != nil {
+		t.Fatal("an offer went out on a record lookup from before the rebind")
+	}
+}
