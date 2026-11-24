@@ -3,6 +3,7 @@ package dht
 import (
 	"crypto/ed25519"
 	"crypto/sha1"
+	"encoding/binary"
 	"net/netip"
 	"testing"
 	"time"
@@ -577,8 +578,10 @@ func TestGetTimingOnEarlyHit(t *testing.T) {
 			tids[s.To] = m.T
 		}
 	}
-	if tids[addr(1)] == nil || tids[addr(2)] == nil {
-		t.Fatal("both contacts weren't queried")
+	for _, a := range []netip.AddrPort{addr(1), addr(2)} {
+		if tids[a] == nil {
+			t.Fatalf("no query to %v", a)
+		}
 	}
 	n.HandlePacket(t0.Add(120*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0], V: v}}))
 	gets := func() []GetDone {
@@ -648,11 +651,12 @@ func TestRebindCountsAbandonedQueriesOnce(t *testing.T) {
 		return out
 	}
 	n.Rebound(t0.Add(50 * time.Millisecond))
-	// Rebound starts its own lookup on the new socket; none of ours may
-	// survive, or a late reply or timeout could still settle them.
-	for tid, tx := range n.txns {
-		if tx.lookup != nil && tx.lookup.op == op {
-			t.Fatalf("transaction %d of the abandoned lookup survives the rebind", tid)
+	// None of the queries sent from the old socket may survive, or a late
+	// reply or timeout could still settle them. (A lookup with candidates
+	// left would carry on from the new socket with new transactions.)
+	for to, t0id := range tids {
+		if tx := n.txns[binary.BigEndian.Uint16(t0id)]; tx != nil && tx.to == to {
+			t.Fatalf("the query to %v, sent before the rebind, survives it", to)
 		}
 	}
 	got := dones()
