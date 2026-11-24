@@ -514,3 +514,17 @@ func TestBusyLimitRestartsAfterASend(t *testing.T) {
 		t.Fatal("a sent offer didn't clear the old busy time")
 	}
 }
+
+// With ShortTimeout past the answer window, an unacked offer still wakes
+// the node at its answer deadline, not at the later ack or lapse time.
+func TestOfferWakesByAnswerDeadline(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(118)), Rand: rng(119), ShortTimeout: 6 * time.Second})
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	m, _ := NewMutable(priv, make([]byte, 32), 1, ImmutableValue([]byte("offer")))
+	s := &signalOp{op: 11, offer: &m, holders: []*cand{{addr: addr(1), token: []byte("tok")}}}
+	n.signals = append(n.signals, s)
+	n.fillOffers(t0, s)
+	if w := s.wakeup(); !w.Equal(t0.Add(signalAttemptTimeout)) {
+		t.Fatalf("the unacked offer wakes at %v, want its answer deadline %v", w.Sub(t0), signalAttemptTimeout)
+	}
+}

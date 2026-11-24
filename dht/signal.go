@@ -1052,11 +1052,14 @@ func (s *signalOp) wakeup() time.Time {
 	}
 	for _, t := range s.tries {
 		d := t.deadline
+		// Each try wakes at its next deadline, never past its answer window
+		// (a ShortTimeout above signalAttemptTimeout would otherwise put
+		// the ack or lapse time after it).
 		switch {
 		case t.acked:
-		case !t.late:
+		case !t.late && t.ackBy.Before(d):
 			d = t.ackBy
-		case t.lapseBy.Before(d):
+		case t.late && t.lapseBy.Before(d):
 			d = t.lapseBy
 		}
 		if w.IsZero() || d.Before(w) {
