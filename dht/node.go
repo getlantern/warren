@@ -31,6 +31,14 @@ type LookupDone struct {
 	Closest  []krpc.NodeInfo
 	Queried  int
 	Failures int
+	Timing   Timing
+}
+
+// Timing is how a lookup spent its time, measured from its start.
+type Timing struct {
+	First   time.Duration // the first response; zero if none came
+	Settled time.Duration // the last time the K closest responders changed
+	Total   time.Duration // until the lookup finished
 }
 
 type GetDone struct {
@@ -38,8 +46,10 @@ type GetDone struct {
 	Target krpc.NodeID
 	Value  []byte // nil if not found
 	// Item is the highest-sequence verified item, for mutable gets.
-	Item    *MutableItem
-	Queried int
+	Item     *MutableItem
+	Queried  int
+	Failures int
+	Timing   Timing
 }
 
 type PutDone struct {
@@ -403,7 +413,7 @@ func (n *Node) startLookup(now time.Time, t *table, kind lookupKind, target krpc
 	l := &lookup{
 		gen: n.gen,
 		op:  n.nextOp, kind: kind, internal: internal, target: target, t: t,
-		deadline: now.Add(n.cfg.LookupTimeout),
+		deadline: now.Add(n.cfg.LookupTimeout), started: now,
 		domestic: kind == putItem && n.cfg.DomesticCopies && n.cfg.Domestic != nil,
 		ips:      map[netip.AddrPort]bool{}, pfx: map[ipPrefix]int{}, rec: rec,
 	}
@@ -468,9 +478,9 @@ func (n *Node) finish(now time.Time, l *lookup) {
 	l.finished = true
 	switch l.kind {
 	case findNode:
-		n.complete(now, l, LookupDone{Op: l.op, Target: l.target, Closest: l.closestResponded(n.cfg.K), Queried: l.queried, Failures: l.failures})
+		n.complete(now, l, LookupDone{Op: l.op, Target: l.target, Closest: l.closestResponded(n.cfg.K), Queried: l.queried, Failures: l.failures, Timing: l.timing(now)})
 	case getItem:
-		g := GetDone{Op: l.op, Target: l.target, Value: l.value, Queried: l.queried}
+		g := GetDone{Op: l.op, Target: l.target, Value: l.value, Queried: l.queried, Failures: l.failures, Timing: l.timing(now)}
 		if l.best != nil {
 			g.Value, g.Item = l.best.V, l.best
 		}
@@ -609,6 +619,7 @@ func (n *Node) lookupReply(now time.Time, l *lookup, from netip.AddrPort, m *krp
 	}
 	c.state = responded
 	c.token = m.R.Token
+	l.responded(now, c, n.cfg.K)
 	for _, ni := range m.R.Nodes {
 		l.add(n, ni.ID, true, ni.Addr)
 	}
@@ -852,6 +863,7 @@ func (n *Node) abandon(now time.Time, t *txn) {
 		l := t.lookup
 		if c := l.byAddr(t.to); c != nil && c.state == inflight {
 			c.state = failed
+			l.failures++ // not the peer's fault, but the lookup got no answer
 		}
 		n.step(now, l)
 	case txPut:

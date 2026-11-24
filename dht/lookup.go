@@ -50,6 +50,8 @@ type lookup struct {
 	t        *table
 	deadline time.Time
 	domestic bool
+	// started, first and settled time the lookup (see Timing).
+	started, first, settled time.Time
 
 	cands []*cand
 	ips   map[netip.AddrPort]bool
@@ -179,6 +181,36 @@ func (l *lookup) byAddr(addr netip.AddrPort) *cand {
 		}
 	}
 	return nil
+}
+
+// responded notes c answered: the lookup's first response, and whether c
+// joins the k closest responders, which moves when the result settled.
+func (l *lookup) responded(now time.Time, c *cand, k int) {
+	if l.first.IsZero() {
+		l.first = now
+	}
+	closer := 0
+	for _, o := range l.cands { // sorted by distance
+		if o == c {
+			break
+		}
+		if o.state == responded {
+			closer++
+		}
+	}
+	if closer < k {
+		l.settled = now
+	}
+}
+
+func (l *lookup) timing(now time.Time) Timing {
+	since := func(t time.Time) time.Duration {
+		if t.IsZero() {
+			return 0
+		}
+		return t.Sub(l.started)
+	}
+	return Timing{First: since(l.first), Settled: since(l.settled), Total: now.Sub(l.started)}
 }
 
 // replicas returns the responded nodes a put should go to: the K closest,

@@ -2,7 +2,9 @@ package dht
 
 import (
 	"crypto/ed25519"
+	"crypto/sha1"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -448,5 +450,237 @@ func TestReboundDropsStaleTokensAndPublications(t *testing.T) {
 	n.recordStored(t0.Add(2*time.Second), oldPub)
 	if len(n.lst.holders) != 0 {
 		t.Fatal("a publication from before the rebind installed its holders")
+	}
+}
+
+// A finished lookup reports when its first response came, when its K
+// closest responders last changed, and its total time.
+func TestLookupTiming(t *testing.T) {
+	r := rng(80)
+	n := New(Config{ID: outsiderID(r), Rand: rng(81)})
+	ids := make([]krpc.NodeID, 3)
+	for i := range ids {
+		ids[i] = outsiderID(r)
+		n.primary.heard(ids[i], addr(i+1), t0)
+	}
+	op, err := n.FindNode(t0, outsiderID(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sends, _ := n.Drain()
+	tids := map[netip.AddrPort][]byte{}
+	for _, s := range sends {
+		var m krpc.Msg
+		if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+			tids[s.To] = m.T
+		}
+	}
+	var done *LookupDone
+	for i, after := range []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 400 * time.Millisecond} {
+		from := addr(i + 1)
+		if tids[from] == nil {
+			t.Fatalf("no query to %v", from)
+		}
+		resp := krpc.AppendMarshal(nil, &krpc.Msg{T: tids[from], Y: krpc.Response, R: krpc.Return{ID: ids[i]}})
+		n.HandlePacket(t0.Add(after), from, resp)
+		_, events := n.Drain()
+		for _, e := range events {
+			if d, ok := e.(LookupDone); ok && d.Op == op {
+				done = &d
+			}
+		}
+	}
+	if done == nil {
+		t.Fatal("the lookup never finished")
+	}
+	want := Timing{First: 100 * time.Millisecond, Settled: 400 * time.Millisecond, Total: 400 * time.Millisecond}
+	if done.Timing != want || done.Failures != 0 {
+		t.Fatalf("timing %+v failures %d, want %+v and none", done.Timing, done.Failures, want)
+	}
+}
+
+// A reply from beyond the K closest responders leaves Settled alone; only a
+// change to the K closest moves it.
+func TestSettledIgnoresDistantReplies(t *testing.T) {
+	r := rng(82)
+	n := New(Config{ID: outsiderID(r), Rand: rng(83), K: 2})
+	target := outsiderID(r)
+	near := func(byteIdx int) krpc.NodeID { // differs from target first at byteIdx
+		id := target
+		id[byteIdx] ^= 0x80
+		return id
+	}
+	nearest, middle, far := near(19), near(10), near(0)
+	n.primary.heard(middle, addr(1), t0)
+	n.primary.heard(far, addr(2), t0)
+	op, err := n.FindNode(t0, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var done *LookupDone
+	tids := map[netip.AddrPort][]byte{}
+	drain := func() {
+		sends, events := n.Drain()
+		for _, s := range sends {
+			var m krpc.Msg
+			if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+				tids[s.To] = m.T
+			}
+		}
+		for _, e := range events {
+			if d, ok := e.(LookupDone); ok && d.Op == op {
+				done = &d
+			}
+		}
+	}
+	reply := func(after time.Duration, from netip.AddrPort, id krpc.NodeID, nodes ...krpc.NodeInfo) {
+		t.Helper()
+		if tids[from] == nil {
+			t.Fatalf("no query to %v", from)
+		}
+		n.HandlePacket(t0.Add(after), from, krpc.AppendMarshal(nil, &krpc.Msg{T: tids[from], Y: krpc.Response, R: krpc.Return{ID: id, Nodes: nodes}}))
+		drain()
+	}
+	drain()
+	// The middle node answers and refers a nearer one; the nearer one
+	// answers; the far node, by then outside the K=2 closest responders,
+	// answers last.
+	reply(100*time.Millisecond, addr(1), middle, krpc.NodeInfo{ID: nearest, Addr: addr(3)})
+	reply(150*time.Millisecond, addr(3), nearest)
+	reply(200*time.Millisecond, addr(2), far)
+	if done == nil {
+		t.Fatal("the lookup never finished")
+	}
+	if done.Timing.Settled != 150*time.Millisecond || done.Timing.Total != 200*time.Millisecond {
+		t.Fatalf("settled %v total %v, want 150ms and 200ms: a reply outside K moved Settled", done.Timing.Settled, done.Timing.Total)
+	}
+}
+
+// An immutable get that finds its value stops there, reporting the time to
+// the value as its total.
+func TestGetTimingOnEarlyHit(t *testing.T) {
+	r := rng(84)
+	n := New(Config{ID: outsiderID(r), Rand: rng(85)})
+	ids := []krpc.NodeID{outsiderID(r), outsiderID(r)}
+	for i, id := range ids {
+		n.primary.heard(id, addr(i+1), t0)
+	}
+	v := []byte("5:hello")
+	op, err := n.Get(t0, krpc.NodeID(sha1.Sum(v)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sends, _ := n.Drain()
+	tids := map[netip.AddrPort][]byte{}
+	for _, s := range sends {
+		var m krpc.Msg
+		if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+			tids[s.To] = m.T
+		}
+	}
+	for _, a := range []netip.AddrPort{addr(1), addr(2)} {
+		if tids[a] == nil {
+			t.Fatalf("no query to %v", a)
+		}
+	}
+	n.HandlePacket(t0.Add(120*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0], V: v}}))
+	gets := func() []GetDone {
+		_, events := n.Drain()
+		var out []GetDone
+		for _, e := range events {
+			if d, ok := e.(GetDone); ok && d.Op == op {
+				out = append(out, d)
+			}
+		}
+		return out
+	}
+	got := gets()
+	if len(got) != 1 {
+		t.Fatalf("%d completions, want 1", len(got))
+	}
+	if string(got[0].Value) != string(v) {
+		t.Fatalf("value %q, want %q", got[0].Value, v)
+	}
+	done := got[0]
+	// The other contact's query times out later; the finished get stays
+	// finished.
+	n.Tick(t0.Add(10 * time.Second))
+	if extra := gets(); len(extra) != 0 {
+		t.Fatalf("a finished get completed again: %+v", extra)
+	}
+	want := Timing{First: 120 * time.Millisecond, Settled: 120 * time.Millisecond, Total: 120 * time.Millisecond}
+	if done.Timing != want || done.Failures != 0 {
+		t.Fatalf("timing %+v failures %d, want %+v and none", done.Timing, done.Failures, want)
+	}
+}
+
+// A rebind counts each query it abandons as one failure, and a stale reply
+// that arrives afterwards changes nothing.
+func TestRebindCountsAbandonedQueriesOnce(t *testing.T) {
+	r := rng(86)
+	n := New(Config{ID: outsiderID(r), Rand: rng(87)})
+	ids := []krpc.NodeID{outsiderID(r), outsiderID(r)}
+	for i, id := range ids {
+		n.primary.heard(id, addr(i+1), t0)
+	}
+	op, err := n.FindNode(t0, outsiderID(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sends, _ := n.Drain()
+	tids := map[netip.AddrPort][]byte{}
+	for _, s := range sends {
+		var m krpc.Msg
+		if krpc.Unmarshal(s.Data, &m) == nil && m.Y == krpc.Query {
+			tids[s.To] = m.T
+		}
+	}
+	for i := range ids {
+		if tids[addr(i+1)] == nil {
+			t.Fatalf("no query to %v", addr(i+1))
+		}
+	}
+	dones := func() []LookupDone {
+		_, events := n.Drain()
+		var out []LookupDone
+		for _, e := range events {
+			if d, ok := e.(LookupDone); ok && d.Op == op {
+				out = append(out, d)
+			}
+		}
+		return out
+	}
+	var before []*txn // the lookup's queries from the old socket
+	for _, tx := range n.txns {
+		if tx.lookup != nil && tx.lookup.op == op {
+			before = append(before, tx)
+		}
+	}
+	n.Rebound(t0.Add(50 * time.Millisecond))
+	// None of the queries sent from the old socket may survive, or a late
+	// reply or timeout could still settle them; and the lookup, finished
+	// with every candidate abandoned, owns none at all. (Rebound's own
+	// refresh lookup may query the same contacts.)
+	for _, tx := range n.txns {
+		if slices.Contains(before, tx) {
+			t.Fatalf("the query to %v, sent before the rebind, survives it", tx.to)
+		}
+		if tx.lookup != nil && tx.lookup.op == op {
+			t.Fatalf("the finished lookup still owns a query to %v", tx.to)
+		}
+	}
+	got := dones()
+	if len(got) != 1 {
+		t.Fatalf("%d completions after the rebind, want one", len(got))
+	}
+	if d := got[0]; d.Failures != len(ids) || d.Timing.First != 0 || d.Timing.Total != 50*time.Millisecond {
+		t.Fatalf("failures %d first %v total %v, want %d abandoned, no response, 50ms", d.Failures, d.Timing.First, d.Timing.Total, len(ids))
+	}
+	// A reply to an abandoned query finds no transaction, and no timeout
+	// fires for one later: nothing more is reported.
+	n.HandlePacket(t0.Add(80*time.Millisecond), addr(1), krpc.AppendMarshal(nil, &krpc.Msg{T: tids[addr(1)], Y: krpc.Response, R: krpc.Return{ID: ids[0]}}))
+	n.Tick(t0.Add(10 * time.Second))
+	if extra := dones(); len(extra) != 0 {
+		t.Fatalf("an abandoned lookup completed again: %+v", extra)
 	}
 }
