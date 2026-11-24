@@ -83,15 +83,24 @@ const (
 	OfferWindow = 2 * offerMaxSkew * time.Second
 
 	signalAttemptTimeout = 4 * time.Second // answers wait on the provider gathering a fresh socket; dead holders are caught by the ack
-	offerMaxSkew         = 60              // seconds between signer and verifier clocks
-	sessionLifetime      = time.Minute
-	forwardTTL           = 2 * time.Minute
-	pendingAnswerTTL     = 30 * time.Second
-	maxBindings          = 512
-	maxPendingAnswers    = 256
-	maxSessions          = 64
-	maxHolders           = 4
-	holderMaxFailures    = 2
+	// parallelOffers is how many holders a caller offers to at once: the
+	// provider takes the first copy and answers through every holder that
+	// relays one, so a dead or slow holder costs nothing while another works.
+	parallelOffers = 2
+	// epochOverlap is how long after an epoch starts a caller also looks up
+	// the previous epoch's record at once, rather than only after missing
+	// the current one: the provider's new record may not have spread yet,
+	// or the two clocks may disagree about the epoch.
+	epochOverlap      = 10 * time.Minute
+	offerMaxSkew      = 60 // seconds between signer and verifier clocks
+	sessionLifetime   = time.Minute
+	forwardTTL        = 2 * time.Minute
+	pendingAnswerTTL  = 30 * time.Second
+	maxBindings       = 512
+	maxPendingAnswers = 256
+	maxSessions       = 64
+	maxHolders        = 4
+	holderMaxFailures = 2
 )
 
 // RecordSalt is the BEP 44 salt of provider's record in epoch.
@@ -779,17 +788,23 @@ type signalOp struct {
 	priv      ed25519.PrivateKey
 	provider  [32]byte
 	payload   []byte
-	epoch     int64
-	triedPrev bool
+	epoch     int64 // the current epoch's
+	triedPrev bool  // the previous epoch's record is being or was looked up
+	searching int   // record lookups still running
 	holders   []*cand
-	attempt   int
+	next      int // the next holder to offer to
+	tries     []*offerTry
 	offer     *MutableItem
 	answer    []byte // expected answer salt
 	answerKey []byte
-	deadline  time.Time // current attempt's answer
-	// ackBy is when the current holder must have acknowledged the offer.
-	// A dead holder is detected after one round trip, not the whole answer
-	// window.
+}
+
+// offerTry is one holder an offer is out with.
+type offerTry struct {
+	attempt  int       // the holder's index in holders
+	deadline time.Time // for the answer
+	// ackBy is when the holder must have acknowledged the offer: a dead
+	// holder is detected after about a round trip, not the answer window.
 	ackBy time.Time
 	acked bool
 }
@@ -807,36 +822,53 @@ func (n *Node) Signal(now time.Time, priv ed25519.PrivateKey, provider [32]byte,
 	n.nextOp++
 	s := &signalOp{op: n.nextOp, priv: priv, provider: provider, payload: payload, epoch: epochOf(now)}
 	n.signals = append(n.signals, s)
-	n.findRecord(now, s)
+	n.findRecord(now, s, s.epoch)
+	if s.searching > 0 && now.Sub(time.Unix(s.epoch*int64(RecordEpoch/time.Second), 0)) < epochOverlap {
+		// Near the epoch's start, look up the previous epoch's record at
+		// once too. If the node is at its lookup cap, the miss fallback in
+		// recordFound still covers it.
+		started := s.searching
+		n.findRecord(now, s, s.epoch-1)
+		s.triedPrev = s.searching > started
+	}
 	return s.op, nil
 }
 
-func (n *Node) findRecord(now time.Time, s *signalOp) {
-	salt := RecordSalt(s.provider, s.epoch)
+func (n *Node) findRecord(now time.Time, s *signalOp, epoch int64) {
+	salt := RecordSalt(s.provider, epoch)
 	key := s.provider
 	l := n.startLookup(now, n.primary, getItem, MutableTarget(s.provider, salt), record{}, nil, true)
 	if l == nil {
-		n.signalFailed(s, ErrBusy)
+		if s.searching == 0 {
+			n.signalFailed(s, ErrBusy)
+		}
 		return
 	}
+	s.searching++
 	l.key, l.salt = &key, salt
 	l.onDone = func(now time.Time, l *lookup) { n.recordFound(now, s, l) }
 	n.step(now, l)
 }
 
 func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
+	s.searching--
+	if s.offer != nil || !slices.Contains(n.signals, s) {
+		return // the other epoch's record was found first, or the signal ended
+	}
 	x, ok := [32]byte{}, false
 	if l.best != nil {
 		x, ok = decodeRecord(l.best.V)
 	}
 	if !ok {
-		if !s.triedPrev {
+		switch {
+		case s.searching > 0:
+			return // the other epoch's lookup may still find one
+		case !s.triedPrev:
 			s.triedPrev = true
-			s.epoch--
-			n.findRecord(now, s)
-			return
+			n.findRecord(now, s, s.epoch-1)
+		default:
+			n.signalFailed(s, ErrNoRecord)
 		}
-		n.signalFailed(s, ErrNoRecord)
 		return
 	}
 	for _, c := range l.holders {
@@ -873,26 +905,47 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 		return
 	}
 	s.offer, s.answer, s.answerKey = &m, answerSalt(salt), answerKey
-	n.sendOffer(now, s)
+	n.fillOffers(now, s)
 }
 
-func (n *Node) sendOffer(now time.Time, s *signalOp) {
-	if s.attempt >= len(s.holders) {
-		n.signalFailed(s, ErrNoAnswer)
-		return
+// fillOffers keeps the offer out with up to parallelOffers holders, and
+// fails the signal once every holder has been tried without an answer.
+func (n *Node) fillOffers(now time.Time, s *signalOp) {
+	for len(s.tries) < parallelOffers && s.next < len(s.holders) {
+		h := s.holders[s.next]
+		a := s.offer.args()
+		a.Token = h.token
+		n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: s.next})
+		s.tries = append(s.tries, &offerTry{attempt: s.next, deadline: now.Add(signalAttemptTimeout), ackBy: now.Add(n.shortTimeout())})
+		s.next++
 	}
-	h := s.holders[s.attempt]
-	a := s.offer.args()
-	a.Token = h.token
-	n.send(now, h.addr, "put", a, &txn{kind: txOffer, signal: s, attempt: s.attempt})
-	s.deadline = now.Add(signalAttemptTimeout)
-	s.ackBy, s.acked = now.Add(n.cfg.ShortTimeout), false
+	if len(s.tries) == 0 {
+		n.signalFailed(s, ErrNoAnswer)
+	}
 }
 
 func (n *Node) offerAcked(s *signalOp, attempt int, ok bool) {
-	if s.attempt == attempt && ok {
-		s.acked = true
+	for _, t := range s.tries {
+		if t.attempt == attempt && ok {
+			t.acked = true
+		}
 	}
+}
+
+// wakeup is when the signal's earliest outstanding offer must be acked or
+// answered, or zero if none is out.
+func (s *signalOp) wakeup() time.Time {
+	var w time.Time
+	for _, t := range s.tries {
+		d := t.deadline
+		if !t.acked && t.ackBy.Before(d) {
+			d = t.ackBy
+		}
+		if w.IsZero() || d.Before(w) {
+			w = d
+		}
+	}
+	return w
 }
 
 // acceptAnswer completes a pending Signal whose answer salt matches.
@@ -930,9 +983,15 @@ func (n *Node) removeSignal(s *signalOp) {
 
 func (n *Node) signalTimeouts(now time.Time) {
 	for _, s := range slices.Clone(n.signals) {
-		if s.offer != nil && (!now.Before(s.deadline) || (!s.acked && !now.Before(s.ackBy))) {
-			s.attempt++
-			n.sendOffer(now, s)
+		if s.offer == nil {
+			continue
+		}
+		before := len(s.tries)
+		s.tries = slices.DeleteFunc(s.tries, func(t *offerTry) bool {
+			return !now.Before(t.deadline) || (!t.acked && !now.Before(t.ackBy))
+		})
+		if len(s.tries) < before {
+			n.fillOffers(now, s)
 		}
 	}
 }

@@ -36,7 +36,8 @@ deliberately incompatible with BitTorrent.
   verified value).
 - **Blinded, rotating keys:** `H(key ‖ epoch)`. Providers publish the
   current epoch's record and keep the previous one until it ages out; callers
-  try the current epoch, then the previous. Pre-publishing the next epoch is
+  try the current epoch, then the previous (both at once in the first ten
+  minutes of an epoch, while the new record may still be spreading). Pre-publishing the next epoch is
   planned.
 
 ## Wire: Mainline as-is
@@ -188,7 +189,7 @@ sequenceDiagram
     end
     C->>H: get record, learns X25519 key, holders, tokens
     C->>H: put offer signed by caller,<br/>salt nonce and HMAC of record target
-    H-->>C: ack, a missing ack fails over after 1 s
+    H-->>C: ack, offered to two holders at once,<br/>a missing ack brings in the next
     rect rgba(200, 230, 255, 0.4)
         H->>P: put offer over the bound path
         P->>H: put answer signed by provider, salt derived from offer salt
@@ -222,15 +223,19 @@ sequenceDiagram
   accepted once.
 
 **Simulated latency, including the record lookup:**
-- phone to phone: 824 ms;
-- with the first holder dead: 1.19 s;
-- an hour into a shutdown, through domestic holders: 361 ms.
+- phone to phone: 683 ms (824 ms before the lookup and offer changes below);
+- with the first holder dead: 1.53 s (1.19 s before; the record lookup now
+  walks on past dead nodes rather than ending short, see *Performance against
+  libtorrent*, and single simulated runs vary by a few hundred ms);
+- an hour into a shutdown, through domestic holders: 334 ms.
 
 The loopback UDP test completes in about 11 ms.
 
 Two fixes came out of this work:
 - **Ack-based failover.** A caller fails over after a missing ack (one round trip)
-  rather than after the full 2.5-second answer window.
+  rather than after the full 2.5-second answer window. It offers to two holders
+  at once: the provider takes the first copy and answers through every holder
+  that relays one, so a dead or slow holder costs nothing while another works.
 - **Lookups no longer wait on slow queries.** Like libtorrent, queries past the
   short timeout no longer hold a lookup open. Previously one dead node near the
   target added a full query timeout to every lookup that passed it.
@@ -381,7 +386,8 @@ No probe traffic is involved. `Config.Profile` overrides it.
 - `MaxInbound` (default 8) bounds concurrent inbound punches and the sockets
   they hold.
 - The signaling answer window is now 4 seconds, because providers gather before
-  answering. Dead holders are still detected by the missing ack after 1 second.
+  answering. Dead holders are still detected by the missing ack, after about a
+  round trip (the adaptive short timeout, at most 1 second).
 
 Loopback tests cover connect plus data both ways (about 10 ms), three concurrent
 callers, an unknown key (`ErrNoRecord`), and authorization. They are race-clean
@@ -799,6 +805,33 @@ CPU, from benchmarks: decoding a response with 8 nodes takes 1.1 µs and 9
 allocations, encoding one 0.3 µs and 12; answering a `find_node` or
 `get_peers` takes about 12 µs and 35 allocations, three quarters of it
 sorting the whole routing table to find the closest contacts.
+
+**Tuning (built).** Lookups now allow 16 queries in flight (from 6), and a
+query counts as slow, so the lookup widens past it, at an adaptive short
+timeout: the node's smoothed round trip plus four deviations (RFC 6298
+style), between 250 ms and `ShortTimeout` (1 s), which is used until a few
+replies are timed. A slow query still holds the lookup open until 1 s, as
+before, since a slow node near the target may hold the value; past that it
+also leaves the lookup's frontier, so a dead node can't occupy a closest slot
+and end the lookup before it reaches the next candidate. That last rule came
+from the shutdown simulation: widening early with a short timeout filled the
+frontier with newly dead foreign nodes right after a border cut, and
+isolation-mode reads fell below 98 % until lapsed queries left it.
+
+Measured live, the old and new defaults side by side at the same moment
+(150 hits each, warren only):
+
+| | before | after |
+|---|---|---|
+| hit, p50 / p90 / p99 | 1,692 / 3,825 / 9,536 ms | 1,194 / 2,494 / 5,312 ms |
+| hits found | 149 of 150 | 150 of 150 |
+| queries a hit | 13.2 | 14.6 |
+
+Against libtorrent in one run (a slower network than the baseline's), the hit
+p90 went from 5.0 to 2.0 times libtorrent's and the p99 from 4.1 to 1.5 times;
+the median stays about twice libtorrent's, the routing-table work still to do.
+A miss costs more: about 48 queries, from 29, as it widens and walks past dead
+nodes.
 
 ## Phase 0: measure first (`natprobe/`, built)
 

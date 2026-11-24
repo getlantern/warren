@@ -28,14 +28,17 @@ const (
 )
 
 type cand struct {
-	id       krpc.NodeID
-	idKnown  bool
-	addr     netip.AddrPort
-	dist     krpc.NodeID
-	state    candState
-	slow     bool
-	domestic bool
-	token    []byte
+	id      krpc.NodeID
+	idKnown bool
+	addr    netip.AddrPort
+	dist    krpc.NodeID
+	state   candState
+	// slow: the query is past the adaptive short timeout and no longer
+	// counts toward alpha, so the lookup widens. lapsed: it is past
+	// Config.ShortTimeout too and no longer holds the lookup open.
+	slow, lapsed bool
+	domestic     bool
+	token        []byte
 }
 
 // lookup is an iterative Kademlia traversal. It tracks two frontiers: the K
@@ -143,7 +146,7 @@ func (l *lookup) identify(c *cand, id krpc.NodeID) {
 func (l *lookup) next(k int) *cand {
 	overall, dom := 0, 0
 	for _, c := range l.cands {
-		if c.state == failed {
+		if c.state == failed || (c.state == inflight && c.lapsed) {
 			continue
 		}
 		inOverall := overall < k
@@ -162,12 +165,17 @@ func (l *lookup) next(k int) *cand {
 	return nil
 }
 
-func (l *lookup) inflight() (active, total int) {
+// inflight counts the lookup's queries in flight: active ones (not yet
+// slow), open ones (not yet lapsed, still holding the lookup open), and all.
+func (l *lookup) inflight() (active, open, total int) {
 	for _, c := range l.cands {
 		if c.state == inflight {
 			total++
 			if !c.slow {
 				active++
+			}
+			if !c.lapsed {
+				open++
 			}
 		}
 	}

@@ -98,7 +98,8 @@ type txn struct {
 	kind     txnKind
 	lookup   *lookup
 	sent     time.Time
-	slow     bool
+	slow     bool // past the adaptive short timeout
+	lapsed   bool // past Config.ShortTimeout
 	tracked  bool // sent to a routing-table contact; counts toward health
 	domestic bool
 	token    []byte  // put: the token used, recorded on ack
@@ -153,6 +154,7 @@ type Node struct {
 	rotated     time.Time
 	nextMaint   time.Time
 	health      health
+	rtt         rttEstimator // answered queries' round trips, for the short timeout
 	iso         isolation
 	reflections []Reflection
 
@@ -246,20 +248,17 @@ func (n *Node) Knows(addr netip.AddrPort) bool {
 func (n *Node) NextWakeup() time.Time {
 	w := n.nextMaint
 	for _, s := range n.signals {
-		if s.offer == nil {
-			continue
-		}
-		d := s.deadline
-		if !s.acked && s.ackBy.Before(d) {
-			d = s.ackBy
-		}
-		if w.IsZero() || d.Before(w) {
+		if d := s.wakeup(); !d.IsZero() && (w.IsZero() || d.Before(w)) {
 			w = d
 		}
 	}
 	for _, t := range n.txns {
 		d := t.sent.Add(n.cfg.QueryTimeout)
-		if !t.slow && t.kind == txLookup {
+		switch {
+		case t.kind != txLookup:
+		case !t.slow:
+			d = t.sent.Add(n.shortTimeout())
+		case !t.lapsed:
 			d = t.sent.Add(n.cfg.ShortTimeout)
 		}
 		if w.IsZero() || d.Before(w) {
@@ -443,7 +442,7 @@ func (n *Node) step(now time.Time, l *lookup) {
 		return
 	}
 	for {
-		active, total := l.inflight()
+		active, _, total := l.inflight()
 		if active >= n.cfg.Alpha || total >= n.cfg.MaxInflight {
 			break
 		}
@@ -465,8 +464,12 @@ func (n *Node) step(now time.Time, l *lookup) {
 	}
 	// Like libtorrent, queries past the short timeout no longer hold the
 	// lookup open: one dead node near the target would otherwise add a full
-	// query timeout to every lookup that passes it.
-	if active, _ := l.inflight(); active == 0 && l.next(n.cfg.K) == nil {
+	// query timeout to every lookup that passes it. The lookup widens past a
+	// slow query at the adaptive short timeout, but only stops waiting for
+	// it at Config.ShortTimeout: a slow node near the target may hold the
+	// value, and on a lossy or far network many live ones are slower than
+	// the typical round trip.
+	if _, open, _ := l.inflight(); open == 0 && l.next(n.cfg.K) == nil {
 		n.finish(now, l)
 	}
 }
@@ -572,6 +575,9 @@ func (n *Node) handleReply(now time.Time, from netip.AddrPort, m *krpc.Msg) {
 		return
 	}
 	delete(n.txns, tid)
+	if m.Y == krpc.Response {
+		n.rtt.sample(now.Sub(t.sent))
+	}
 	if t.tracked {
 		n.health.record(false)
 	}
@@ -825,6 +831,10 @@ func (n *Node) Tick(now time.Time) {
 	}
 }
 
+// shortTimeout adapts Config.ShortTimeout, its ceiling, to the round trips
+// this node measures.
+func (n *Node) shortTimeout() time.Duration { return n.rtt.shortTimeout(n.cfg.ShortTimeout) }
+
 func (n *Node) expire(now time.Time) {
 	var tids []uint16
 	for tid := range n.txns {
@@ -838,10 +848,19 @@ func (n *Node) expire(now time.Time) {
 			n.timedOut(now, t)
 			continue
 		}
-		if t.kind == txLookup && !t.slow && now.Sub(t.sent) >= n.cfg.ShortTimeout {
-			t.slow = true
+		if t.kind != txLookup {
+			continue
+		}
+		changed := false
+		if !t.slow && now.Sub(t.sent) >= n.shortTimeout() {
+			t.slow, changed = true, true
+		}
+		if !t.lapsed && now.Sub(t.sent) >= n.cfg.ShortTimeout {
+			t.slow, t.lapsed, changed = true, true, true
+		}
+		if changed {
 			if c := t.lookup.byAddr(t.to); c != nil && c.state == inflight {
-				c.slow = true
+				c.slow, c.lapsed = t.slow, t.lapsed
 			}
 			n.step(now, t.lookup)
 		}
