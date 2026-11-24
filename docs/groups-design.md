@@ -55,76 +55,112 @@ Gaps this design closes:
 
 ## Keys
 
-A group is created from a random 32-byte **group secret** `G`. Everything
-else derives from it with HKDF-SHA256 (label in quotes):
+A group is created from a random 32-byte **group secret** `G`. It locates
+and protects the group's rendezvous, and nothing more: content keys never
+derive from it, since every invite carries it. Keys derived from `G` with
+HKDF-SHA256 (labels abbreviated):
 
 | Key | Derivation | Use |
 |---|---|---|
-| `dirKey` | `HKDF(G, "warren/group/v1 directory")` | locates and signs the group directory (*Discovery*) |
+| `dirKey` | `HKDF(G, "warren/group/v1 directory")` | derives each period's directory keys and salts (*Discovery*) |
 | `dirSeal` | `HKDF(G, "… directory seal")` | encrypts directory entries |
-| `rosterKey` | `HKDF(G, "… roster")` | encrypts roster operations |
-| `epochKey[n]` | delivered on each rekey (*Removal*); `epochKey[0] = HKDF(G, "… epoch 0")` | wraps content keys |
+| `rosterKey` | `HKDF(G, "… roster")` | encrypts roster operations in transit |
 
-Topics are `HMAC(dirKey, "topic" ‖ period)` with a one-hour `period`, so a
-target says nothing without `G` and doesn't repeat across hours.
+**Epoch keys** wrap content keys (*Content*, *Logs*). `epochKey[0]` is random,
+made by the founder; every later one is made on a rekey (*Removal*). Epoch
+keys travel only sealed to individual members' keys (in `add` and `rekey`
+operations), never derivable from `G`, so an invite holder or a blind mirror
+can't read content.
 
-**Removal changes `G` too** (*Removal*): a removed member knows the old `G`,
-so it could still find the directory and see which keys appear in it. After
-a rekey the remaining members move to `G' ` and the old directory goes
-quiet.
+**Periods** are one hour. Everything a period publishes (the directory's
+signing key, its salts, members' rendezvous keys) derives from `dirKey` or
+the member's key plus the period, so nothing visible on the DHT repeats
+across hours.
+
+**Removal replaces `G` too** (*Removal*): a removed member knows the old `G`,
+so it could still read the directory. After a rekey the remaining members
+move to `G'` and stop using the old directory.
 
 ## Identity
 
 Each device holds a separate ed25519 **member key** per group, generated on
-join and never reused across groups, so two groups' rosters never share a
-key. The member key is what the device listens under on warren
-(`endpoint.Listen`), what signs its roster operations and content
-announcements, and what peers pin when they connect.
+join and never reused across groups. It signs the device's roster
+operations, directory entries and log entries, and peers check it inside
+every session. It never appears on the DHT.
+
+On the DHT the device is reached under a **rendezvous key** instead: a fresh
+ed25519 key each period, `seed = HKDF(memberSecret ‖ G, "rendezvous" ‖ period)`,
+listened under with `endpoint.Listen`. Warren's signaling records are signed
+by the listener key and stored by holders next to the listener's address,
+so a holder sees only a key that changes every hour and means nothing
+without `G`.
+
+A device in several groups listens under one rendezvous key per group. If
+those listeners share one socket, a holder of two of them could notice two
+keys behind one address in the same hour, so each group's listener should
+use its own socket (its own port), at the cost of a socket and keepalives per
+group.
 
 ## Roster
 
-The roster is a set of signed operations, each encrypted under `rosterKey`
-and stored by members (not on the DHT):
+The roster is a set of operations signed by member keys, kept by members
+(not on the DHT) and exchanged sealed under `rosterKey`:
 
-- `genesis` (founder key, group name, policy);
-- `add` (member key, display name, role) signed by an admin;
-- `remove` (member key) signed by an admin;
-- `rekey` (epoch n, see *Removal*).
+- `genesis` (founder key, group name, shard count, `epochKey[0]` sealed to
+  the founder);
+- `add` (member key, display name, role, and the current `G` and every epoch
+  key so far, each sealed to the new member) by an admin;
+- `remove` (member key, and the highest sequence number of its log the
+  remover has seen, see *Logs*) by an admin;
+- `rekey` (see *Removal*) by an admin.
 
 Operations carry a Lamport clock and their causal parents (the hashes of the
-latest operations the author had seen). Folding is deterministic: replay in
-causal order, breaking ties by hash; an operation counts only if its author
-was an admin at that point; **remove wins** over a concurrent add of the
-same key. Members exchange roster operations they lack at the start of
-every session (*Sessions*), so the roster converges by gossip.
+latest operations the author had seen). Folding is deterministic: operations
+are applied in causal order, concurrent ones ordered by hash, and each is
+checked **when applied**: it counts only if its author is an admin at that
+point in the fold. So of two admins removing each other concurrently, the
+removal applied first stands and the second is ignored, since its author is
+no longer an admin. A `remove` of the last remaining admin is ignored, so a
+group always keeps one. **Remove wins** over a concurrent `add` of the same
+key. Members exchange operations they lack at the start of every session
+(*Sessions*), so the roster converges by gossip.
 
-Roles in v1: `admin` (can add, remove, rekey) and `member`. The founder is
-the first admin and can be removed like any other once another admin
-exists.
+Roles in v1: `admin` (add, remove, rekey) and `member` (post, fetch).
 
 ## Discovery
 
-Members find each other's **member keys** through the group directory, then
-reach each other with warren's existing Connect-by-key (encrypted signaling,
-holders, relays, NAT punching). No member's address is ever published
-under a group topic.
+Members find each other's **rendezvous keys** through the group directory,
+then reach each other with warren's existing Connect-by-key (encrypted
+signaling, holders, relays, NAT punching). No member's address or member key
+is ever published under a group topic.
 
-The **directory** is a set of BEP 44 mutable items under the current
-period's topic, signed by an ed25519 key derived from `dirKey` (so any
-member can write, nobody else can forge), salted by shard:
+The **directory** is a set of BEP 44 mutable items, one per shard, rotated
+each period:
 
-- `target = MutableTarget(dirPub, HMAC(dirKey, period ‖ shard))`;
-- value: sealed under `dirSeal`, up to ~900 bytes: member keys seen alive
-  recently, with a last-seen time, about 20 per shard.
+- signing key: `seed = HKDF(dirKey, "directory key" ‖ period)`, so the `k`
+  every put and reply carries changes every hour;
+- salt: `HMAC(dirKey, "directory salt" ‖ period ‖ shard)`;
+- value, sealed under `dirSeal`, up to ~900 bytes: about 20 **entries**, each
+  a member's current rendezvous key and a last-seen time, signed by that
+  member's key.
 
 A member that comes online reads the current and previous period's shards,
-merges, adds itself, and puts back the shard its key hashes to (with CAS on
-the sequence number, retrying on conflict). It repeats every half period.
-Members it finds it calls with `endpoint.Connect`; once one session is up,
-roster and peer lists flow over sessions, so the directory matters mostly
-for a cold start or after a long absence.
+keeps only entries signed by a key on its roster, merges, adds its own entry,
+and puts back the shard its member key hashes to (with CAS on the sequence
+number, retrying on conflict), repeating every half period. It calls the
+members it finds with `endpoint.Connect`. Once one session is up, roster,
+rendezvous keys and peer lists flow over sessions, so the directory matters
+mostly for a cold start or after a long absence.
 
-Small groups need one shard; the shard count is in the genesis.
+**Shards:** about 20 entries fit in one, so the genesis sets the shard count
+from the expected size: three shards for a group of 50.
+
+**A leaked `G`** (a leaked invite, or a removed member before the rekey
+reaches everyone) can't forge entries, since readers check each entry's
+member signature against the roster, but it can overwrite shards (the
+directory's signing key derives from `G`) and so disrupt cold-start
+discovery until the next rekey. Members recover from cached peers and the
+invite's bootstrap hints, and an admin can rekey to cut the holder off.
 
 ## Sessions
 
@@ -132,18 +168,21 @@ A session is a hysteria2 connection between two members over a punched
 path (`endpoint.Connect`, `transport/hy2`), so it inherits migration, stall
 recovery and memory caps.
 
-- **Authorization before anything is served.** The callee accepts a caller
-  only if the caller's key is on its current roster for the group it was
-  called on. Warren needs two changes for this: an endpoint listening under
-  several keys at once (one per group; today the DHT node holds a single
-  listener), and `Authorize` told which listener key was called, not just
-  the caller's.
+- **Authorization before anything is served.** The callee's listener (one
+  per group, see *Identity*) admits a caller only if the caller's rendezvous
+  key is one it has seen in a roster-signed directory entry or a member's
+  peer list. Then, inside the encrypted session, each side signs the
+  session's secret with its **member key**, and each checks the other's
+  member key is on its roster. Nothing is served before both checks pass.
+  Warren needs two changes for this: an endpoint listening under several
+  keys at once (today the DHT node holds a single listener), and `Authorize`
+  told which listener key was called.
 - **A newer roster than the callee's** (a member added since the callee last
-  synced): the caller may present the signed `add` chain in its first
-  message; the callee verifies and admits it.
-- On connect the two exchange roster heads and send each other missing
-  operations, then peer lists (members recently reached, with nothing
-  addressable), then content inventories (*Swarming*).
+  synced): the caller may present the signed `add` chain first; the callee
+  verifies and admits it.
+- On connect the two exchange roster heads and missing operations, then peer
+  lists (members' current rendezvous keys), then log heads (*Logs*) and
+  content inventories (*Swarming*).
 
 ## Content
 
@@ -177,9 +216,14 @@ epoch key current when written. Two kinds:
 Members replicate each other's logs over sessions: on connect each sends the
 latest sequence number it holds of every log, and the other sends what's
 missing. Any member can serve another's log, so a member offline for a
-week catches up from whoever is around. Removal (*Removal*) doesn't rewrite
-logs: entries a removed member wrote before removal stay, and members
-ignore entries it writes after.
+week catches up from whoever is around.
+
+**Removal and logs.** A removed member's log keeps the entries it wrote
+before removal. The `remove` operation records the highest sequence number
+of that log the removing admin had seen, and members accept nothing past
+it. Without a trusted clock an entry written offline just before removal
+can't be told from one backdated after, so this cut is the rule: a removed
+member's late offline writes are dropped rather than its forgeries kept.
 
 ## Swarming
 
@@ -195,43 +239,55 @@ A fetcher asks every connected member for the pieces of a blob they hold
 
 Any member holding pieces serves them by default, so a fetch draws on the
 whole group's upload; the app can turn serving off or cap its rate per
-device (a phone on cellular, say). A device keeps what it fetched up to a storage budget the app sets,
-evicting the least recently used. A partial download resumes from the
+device (a phone on cellular, say). A device keeps what it fetched up to a
+storage budget the app sets, evicting the least recently used. A partial download resumes from the
 pieces on disk.
 
-**Blind mirrors** (an always-on member that serves without reading) are a
-member with storage but without epoch keys: it fetches and serves
-ciphertext and verifies pieces by the tree, but can't unwrap blob keys.
+**Blind mirrors** (an always-on device that serves without reading) are
+added with a `mirror` flag: they receive `G` (to find the directory) but no
+epoch keys, so they fetch and serve ciphertext and verify pieces by the tree
+but can't unwrap blob keys or read logs. A rekey seals the new `G'` to
+mirrors as to members, and the new epoch key to members only.
 
 ## Removal
 
 Removing a member:
 
-1. An admin writes `remove`, then a `rekey`: a fresh group secret `G'` and
-   epoch key, each sealed to every remaining member's X25519 key (derived
-   from its member key), in the operation.
+1. An admin writes `remove`, then a `rekey`: a fresh group secret `G'`
+   sealed to every remaining member and mirror, and a fresh epoch key sealed
+   to every remaining member, each to its X25519 key (derived from its
+   member key).
 2. Members apply it as they receive it: they move to `G'`'s directory and
-   wrap new blob keys under the new epoch key.
-3. The removed member keeps what it already had (blobs announced before its
-   removal) but can't unwrap anything announced after, can't find the new
-   directory, and is refused by every member that has applied the removal.
+   wrap new blob keys under the new epoch key. A member that, after applying
+   the rekey, sees an `add` concurrent with it (a new member the rekeying
+   admin didn't know of) seals `G'` and the new epoch key to that member in
+   a follow-up operation, so nobody added around a rekey is left behind.
+3. The removed member keeps what it already had (blobs and log entries from
+   before its removal) but can't unwrap anything announced after, can't find
+   the new directory, and is refused by every member that has applied the
+   removal.
+
+A rekey **invalidates outstanding invites**: they carry the old `G`, whose
+directory members stop using. Admins reissue invites after removing someone.
 
 This costs one sealed copy per member per removal, fine for v1 group sizes;
 a tree scheme (MLS/TreeKEM) can replace it for large groups.
 
 ## Invites
 
-An invite is `G`, the inviting admin's key, the group's shard count, and a
-few bootstrap hints (member keys likely online, DHT contacts in the right
-community), encoded as a link or QR code. Anyone holding it can find the
-group and ask to join; they're admitted only once an admin adds their member
-key. The joiner's first session carries a join request; an admin approves
-it with an `add`. Single-use or expiring invites sign a token with the
-admin's key and are refused after use or expiry.
+An invite is `G`, the inviting admin's member key, the shard count, and a few
+bootstrap hints (current rendezvous keys of members likely online, DHT
+contacts in the right community), encoded as a link or QR code. The holder
+finds the group's directory and sends a join request in its first session;
+it is admitted only when an admin writes an `add`, which delivers the
+current `G` and the epoch keys sealed to it. Single-use or expiring invites
+carry a token signed by the admin and are refused after use or expiry. A
+rekey invalidates every outstanding invite (*Removal*).
 
-An invite reveals `G`, so a leaked invite lets the holder see the directory
-until the next rekey, but not join (no admin `add`) and not read content
-(epoch keys are delivered only to members).
+An invite reveals `G`, so a leaked invite lets the holder read the
+directory (rendezvous keys, not member keys or addresses) and disrupt it
+(*Discovery*) until the next rekey, but not join (no admin `add`) and not
+read content (epoch keys are never derivable from `G`).
 
 ## Library surface
 
@@ -259,7 +315,7 @@ so an app chooses where data lives and how much.
 ## Scale and cost
 
 - **v1 target:** groups of up to about 50 members (decided). Rekey is one
-  sealed copy per member; the directory one shard.
+  sealed copy per member; the directory three shards.
 - **Idle cost** for a member: a directory read and write every half hour,
   plus warren's listening keepalives.
 - **Memory:** sessions use hysteria2's capped windows; a fetch holds a
@@ -267,8 +323,8 @@ so an app chooses where data lives and how much.
 
 ## Warren changes needed
 
-1. **Several listeners per endpoint** (one per group), and `Authorize` given
-   the listener key that was called.
+1. **Several listeners per endpoint** (one per group, each on its own
+   socket), and `Authorize` given the listener key that was called.
 2. **Mutable-item CAS writes** from the endpoint, for the directory (the
    DHT supports CAS; the endpoint doesn't expose puts yet).
 3. Nothing in the data plane: sessions are hysteria2 over `Conn`.
@@ -285,8 +341,8 @@ so an app chooses where data lives and how much.
 
 ## Decisions
 
-1. **Group size:** up to about 50 members in v1, so pairwise rekey and a
-   single directory shard. A tree scheme (MLS/TreeKEM) is the path past
+1. **Group size:** up to about 50 members in v1, so pairwise rekey and three
+   directory shards. A tree scheme (MLS/TreeKEM) is the path past
    that.
 2. **Roles:** admin (add, remove, rekey) and member (post, fetch).
 3. **Serving:** every member serves what it holds by default; the app can
