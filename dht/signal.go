@@ -901,14 +901,17 @@ func usableRecord(l *lookup) ([]*cand, *ecdh.PublicKey, bool) {
 	}
 	// NewPublicKey accepts a low-order point that ECDH then rejects; check
 	// now, before this record is chosen over the other epoch's.
-	if _, err := ecdhProbe.ECDH(xPub); err != nil {
-		return nil, nil, false
+	if ecdhProbe != nil {
+		if _, err := ecdhProbe.ECDH(xPub); err != nil {
+			return nil, nil, false
+		}
 	}
 	return holders, xPub, true
 }
 
-// ecdhProbe is a fixed key for checking a record's key is usable. The
-// secret it derives is discarded.
+// ecdhProbe is a fixed key for checking a record's key is usable; the secret
+// it derives is discarded. It is nil where X25519 is unavailable (FIPS-only
+// mode), and startOffer's own ECDH then fails the signal.
 var ecdhProbe, _ = ecdh.X25519().NewPrivateKey(bytes.Repeat([]byte{0x42}, 32))
 
 // recordFound takes a finished record lookup. The current epoch's record is
@@ -956,7 +959,11 @@ func (n *Node) recordFound(now time.Time, s *signalOp, l *lookup) {
 // startOffer seals the payload to l's record and offers it to its holders,
 // ending any other record lookup still running.
 func (n *Node) startOffer(now time.Time, s *signalOp, l *lookup) {
-	holders, xPub, _ := usableRecord(l)
+	holders, xPub, ok := usableRecord(l)
+	if !ok {
+		n.signalFailed(s, ErrNoRecord)
+		return
+	}
 	for _, o := range s.lookups {
 		if o != l {
 			n.cancelLookup(o)
