@@ -161,7 +161,9 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 	if l.fork != nil {
 		return false, ErrForked
 	}
-	if e.Seq > l.top+Window || l.ahead()+len(e.Box) > MaxAhead {
+	// The entry that closes the gap is always taken: it only ever shrinks
+	// what is held ahead.
+	if e.Seq > l.top+1 && (e.Seq > l.top+Window || l.ahead()+len(e.Box) > MaxAhead) {
 		return false, ErrTooFar
 	}
 	if old := l.bySeq[e.Seq]; old != nil {

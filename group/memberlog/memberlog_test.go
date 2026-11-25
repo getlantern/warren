@@ -560,7 +560,8 @@ func TestMaxAhead(t *testing.T) {
 	f := x.fold(t)
 	s := NewSet(x.r.Group())
 	s.Update(f)
-	prev, _ := Write(x.member, x.r.Group(), nil, ep, key, App, nil)
+	first, _ := Write(x.member, x.r.Group(), nil, ep, key, App, nil)
+	prev := first
 	held := 0
 	for range 100 {
 		var err error
@@ -576,5 +577,13 @@ func TestMaxAhead(t *testing.T) {
 	}
 	if held*MaxBody > MaxAhead+MaxBody || held == 100 {
 		t.Fatalf("held %d full entries past a gap", held)
+	}
+	// With the budget full, the entry that closes the gap is still taken,
+	// and what was held ahead shows.
+	if _, err := s.Add(first); err != nil {
+		t.Fatalf("the gap-closing entry with the budget full: %v", err)
+	}
+	if n := len(s.Log(x.member.Public()).Entries()); n != held+1 {
+		t.Fatalf("%d visible after closing the gap, want %d", n, held+1)
 	}
 }
