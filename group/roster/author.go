@@ -230,8 +230,9 @@ type held struct{ secret, epoch bool }
 func (w *Writer) holdings(f *Result, target keys.PublicKey) map[ID]held {
 	h := map[ID]held{}
 	for _, o := range w.R.ops {
-		trusted := o.Author == w.Me.Public() ||
-			(f.Counts[o.id] && (f.Roles[o.Author] == Owner || f.Roles[o.Author] == Admin))
+		// The author's role when the op counted, not now: a member's list
+		// doesn't become trusted when it's promoted later.
+		trusted := o.Author == w.Me.Public() || f.As[o.id] == Owner || f.As[o.id] == Admin
 		if !trusted {
 			continue
 		}

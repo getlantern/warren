@@ -167,17 +167,18 @@ The roster is a set of operations signed by member keys, kept by members
   author was removed concurrently leaks nothing: the author already held
   those keys.
 
-Every operation names the genesis's hash, which is the group's ID, and
-carries a Lamport clock, exactly one more than its parents' greatest (so an
-author can't pick its place in the order by its clock), and its causal
-parents (the hashes of the latest
+Every operation but the genesis names the genesis's hash, which is the
+group's ID. Every operation carries a Lamport clock: 1 for the genesis, and
+for every other operation exactly one more than its parents' greatest (so an
+author can't pick its place in the order by its clock, and a child's clock
+is always above its parents'), and its causal parents (the hashes of the latest
 operations the author had seen). Folding is deterministic:
 
 - operations apply in one **total order** every member computes alike: a
   topological order of the causal graph that, among operations whose
   parents are all placed, takes the lowest Lamport clock and then the lowest
-  hash first. (Sorting by Lamport clock alone would break causal order
-  whenever an author writes a clock lower than a parent's.)
+  hash first. (With the clock rule above, that is the same as sorting by
+  clock and then hash; the topological form doesn't depend on it.)
 - `genesis` is valid only as the root: no parents, signed by the founder key
   it names, and it makes the founder the group's **owner**;
 - each other operation is checked **when applied**, against the roster the

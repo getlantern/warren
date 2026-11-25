@@ -410,6 +410,11 @@ func Decode(b []byte) (*Op, error) {
 			return nil, ErrMalformed
 		}
 	}
+	for _, s := range o.Seals {
+		if s.To.Valid() != nil {
+			return nil, ErrMalformed
+		}
+	}
 	if (o.Kind == Invite || o.Invite != zero) && o.Invite.Valid() != nil {
 		return nil, ErrMalformed
 	}

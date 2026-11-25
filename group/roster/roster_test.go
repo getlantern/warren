@@ -250,18 +250,37 @@ func TestAddRefuses(t *testing.T) {
 // TestKeyringChecksCommitments: a key that doesn't match its maker's
 // commitment is ignored, whoever sealed it.
 func TestKeyringChecksCommitments(t *testing.T) {
-	r, owner, admin, _ := group(t)
-	f, _ := r.Fold()
+	r, owner, admin, member := group(t)
+	// A rekey made without the member, so the member holds none of its keys.
+	stale, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.ops {
+		if o.Kind == Add && o.Target == admin.Public() {
+			if _, err := stale.Add(o); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rk, err := (&Writer{R: stale, Me: owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	// The owner delivers the member a wrong key for that rekey.
 	o := (&Writer{R: r, Me: owner}).base(Deliver)
-	o.Target = admin.Public()
-	if err := seal(o, admin.Public(), []entry{{made: f.Current, key: [32]byte{0xbb}}}); err != nil {
+	o.Target = member.Public()
+	if err := seal(o, member.Public(), []entry{{made: rk.ID(), key: [32]byte{0xbb}}}); err != nil {
 		t.Fatal(err)
 	}
 	o.Sign(owner)
 	if _, err := r.Add(o); err != nil {
 		t.Fatal(err)
 	}
-	if k := r.Keyring(admin).Epochs[f.Current]; k == (keys.EpochKey{0xbb}) {
+	if _, ok := r.Keyring(member).Epochs[rk.ID()]; ok {
 		t.Fatal("a key not matching its commitment was accepted")
 	}
 }
@@ -545,5 +564,94 @@ func TestFoldScalesWithTurnover(t *testing.T) {
 		t.Fatalf("a cold fold of %d ops took %v", fresh.Len(), d)
 	} else {
 		t.Logf("a cold fold of %d ops took %v", fresh.Len(), d)
+	}
+}
+
+// TestPromotionDoesntTrustOldLists: a member's deliver, written while it
+// was a member, stays untrusted after the member is promoted.
+func TestPromotionDoesntTrustOldLists(t *testing.T) {
+	r, owner, admin, member := group(t)
+	newcomer := me(6)
+	if _, err := (&Writer{R: r, Me: owner}).Add(newcomer.Public(), "n", Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.ops {
+		if o.Kind == Add && o.Target == admin.Public() {
+			if _, err := stale.Add(o); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rk, err := (&Writer{R: stale, Me: owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	// The member, still a member, lies that the newcomer has the rekey's keys,
+	// then is promoted.
+	lie := (&Writer{R: r, Me: member}).base(Deliver)
+	lie.Target = newcomer.Public()
+	if err := seal(lie, newcomer.Public(), nil); err != nil {
+		t.Fatal(err)
+	}
+	lie.Seals[0].Holds = []KeyRef{{Made: rk.ID()}, {Made: rk.ID(), Secret: true}}
+	lie.Sign(member)
+	if _, err := r.Add(lie); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: owner}).SetRole(member.Public(), Admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Deliver(newcomer.Public(), keys.PublicKey{}); err != nil {
+		t.Fatalf("the promoted member's old lie stopped the deliver: %v", err)
+	}
+}
+
+func TestDecodeRejectsBadSealRecipient(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	o := (&Writer{R: r, Me: owner}).base(Deliver)
+	o.Target = admin.Public()
+	o.Seals = []Seal{{To: keys.PublicKey(edwards25519.NewIdentityPoint().Bytes()), Box: []byte{1}}}
+	o.Sign(owner)
+	if _, err := Decode(o.Encode()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a seal to a small-order key: %v", err)
+	}
+}
+
+// TestFoldScalesWithAdmissions: a cold fold of many distinct admissions,
+// each of whose views folds its whole prefix.
+func TestFoldScalesWithAdmissions(t *testing.T) {
+	r, owner, _, _ := group(t)
+	ow := &Writer{R: r, Me: owner}
+	const n = 500
+	for i := range n {
+		k := keys.IdentityFromSeed([32]byte{0xe0, byte(i), byte(i >> 8)}).Public()
+		if _, err := ow.Add(k, "m", Member, keys.PublicKey{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.order()[1:] {
+		if _, err := fresh.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	if _, err := fresh.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	// About 50 ms: each admission's view folds its prefix, quadratic in
+	// principle but small at group sizes.
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("a cold fold of %d admissions took %v", n, d)
 	}
 }

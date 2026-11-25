@@ -41,9 +41,11 @@ type Roster struct {
 	anc map[[2]ID]bool
 }
 
+// view is what an op's author saw of the op's target, the only thing the
+// view checks ask: its role, and whether it had been removed.
 type view struct {
-	roles   map[keys.PublicKey]Role
-	removed map[keys.PublicKey]ID
+	role    Role
+	removed bool
 	failed  bool // the history's fold had no fixpoint
 }
 
@@ -237,6 +239,9 @@ type Result struct {
 	// Grants lists, per key, the counting role operations that promoted or
 	// demoted it, in total order.
 	Grants  map[keys.PublicKey][]*Op
+	// As is each counting op's author's role when it counted (an admin not
+	// yet aware of its grant counts as a member).
+	As      map[ID]Role
 	Owner   keys.PublicKey
 	Current ID // the key-making operation whose keys are current
 	Passes  int
@@ -373,6 +378,7 @@ func (r *Roster) fold() (*Result, error) {
 					for _, p := range grants[i+1:] {
 						if p.Role == Admin && r.descends(p.id, d.id) && r.descends(o.id, p.id) {
 							restored = true
+							break
 						}
 					}
 					if !restored {
@@ -401,7 +407,7 @@ func (r *Roster) viewOf(o *Op) *view {
 	if f, err := r.sub(r.History(o.id)).foldOrFail(); err != nil {
 		v.failed = true
 	} else {
-		v.roles, v.removed = f.Roles, f.Removed
+		v.role, v.removed = f.Roles[o.Target], f.Removed[o.Target] != ID{}
 	}
 	r.views[o.id] = v
 	return v
@@ -417,7 +423,7 @@ func (r *Roster) foldOrFail() (*Result, error) {
 func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 	res := &Result{
 		Order: order, Counts: map[ID]bool{}, Roles: map[keys.PublicKey]Role{},
-		Removed: map[keys.PublicKey]ID{}, Grants: map[keys.PublicKey][]*Op{},
+		Removed: map[keys.PublicKey]ID{}, Grants: map[keys.PublicKey][]*Op{}, As: map[ID]Role{},
 	}
 	ever := map[keys.PublicKey]bool{}
 	// granted is the operation that made each admin one: its counting add
@@ -425,11 +431,11 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 	granted := map[keys.PublicKey]ID{}
 	sawTarget := func(o *Op) bool {
 		v := r.viewOf(o)
-		return v.failed || v.roles[o.Target] != None || v.removed[o.Target] != ID{}
+		return v.failed || v.role != None || v.removed
 	}
 	adminInView := func(o *Op) bool {
 		v := r.viewOf(o)
-		return v.failed || v.roles[o.Target] == Admin
+		return v.failed || v.role == Admin
 	}
 	for i, o := range order {
 		if dropped[o.id] {
@@ -497,6 +503,12 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 			ok = author == Owner || author == Admin
 		}
 		res.Counts[o.id] = ok
+		if ok {
+			res.As[o.id] = author
+			if o.Kind == Genesis {
+				res.As[o.id] = Owner
+			}
+		}
 	}
 	return res
 }
