@@ -913,9 +913,11 @@ line, B runs alongside it, C waits on device time, D is maintenance.
    chain ending at the head the remover saw), with withdrawn entries
    reported; only authors the roster admits, never mirrors.
 2. **Sync, as a state machine** (`group/sync`, built): what two members
-   exchange on connect, with no networking: roster heads and the
-   operations each lacks, then fork proofs, log heads, and entries pulled
-   in bounded batches (a removed author's from its recorded head down).
+   exchange on connect, with no networking: the IDs of the roster
+   operations each holds and the operations each lacks, then fork proofs,
+   log heads with their hashes (a differing one starts a walk down to
+   where two branches of a fork part), and entries pulled in bounded
+   batches (a removed author's from its recorded head down).
    Phase 2 carries the messages over a session; the simulator drives two
    in-process. Liveness moved to step 5.
 3. **Protocol review**, started now, before step 5 needs it: a human

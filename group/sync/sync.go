@@ -1,16 +1,13 @@
 // Package sync is what two members of a group exchange when a session
-// opens (docs/groups-design.md, *Sessions*): roster heads and the
-// operations each lacks, then log heads and the entries each lacks. It is
-// a state machine with no networking: the caller carries its messages
-// over a session, in order, and the simulator drives two of them
-// in-process.
+// opens (docs/groups-design.md, *Sessions*): the roster operations each
+// lacks, then log heads and the entries each lacks. It is a state machine
+// with no networking: the caller carries its messages over a session, in
+// order, and the simulator drives two of them in-process.
 package sync
 
 import (
-	"cmp"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 
 	"github.com/getlantern/warren/group/keys"
@@ -26,15 +23,12 @@ const (
 	MaxBatch = 64
 )
 
-// walk is called per step of closure's walk; tests count with it.
-var walk = func() {}
-
 // opsChunk is the operation bytes one Ops message carries, past which it
 // splits; tests lower it. A single larger operation goes alone.
 var opsChunk = 1 << 20
 
-// headsChunk is the heads one Heads message carries; tests lower it.
-var headsChunk = 16384
+// haveChunk is the IDs one Have message carries; tests lower it.
+var haveChunk = 16384
 
 // ErrProtocol means the peer sent a message out of turn, or one that
 // doesn't answer what was asked.
@@ -46,14 +40,15 @@ type Sync struct {
 	r    *roster.Roster
 	logs *memberlog.Set
 
-	gotHeads  bool
-	opsDone   bool               // the peer's operations are all in, and logs updated
-	logsDone  bool               // the peer's log heads are all in
-	peerHeads map[roster.ID]bool // those this side holds: the rest it can't use
-	peerTop   map[keys.PublicKey]uint64
-	wants     map[keys.PublicKey]Want // asked and not yet answered
-	stopped   map[keys.PublicKey]bool // nothing more from this peer
-	err       error
+	gotHave  bool
+	opsDone  bool               // the peer's operations are all in, and logs updated
+	logsDone bool               // the peer's log heads are all in
+	theirs   map[roster.ID]bool // operations the peer holds, among this side's
+	peer     map[keys.PublicKey]LogHead
+	wants    map[keys.PublicKey]Want // asked and not yet answered
+	walking  map[keys.PublicKey]bool // walking down a peer's branch of a fork
+	stopped  map[keys.PublicKey]bool // nothing more from this peer
+	err      error
 }
 
 // New makes one side of an exchange over r and logs, which it updates as
@@ -61,22 +56,23 @@ type Sync struct {
 func New(r *roster.Roster, logs *memberlog.Set) *Sync {
 	return &Sync{
 		r: r, logs: logs,
-		peerTop:   map[keys.PublicKey]uint64{},
-		wants:     map[keys.PublicKey]Want{},
-		stopped:   map[keys.PublicKey]bool{},
-		peerHeads: map[roster.ID]bool{},
+		theirs:  map[roster.ID]bool{},
+		peer:    map[keys.PublicKey]LogHead{},
+		wants:   map[keys.PublicKey]Want{},
+		walking: map[keys.PublicKey]bool{},
+		stopped: map[keys.PublicKey]bool{},
 	}
 }
 
 // Start returns the first messages to send.
 func (s *Sync) Start() []Message {
-	hs := s.r.Heads()
+	ids := s.r.IDs()
 	var out []Message
-	for len(hs) > headsChunk {
-		out = append(out, Heads{IDs: hs[:headsChunk], More: true})
-		hs = hs[headsChunk:]
+	for len(ids) > haveChunk {
+		out = append(out, Have{IDs: ids[:haveChunk], More: true})
+		ids = ids[haveChunk:]
 	}
-	return append(out, Heads{IDs: hs})
+	return append(out, Have{IDs: ids})
 }
 
 // Done reports whether this side has taken everything the peer offered.
@@ -104,22 +100,22 @@ func violation(format string, a ...any) error {
 
 func (s *Sync) handle(m Message) ([]Message, error) {
 	switch m := m.(type) {
-	case Heads:
-		if s.gotHeads {
-			return nil, violation("heads twice")
+	case Have:
+		if s.gotHave {
+			return nil, violation("have twice")
 		}
 		for _, id := range m.IDs {
-			if s.r.Has(id) {
-				s.peerHeads[id] = true
+			if s.r.Has(id) { // the rest are the peer's to send
+				s.theirs[id] = true
 			}
 		}
 		if m.More {
 			return nil, nil
 		}
-		s.gotHeads = true
+		s.gotHave = true
 		return s.missingOps(), nil
 	case Ops:
-		if !s.gotHeads || s.opsDone {
+		if !s.gotHave || s.opsDone {
 			return nil, violation("operations out of turn")
 		}
 		for _, o := range m.Ops {
@@ -152,9 +148,9 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 			return nil, violation("log heads out of turn")
 		}
 		for _, h := range m.Heads {
-			// Only logs this side would take from: the roster bounds them.
-			if _, _, done := s.logs.Next(h.Author); !done {
-				s.peerTop[h.Author] = h.Top
+			// Only logs this side holds or would take: the roster bounds them.
+			if _, _, done := s.logs.Next(h.Author); !done || s.logs.Log(h.Author) != nil {
+				s.peer[h.Author] = h
 			}
 		}
 		if m.More {
@@ -162,8 +158,8 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		}
 		s.logsDone = true
 		var out []Message
-		for _, a := range sortedKeys(s.peerTop) {
-			out = append(out, s.want(a)...)
+		for _, a := range sortedKeys(s.peer) {
+			out = append(out, s.start(a)...)
 		}
 		return out, nil
 	case Want:
@@ -177,29 +173,16 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 	return nil, violation("unknown message")
 }
 
-// missingOps returns the operations the peer lacks as far as its heads
-// show: every operation this side holds that isn't one of the heads it
-// knows or in their history, parents first, split to fit messages. A head
-// this side doesn't know means the peer is ahead there, and sends it.
+// missingOps returns every operation this side holds that the peer
+// doesn't, parents first, split to fit messages.
 func (s *Sync) missingOps() []Message {
-	theirs := s.closure(slices.Collect(maps.Keys(s.peerHeads)))
-	var send []*roster.Op
-	for id := range s.closure(s.r.Heads()) {
-		if o := s.r.Op(id); !theirs[id] && o.Kind != roster.Genesis {
-			send = append(send, o)
-		}
-	}
-	// Clocks strictly increase along every edge, so this puts parents first.
-	slices.SortFunc(send, func(a, b *roster.Op) int {
-		if c := cmp.Compare(a.Lamport, b.Lamport); c != 0 {
-			return c
-		}
-		ai, bi := a.ID(), b.ID()
-		return slices.Compare(ai[:], bi[:])
-	})
 	var out []Message
 	cur, size := Ops{}, 0
-	for _, o := range send {
+	for _, id := range s.r.IDs() {
+		if s.theirs[id] || id == s.r.Group() {
+			continue
+		}
+		o := s.r.Op(id)
 		n := len(o.Encode()) + 16
 		if size+n > opsChunk && len(cur.Ops) > 0 {
 			cur.More = true
@@ -212,32 +195,6 @@ func (s *Sync) missingOps() []Message {
 	return append(out, cur)
 }
 
-// closure returns the operations among ids this side holds, with their
-// history: one walk with one visited set, so a peer repeating heads costs
-// no more than the roster's size.
-func (s *Sync) closure(ids []roster.ID) map[roster.ID]bool {
-	seen := map[roster.ID]bool{}
-	var stack []roster.ID
-	push := func(id roster.ID) {
-		if !seen[id] && s.r.Has(id) {
-			walk()
-			seen[id] = true
-			stack = append(stack, id)
-		}
-	}
-	for _, id := range ids {
-		push(id)
-	}
-	for len(stack) > 0 {
-		id := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		for _, p := range s.r.Op(id).Parents {
-			push(p)
-		}
-	}
-	return seen
-}
-
 // logHeads returns this side's fork proofs and log heads, split to fit
 // messages.
 func (s *Sync) logHeads() []Message {
@@ -248,18 +205,30 @@ func (s *Sync) logHeads() []Message {
 		if p := l.Fork(); p != nil {
 			out = append(out, Fork{A: p.A, B: p.B})
 		}
-		var top uint64
-		if h := l.Head(); h != nil {
-			top = h.Seq
+		h := LogHead{Author: a}
+		if e := l.Head(); e != nil {
+			h.Top, h.ID = e.Seq, e.ID()
 		}
 		if len(cur.Heads) == 4096 {
 			cur.More = true
 			out = append(out, cur)
 			cur = Logs{}
 		}
-		cur.Heads = append(cur.Heads, LogHead{Author: a, Top: top})
+		cur.Heads = append(cur.Heads, h)
 	}
 	return append(out, cur)
+}
+
+// start decides what to ask for of a's log once the peer's heads are in.
+// A peer head that differs from the entry this side shows at that sequence
+// number is another branch of a fork: walk down the peer's branch to where
+// it parts from this one.
+func (s *Sync) start(a keys.PublicKey) []Message {
+	h := s.peer[a]
+	if mine := s.logs.At(a, h.Top); mine != nil && mine.ID() != h.ID {
+		return s.walk(a, h.Top)
+	}
+	return s.want(a)
 }
 
 // want asks for more of a's log, if the peer may have it and this side
@@ -269,21 +238,47 @@ func (s *Sync) want(a keys.PublicKey) []Message {
 		return nil
 	}
 	seq, down, done := s.logs.Next(a)
-	if done || (!down && s.peerTop[a] < seq) {
+	if done || (!down && s.peer[a].Top < seq) {
 		return nil
 	}
-	w := Want{Author: a, Seq: seq, Down: down}
-	s.wants[a] = w
+	return s.ask(Want{Author: a, Seq: seq, Down: down})
+}
+
+// walk asks for the peer's visible chain of a's log from seq down, to find
+// where its branch parts from this side's.
+func (s *Sync) walk(a keys.PublicKey, seq uint64) []Message {
+	if seq == 0 || s.stopped[a] {
+		s.walking[a] = false
+		return nil
+	}
+	s.walking[a] = true
+	return s.ask(Want{Author: a, Seq: seq, Down: true})
+}
+
+func (s *Sync) ask(w Want) []Message {
+	s.wants[w.Author] = w
 	return []Message{w}
 }
 
-// entries takes a batch the peer sent for a Want, then asks for more.
+// point is a's fork point, or 0.
+func (s *Sync) point(a keys.PublicKey) uint64 {
+	if l := s.logs.Log(a); l != nil {
+		if p := l.Fork(); p != nil {
+			return min(p.A.Seq, p.B.Seq)
+		}
+	}
+	return 0
+}
+
+// entries takes a batch the peer sent for a Want, then asks for more, and
+// sends the peer any fork this side found or moved down meanwhile.
 func (s *Sync) entries(m Entries) ([]Message, error) {
-	w, ok := s.wants[m.Author]
+	a := m.Author
+	w, ok := s.wants[a]
 	if !ok {
 		return nil, violation("entries not asked for")
 	}
-	delete(s.wants, m.Author)
+	delete(s.wants, a)
 	if len(m.Entries) > MaxBatch {
 		return nil, violation("%d entries in a batch", len(m.Entries))
 	}
@@ -294,27 +289,68 @@ func (s *Sync) entries(m Entries) ([]Message, error) {
 			seq = w.Seq - uint64(i)
 		}
 		size += len(e.Box)
-		if e.Author != w.Author || e.Seq != seq || size > Budget {
+		if e.Author != a || e.Seq != seq || size > Budget {
 			return nil, violation("a batch that doesn't answer the want")
 		}
 	}
-	if len(m.Entries) == 0 {
-		s.stopped[m.Author] = true
-		return nil, nil
+	before := s.point(a)
+	var out []Message
+	if s.walking[a] {
+		out = s.walked(a, m.Entries)
+	} else {
+		out = s.took(a, m.Entries)
 	}
-	for _, e := range m.Entries {
+	if p := s.point(a); p != before {
+		f := s.logs.Log(a).Fork()
+		out = append(out, Fork{A: f.A, B: f.B})
+	}
+	return out, nil
+}
+
+// took adds a batch asked for with want, then asks for more. A fork found
+// on the way may lie above where the branches part, but the peer, longer
+// on its branch, sees this side's head differ from its own entry there and
+// walks down itself, sending the lower proof.
+func (s *Sync) took(a keys.PublicKey, es []*memberlog.Entry) []Message {
+	if len(es) == 0 {
+		s.stopped[a] = true
+		return nil
+	}
+	for _, e := range es {
 		if _, err := s.logs.Add(e); err != nil {
 			// The roster is merged, so a refusal is the log's own state (a
 			// fork, a cutoff) or a peer serving what it shouldn't: either
 			// way, take nothing more of this log from it.
-			s.stopped[m.Author] = true
-			break
+			s.stopped[a] = true
+			return nil
 		}
 	}
-	return s.want(m.Author), nil
+	return s.want(a)
 }
 
-func sortedKeys(m map[keys.PublicKey]uint64) []keys.PublicKey {
+// walked adds a batch of the peer's branch, highest first. Each entry that
+// differs from this side's moves the fork proof down to it; the first one
+// this side already holds is where the branches part, and ends the walk.
+func (s *Sync) walked(a keys.PublicKey, es []*memberlog.Entry) []Message {
+	for _, e := range es {
+		isNew, err := s.logs.Add(e)
+		switch {
+		case err == nil && !isNew: // the same entry: the branches part above it
+			s.walking[a] = false
+			return nil
+		case err != nil && !errors.Is(err, memberlog.ErrForked):
+			s.walking[a], s.stopped[a] = false, true
+			return nil
+		}
+	}
+	if len(es) == 0 {
+		s.walking[a], s.stopped[a] = false, true
+		return nil
+	}
+	return s.walk(a, es[len(es)-1].Seq-1)
+}
+
+func sortedKeys[V any](m map[keys.PublicKey]V) []keys.PublicKey {
 	out := make([]keys.PublicKey, 0, len(m))
 	for k := range m {
 		out = append(out, k)

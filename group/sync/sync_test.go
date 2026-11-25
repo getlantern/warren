@@ -511,11 +511,11 @@ func TestMessageRoundTrip(t *testing.T) {
 	es := p.chain(t, g.m1, nil, 2, 10)
 	op := p.r.Op(p.r.Heads()[0])
 	for _, m := range []Message{
-		Heads{IDs: p.r.Heads()},
-		Heads{More: true},
+		Have{IDs: p.r.IDs()},
+		Have{More: true},
 		Ops{Ops: []*roster.Op{op}, More: true},
 		Fork{A: es[0], B: es[1]},
-		Logs{Heads: []LogHead{{Author: g.m1.Public(), Top: 9}}},
+		Logs{Heads: []LogHead{{Author: g.m1.Public(), Top: 9, ID: es[1].ID()}}},
 		Want{Author: g.m1.Public(), Seq: 3, Down: true},
 		Entries{Author: g.m1.Public(), Entries: es},
 	} {
@@ -567,7 +567,7 @@ func TestStrangersCostNothing(t *testing.T) {
 	p := newPeer(t, g.r)
 	s := New(p.r, p.logs)
 	s.Start()
-	if _, err := s.Handle(Heads{IDs: p.r.Heads()}); err != nil {
+	if _, err := s.Handle(Have{IDs: p.r.IDs()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Handle(Ops{}); err != nil {
@@ -584,40 +584,18 @@ func TestStrangersCostNothing(t *testing.T) {
 	if _, err := s.Handle(Logs{Heads: []LogHead{{Author: stranger.Public(), Top: 5}}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.peerTop) != 0 || p.logs.Log(stranger.Public()) != nil {
-		t.Fatalf("kept %d log heads, or a log, of a stranger", len(s.peerTop))
+	if len(s.peer) != 0 || p.logs.Log(stranger.Public()) != nil {
+		t.Fatalf("kept %d log heads, or a log, of a stranger", len(s.peer))
 	}
 	if _, err := s.Handle(Entries{Author: g.m1.Public()}); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("an empty batch nobody asked for: %v", err)
 	}
 }
 
-// TestRepeatedHeadsCostLittle: a peer listing one head many times costs a
-// single walk of the roster, not one per copy.
-func TestRepeatedHeadsCostLittle(t *testing.T) {
-	g := newGroup(t)
-	p := newPeer(t, g.r)
-	h := p.r.Heads()[0]
-	ids := make([]roster.ID, 30000)
-	for i := range ids {
-		ids[i] = h
-	}
-	s := New(p.r, p.logs)
-	visits := 0
-	walk = func() { visits++ }
-	defer func() { walk = func() {} }()
-	if _, err := s.Handle(Heads{IDs: ids}); err != nil {
-		t.Fatal(err)
-	}
-	if visits > 4*p.r.Len() {
-		t.Fatalf("%d visits for a roster of %d", visits, p.r.Len())
-	}
-}
-
-// TestHeadsSplit: heads that don't fit one message go in several.
-func TestHeadsSplit(t *testing.T) {
-	defer func(n int) { headsChunk = n }(headsChunk)
-	headsChunk = 1
+// TestHaveSplit: IDs that don't fit one message go in several.
+func TestHaveSplit(t *testing.T) {
+	defer func(n int) { haveChunk = n }(haveChunk)
+	haveChunk = 1
 	g := newGroup(t)
 	a, b, c := newPeer(t, g.r), newPeer(t, g.r), newPeer(t, g.r)
 	for i, p := range []*peer{a, b} { // concurrent ops: two heads once merged
@@ -631,9 +609,9 @@ func TestHeadsSplit(t *testing.T) {
 	}
 	var heads int
 	if _, _, err := run(t, a, c, func(_ int, m Message) []Message {
-		if h, ok := m.(Heads); ok {
+		if h, ok := m.(Have); ok {
 			heads++
-			if len(h.IDs) > headsChunk {
+			if len(h.IDs) > haveChunk {
 				t.Fatalf("%d heads in one message", len(h.IDs))
 			}
 		}
@@ -676,7 +654,7 @@ func TestForkProofShowsNothingNew(t *testing.T) {
 	}
 }
 
-// TestUnknownHeadsNotKept: heads this side doesn't hold are of no use to
+// TestUnknownHeadsNotKept: IDs this side doesn't hold are of no use to
 // it, so a peer listing many costs no memory.
 func TestUnknownHeadsNotKept(t *testing.T) {
 	g := newGroup(t)
@@ -686,10 +664,108 @@ func TestUnknownHeadsNotKept(t *testing.T) {
 	for i := range ids {
 		ids[i] = roster.ID{byte(i), byte(i >> 8), 1}
 	}
-	if _, err := s.Handle(Heads{IDs: ids, More: true}); err != nil {
+	if _, err := s.Handle(Have{IDs: ids, More: true}); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.peerHeads) != 0 {
-		t.Fatalf("kept %d unknown heads", len(s.peerHeads))
+	if len(s.theirs) != 0 {
+		t.Fatalf("kept %d unknown IDs", len(s.theirs))
+	}
+}
+
+// branches gives a and b two branches of m1's log that part above entry
+// 5: a holds 1..5 then x, b holds 1..5 then y.
+func branches(t *testing.T, g *group, a, b *peer, x, y int) {
+	t.Helper()
+	common := a.chain(t, g.m1, nil, 5, 10)
+	a.add(t, common...)
+	b.add(t, common...)
+	a.add(t, a.chain(t, g.m1, common[4], x, 11)...)
+	b.add(t, b.chain(t, g.m1, common[4], y, 12)...)
+}
+
+// TestBranchesOfEqualLength: two members on different branches of a fork,
+// each as long as the other, find it, and both show only what precedes
+// where the branches part.
+func TestBranchesOfEqualLength(t *testing.T) {
+	g := newGroup(t)
+	a, b := newPeer(t, g.r), newPeer(t, g.r)
+	branches(t, g, a, b, 5, 5)
+	converge(t, a, b)
+	if shown(a, g.m1) != 5 || shown(b, g.m1) != 5 || a.logs.Log(g.m1.Public()).Fork() == nil {
+		t.Fatalf("shown %d and %d, want 5 each", shown(a, g.m1), shown(b, g.m1))
+	}
+}
+
+// TestBranchesOfUnequalLength: the shorter branch's member finds the fork
+// at its own top; the walk down still finds where the branches part, and
+// both members agree in the same session.
+func TestBranchesOfUnequalLength(t *testing.T) {
+	for _, n := range [][2]int{{5, 7}, {7, 5}, {2 * MaxBatch, 3}} {
+		g := newGroup(t)
+		a, b := newPeer(t, g.r), newPeer(t, g.r)
+		branches(t, g, a, b, n[0], n[1])
+		converge(t, a, b)
+		if shown(a, g.m1) != 5 || shown(b, g.m1) != 5 {
+			t.Fatalf("%v: shown %d and %d, want 5 each", n, shown(a, g.m1), shown(b, g.m1))
+		}
+	}
+}
+
+// TestOneOpAheadSendsOne: a peer one operation ahead gets nothing, and
+// sends just that operation.
+func TestOneOpAheadSendsOne(t *testing.T) {
+	g := newGroup(t)
+	a, b := newPeer(t, g.r), newPeer(t, g.r)
+	if _, err := b.writer(g.owner).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	ops := 0
+	if _, _, err := run(t, a, b, func(_ int, m Message) []Message {
+		if o, ok := m.(Ops); ok {
+			ops += len(o.Ops)
+		}
+		return []Message{m}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ops != 1 || state(a) != state(b) {
+		t.Fatalf("%d operations sent for a peer one ahead", ops)
+	}
+}
+
+func TestDecodeErrorsAreMalformed(t *testing.T) {
+	g := newGroup(t)
+	p := newPeer(t, g.r)
+	es := p.chain(t, g.m1, nil, 1, 10)
+	b := Encode(Entries{Author: g.m1.Public(), Entries: es})
+	i := bytes.Index(b, es[0].Sig[:8])
+	b[i] ^= 1 // a bad signature inside a well-formed message
+	if _, err := Decode(b); !errors.Is(err, ErrMalformed) || !errors.Is(err, memberlog.ErrSignature) {
+		t.Fatalf("a bad entry signature: %v", err)
+	}
+}
+
+// TestWalkStopsWhereBranchesPart: finding a fork above a long shared
+// prefix doesn't resend the prefix.
+func TestWalkStopsWhereBranchesPart(t *testing.T) {
+	g := newGroup(t)
+	a, b := newPeer(t, g.r), newPeer(t, g.r)
+	common := a.chain(t, g.m1, nil, 4*MaxBatch, 10)
+	a.add(t, common...)
+	b.add(t, common...)
+	top := common[len(common)-1]
+	a.add(t, a.chain(t, g.m1, top, 3, 11)...)
+	b.add(t, b.chain(t, g.m1, top, 3, 12)...)
+	sent := 0
+	if _, _, err := run(t, a, b, func(_ int, m Message) []Message {
+		if e, ok := m.(Entries); ok {
+			sent += len(e.Entries)
+		}
+		return []Message{m}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if shown(a, g.m1) != len(common) || shown(b, g.m1) != len(common) || sent > 2*MaxBatch {
+		t.Fatalf("shown %d and %d of %d, %d entries sent", shown(a, g.m1), shown(b, g.m1), len(common), sent)
 	}
 }

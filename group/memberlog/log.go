@@ -520,6 +520,16 @@ func (s *Set) check(e *Entry) error {
 	return nil
 }
 
+// At returns a copy of the entry of author's log the app sees at seq, or
+// nil.
+func (s *Set) At(author keys.PublicKey, seq uint64) *Entry {
+	l := s.logs[author]
+	if l == nil || seq == 0 || seq > l.top {
+		return nil
+	}
+	return l.bySeq[seq].clone()
+}
+
 // Authors returns the authors whose logs the Set holds, in key order.
 func (s *Set) Authors() []keys.PublicKey {
 	out := make([]keys.PublicKey, 0, len(s.logs))
@@ -533,7 +543,9 @@ func (s *Set) Authors() []keys.PublicKey {
 // Next reports where author's log continues under the current fold: the
 // next sequence number the Set would take, and whether the log fills
 // downward (a removed author's, from its recorded head). done means it
-// takes nothing more: complete, forked, or an author that may not write.
+// takes nothing more: a forked log that has reached its fork point, a
+// removed author's chain anchored down to entry 1, or an author that may
+// not write. A live log otherwise always takes its next entry.
 func (s *Set) Next(author keys.PublicKey) (seq uint64, down, done bool) {
 	if s.fold == nil || !s.writer(author) {
 		return 0, false, true
@@ -554,8 +566,10 @@ func (s *Set) Next(author keys.PublicKey) (seq uint64, down, done bool) {
 
 // Serve returns copies of the entries of author's log a peer asking from
 // seq can take, in the order it takes them, within budget box bytes:
-// upward along the visible chain, or, for a removed author, downward along
-// the chain anchored to the recorded head; at most n of them.
+// along the visible chain, upward or downward (a peer finding where its
+// branch of a fork parts from this one walks down), or, for a removed
+// author, downward along the chain anchored to the recorded head; at most
+// n of them.
 func (s *Set) Serve(author keys.PublicKey, seq uint64, down bool, budget, n int) []*Entry {
 	l := s.logs[author]
 	if l == nil || seq == 0 {
@@ -564,8 +578,8 @@ func (s *Set) Serve(author keys.PublicKey, seq uint64, down bool, budget, n int)
 	var out []*Entry
 	for {
 		var e *Entry
-		if down {
-			if l.removed && seq >= l.low && seq <= l.cutSeq {
+		if down && l.removed {
+			if seq >= l.low && seq <= l.cutSeq {
 				e = l.bySeq[seq]
 			}
 		} else if seq <= l.top {

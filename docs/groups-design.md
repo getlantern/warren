@@ -306,9 +306,11 @@ recovery and memory caps.
   with that key. This opens the callee to members and recently removed
   members (who hold `G` during the grace window, see *Removal*, and are
   refused once the chain is checked), and nobody else.
-- On connect the two exchange roster heads and missing operations, then
-  liveness (members each has reached lately), then log heads (*Logs*) and
-  content inventories (*Swarming*).
+- On connect the two exchange the IDs of the roster operations each holds
+  and then the operations the other lacks (32 bytes an operation, so a
+  peer one operation ahead is sent one), then liveness (members each has
+  reached lately), then log heads (*Logs*) and content inventories
+  (*Swarming*).
 - **Join sessions** (*Invites*) are separate: they are admitted under an
   invite's key, carry only a join request and its answer, and serve no
   member data.
@@ -344,7 +346,10 @@ epoch key current when written. Two kinds:
 
 Members replicate each other's logs over sessions: on connect each sends the
 head of every log it holds (sequence number and entry hash), and the other
-sends what's missing. Two different entries at the same sequence number,
+sends what's missing. A head whose hash differs from the entry the other
+shows at that number is another branch of a fork: the other walks down
+the sender's branch to where the two part, and both keep the proof at
+that point. Two different entries at the same sequence number,
 both signed by the author, are proof the author forked its log (so is an
 entry whose previous-hash contradicts the held chain): members keep the
 proof, show only its entries before the fork point (nobody can tell which

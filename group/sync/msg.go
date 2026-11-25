@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"github.com/getlantern/warren/bencode"
 	"github.com/getlantern/warren/group/keys"
@@ -20,15 +21,17 @@ const MaxMessage = roster.MaxOpBytes + 4096
 // operations or log heads, each a few values apiece.
 const maxElements = 1 << 16
 
-// ErrMalformed means a message isn't a well-formed, canonical message.
+// ErrMalformed means a message isn't a well-formed, canonical message, or
+// carries an operation or entry that isn't; the error wraps theirs too.
 var ErrMalformed = errors.New("sync: malformed message")
 
 // A Message is one step of the exchange.
 type Message interface{ kind() int64 }
 
-// Heads is the roster's heads, the first message each side sends. More
-// means another Heads message follows.
-type Heads struct {
+// Have is the ID of every roster operation the sender holds, the first
+// message each side sends, so each sends the other exactly what it lacks.
+// More means another Have message follows.
+type Have struct {
 	IDs  []roster.ID
 	More bool
 }
@@ -51,10 +54,13 @@ type Logs struct {
 	More  bool
 }
 
-// LogHead is one log's visible end.
+// LogHead is one log's visible end: its sequence number and the entry's
+// ID (zero for an empty log), so a peer holding another branch of a fork
+// sees it.
 type LogHead struct {
 	Author keys.PublicKey
 	Top    uint64
+	ID     memberlog.ID
 }
 
 // Want asks for the entries of Author's log from Seq on, upward, or
@@ -72,7 +78,7 @@ type Entries struct {
 	Entries []*memberlog.Entry
 }
 
-func (Heads) kind() int64   { return 1 }
+func (Have) kind() int64    { return 1 }
 func (Ops) kind() int64     { return 2 }
 func (Fork) kind() int64    { return 3 }
 func (Logs) kind() int64    { return 4 }
@@ -95,7 +101,7 @@ func flag(b bool) bencode.Value {
 func Encode(m Message) []byte {
 	d := []bencode.Pair{}
 	switch m := m.(type) {
-	case Heads:
+	case Have:
 		var ids []bencode.Value
 		for _, id := range m.IDs {
 			ids = append(ids, str(id[:]))
@@ -113,7 +119,7 @@ func Encode(m Message) []byte {
 	case Logs:
 		var hs []bencode.Value
 		for _, h := range m.Heads {
-			hs = append(hs, list([]bencode.Value{str(h.Author[:]), num(int64(h.Top))}))
+			hs = append(hs, list([]bencode.Value{str(h.Author[:]), num(int64(h.Top)), str(h.ID[:])}))
 		}
 		d = append(d, pair("l", list(hs)), pair("m", flag(m.More)))
 	case Want:
@@ -168,13 +174,13 @@ func decode(v bencode.Value) (Message, error) {
 		return f.Int == 1, ok && (f.Int == 0 || f.Int == 1)
 	}
 	switch t.Int {
-	case Heads{}.kind():
+	case Have{}.kind():
 		hs, ok := field("h", bencode.List)
 		more, ok2 := boolean("m")
 		if !ok || !ok2 {
 			return nil, ErrMalformed
 		}
-		m := Heads{More: more}
+		m := Have{More: more}
 		for _, h := range hs.List {
 			var id roster.ID
 			if h.Kind != bencode.String || len(h.Str) != len(id) {
@@ -197,7 +203,7 @@ func decode(v bencode.Value) (Message, error) {
 			}
 			op, err := roster.Decode(o.Str)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("%w: %w", ErrMalformed, err)
 			}
 			m.Ops = append(m.Ops, op)
 		}
@@ -210,11 +216,11 @@ func decode(v bencode.Value) (Message, error) {
 		}
 		ea, err := memberlog.Decode(a.Str)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrMalformed, err)
 		}
 		eb, err := memberlog.Decode(b.Str)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrMalformed, err)
 		}
 		return Fork{A: ea, B: eb}, nil
 	case Logs{}.kind():
@@ -226,13 +232,15 @@ func decode(v bencode.Value) (Message, error) {
 		m := Logs{More: more}
 		for _, l := range ls.List {
 			var h LogHead
-			if l.Kind != bencode.List || len(l.List) != 2 ||
+			if l.Kind != bencode.List || len(l.List) != 3 ||
 				l.List[0].Kind != bencode.String || len(l.List[0].Str) != len(h.Author) ||
-				l.List[1].Kind != bencode.Int || l.List[1].Int < 0 {
+				l.List[1].Kind != bencode.Int || l.List[1].Int < 0 ||
+				l.List[2].Kind != bencode.String || len(l.List[2].Str) != len(h.ID) {
 				return nil, ErrMalformed
 			}
 			copy(h.Author[:], l.List[0].Str)
 			h.Top = uint64(l.List[1].Int)
+			copy(h.ID[:], l.List[2].Str)
 			m.Heads = append(m.Heads, h)
 		}
 		return m, nil
@@ -257,7 +265,7 @@ func decode(v bencode.Value) (Message, error) {
 			}
 			en, err := memberlog.Decode(e.Str)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("%w: %w", ErrMalformed, err)
 			}
 			m.Entries = append(m.Entries, en)
 		}
