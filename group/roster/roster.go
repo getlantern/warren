@@ -36,7 +36,8 @@ type Roster struct {
 	views map[ID]*view
 	// anc caches descends within one top-level fold (whether the second op
 	// is an ancestor of the first), and is dropped after it, so it never
-	// outgrows a fold's own work.
+	// outgrows a fold's own work; each fold walks the grant checks afresh,
+	// O(ops) per admin.
 	anc map[[2]ID]bool
 }
 
@@ -162,11 +163,7 @@ func (r *Roster) descends(o, a ID) bool {
 	if ao == nil || oo == nil {
 		return false
 	}
-	if r.anc == nil { // outside a fold: a cache for this query alone
-		r.anc = map[[2]ID]bool{}
-		defer func() { r.anc = nil }()
-	}
-	return r.desc(oo, ao)
+	return r.desc(oo, ao) // only within a fold, which sets r.anc
 }
 
 // desc is descends over parents, memoizing every node's answer for the
@@ -328,6 +325,10 @@ func (r *Roster) fold() (*Result, error) {
 		defer func() { r.anc = nil }()
 	}
 	order := r.order()
+	byAuthor := map[keys.PublicKey][]*Op{}
+	for _, o := range order {
+		byAuthor[o.Author] = append(byAuthor[o.Author], o)
+	}
 	dropped := map[ID]bool{}
 	var tried []map[ID]bool
 	for pass := 1; ; pass++ {
@@ -339,9 +340,13 @@ func (r *Roster) fold() (*Result, error) {
 		// the descends memo can't reuse, so they walk that op's history
 		// once instead.
 		for k, rid := range res.Removed {
+			ops := byAuthor[k]
+			if len(ops) == 0 {
+				continue // most removed keys never wrote anything
+			}
 			h := r.History(rid)
-			for _, o := range order {
-				if o.Author == k && o.id != rid && !h[o.id] {
+			for _, o := range ops {
+				if o.id != rid && !h[o.id] {
 					next[o.id] = true
 				}
 			}
@@ -351,9 +356,13 @@ func (r *Roster) fold() (*Result, error) {
 				if d.Role != Member {
 					continue
 				}
+				ops := byAuthor[k]
+				if !slices.ContainsFunc(ops, func(o *Op) bool { return o.Kind.needsAdmin() }) {
+					continue
+				}
 				h := r.History(d.id)
-				for _, o := range order {
-					if o.Author != k || !o.Kind.needsAdmin() || h[o.id] {
+				for _, o := range ops {
+					if !o.Kind.needsAdmin() || h[o.id] {
 						continue
 					}
 					restored := false

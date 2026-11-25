@@ -511,3 +511,37 @@ func TestFoldScalesAfterRemoval(t *testing.T) {
 		}
 	}
 }
+
+// TestFoldScalesWithTurnover: many members added and removed fold quickly:
+// the view rules skip removed keys that never wrote anything.
+func TestFoldScalesWithTurnover(t *testing.T) {
+	r, owner, _, _ := group(t)
+	ow := &Writer{R: r, Me: owner}
+	for i := range 300 {
+		k := keys.IdentityFromSeed([32]byte{0xf0, byte(i), byte(i >> 8)}).Public()
+		if _, err := ow.Add(k, "m", Member, keys.PublicKey{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ow.Remove(k, 0, [32]byte{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.order()[1:] {
+		if _, err := fresh.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	if _, err := fresh.Fold(); err != nil { // cold: no views cached
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("a cold fold of %d ops took %v", fresh.Len(), d)
+	} else {
+		t.Logf("a cold fold of %d ops took %v", fresh.Len(), d)
+	}
+}
