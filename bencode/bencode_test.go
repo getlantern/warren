@@ -2,8 +2,10 @@ package bencode
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRoundTrip(t *testing.T) {
@@ -82,4 +84,37 @@ func FuzzDecode(f *testing.F) {
 			t.Fatalf("canonical form unstable: %q vs %q", c, c2)
 		}
 	})
+}
+
+func TestLargeDictDuplicateCheck(t *testing.T) {
+	build := func(n int, dupAt int) []byte {
+		b := []byte{'d'}
+		for i := range n {
+			k := i
+			if i == dupAt {
+				k = 0
+			}
+			key := []byte(fmt.Sprintf("k%07d", k))
+			b = AppendBytes(b, key)
+			b = AppendInt(b, 1)
+		}
+		return append(b, 'e')
+	}
+	doc := build(100000, -1)
+	start := time.Now()
+	if _, err := DecodeLimit(doc, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	bound := 2 * time.Second
+	if raceEnabled {
+		bound = 30 * time.Second // still far below a pairwise scan's
+	}
+	if d := time.Since(start); d > bound {
+		t.Fatalf("a 100,000-key dictionary took %v", d)
+	}
+	for _, at := range []int{1, smallDict, smallDict + 1, 99999} {
+		if _, err := DecodeLimit(build(100000, at), 1<<20); err != ErrDupKey {
+			t.Fatalf("a duplicate at %d: %v", at, err)
+		}
+	}
 }

@@ -136,10 +136,11 @@ The roster is a set of operations signed by member keys, kept by members
   admitted the key, and both have sealed their keys, so the key takes the
   role holding more (admin over member over mirror) rather than leaving a
   mirror with epoch keys;
-- `remove` (member key; the remover's view of that member: the hashes of its
-  latest roster operations and the head of its log the remover has seen,
-  sequence number and entry hash; and the rekey, see *Removal*) by an admin,
-  or by the owner when the removed key is an admin, as one operation;
+- `remove` (member key; the head of its log the remover has seen, sequence
+  number and entry hash; and the rekey, see *Removal*) by an admin, or by
+  the owner when the removed key is an admin, as one operation. The
+  remover's view of the member's roster operations is the `remove`'s own
+  causal history, fixed by its parents, so it isn't listed separately;
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
 - `role` (member key, and `admin` or `member`) by the owner: promotes a
@@ -149,8 +150,15 @@ The roster is a set of operations signed by member keys, kept by members
   mirror must lose the epoch keys anyway;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
 - `deliver` (the current `G`, and for a member but not a mirror any epoch
-  keys it lacks, sealed to one member already added) by any member: it
-  grants no rights, and only fills in keys a member missed (*Removal*). The
+  keys it lacks, sealed to one member already added) by any member. Every
+  seal also lists, in the clear, which keys its box carries (each by the
+  operation that made it), so a sender can tell what a member lacks; a
+  sender trusts only its own lists and those of counting operations whose
+  author was the owner or an admin both when the operation counted and
+  still is, since a member could list keys it never sealed (and a removed
+  or demoted admin's lists stop counting). A
+  `deliver` grants no rights, and only fills in keys a member missed
+  (*Removal*). The
   recipient checks each key against the commitment of the operation that
   made it (*Keys*), so a forged key is ignored. A sender delivers only to
   a recipient on its own folded roster, which a counting `remove` takes it
@@ -161,15 +169,18 @@ The roster is a set of operations signed by member keys, kept by members
   author was removed concurrently leaks nothing: the author already held
   those keys.
 
-Every operation names the genesis's hash, which is the group's ID, and
-carries a Lamport clock and its causal parents (the hashes of the latest
+Every operation but the genesis names the genesis's hash, which is the
+group's ID. Every operation carries a Lamport clock: 1 for the genesis, and
+for every other operation exactly one more than its parents' greatest (so an
+author can't pick its place in the order by its clock, and a child's clock
+is always above its parents'), and its causal parents (the hashes of the latest
 operations the author had seen). Folding is deterministic:
 
 - operations apply in one **total order** every member computes alike: a
   topological order of the causal graph that, among operations whose
   parents are all placed, takes the lowest Lamport clock and then the lowest
-  hash first. (Sorting by Lamport clock alone would break causal order
-  whenever an author writes a clock lower than a parent's.)
+  hash first. (With the clock rule above, that is the same as sorting by
+  clock and then hash; the topological form doesn't depend on it.)
 - `genesis` is valid only as the root: no parents, signed by the founder key
   it names, and it makes the founder the group's **owner**;
 - each other operation is checked **when applied**, against the roster the
@@ -579,7 +590,10 @@ so an app chooses where data lives and how much.
 
 ## Scale and cost
 
-- **v1 target:** groups of up to about 50 members (decided). Rekey is one
+- **v1 target:** groups of up to about 50 members (decided). A roster
+  operation is bounded (1 MiB, and a budget of decoded values), so one
+  rekey reaches about 3,400 members; splitting a rekey's seals across
+  operations is the path past that. Rekey is one
   sealed copy per member; the directory three shards of at most 20.
 - **Idle cost** for a member: one directory write a period, often made for
   it by a member it's in session with; directory reads only on a cold start;

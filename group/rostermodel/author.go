@@ -179,8 +179,9 @@ func withheldFrom(s Store, rules Rules, target Key) map[ID]bool {
 }
 
 // AuthorBackdated writes an operation by a removed or demoted author with
-// parents from before it saw that, so it looks concurrent with it, and a
-// low Lamport clock, so it sorts early. It seals whatever the author holds.
+// parents from before it saw that, so it looks concurrent with it. Its
+// Lamport clock follows its parents, as a roster requires of every
+// operation. It seals whatever the author holds.
 // It returns nil unless s holds a remove or demotion of author.
 func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
 	// The counting operation that took the author's authority: its removal,
@@ -205,7 +206,7 @@ func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
 	if len(pre) == len(s) {
 		return nil
 	}
-	o := newOp(s, kind, author, target, role, pre.Heads(), 1)
+	o := newOp(s, kind, author, target, role, pre.Heads(), 0)
 	o.Backdated = true
 	epochs, gs := held(pre, author)
 	switch kind {
@@ -223,6 +224,31 @@ func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
 		}
 	default:
 		return nil
+	}
+	return finish(s, o)
+}
+
+// AuthorRogue writes an operation its author has no authority for, as a
+// compromised device could: a remove or rekey seals its new keys as an
+// honest one would, since only its authority is forged.
+func AuthorRogue(s Store, kind Kind, author, target Key, role Role) *Op {
+	o := newOp(s, kind, author, target, role, s.Heads(), 0)
+	o.Rogue = true
+	if kind == Remove || kind == Rekey {
+		f, err := Fold(s)
+		if err != nil {
+			return nil
+		}
+		for _, k := range sortedKeys(f.Roles) {
+			if kind == Remove && k == target {
+				continue
+			}
+			sl := Seal{To: k, Gs: []ID{self}}
+			if f.Roles[k] != Mirror {
+				sl.Epochs = []ID{self}
+			}
+			o.Seals = append(o.Seals, sl)
+		}
 	}
 	return finish(s, o)
 }
