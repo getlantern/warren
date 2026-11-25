@@ -958,8 +958,5 @@ Needs device time and changes in those repos.
 phones, and rebind debounce, once C gives real-network data; signaling's
 keepalive answers and store-and-poll fallback (row 3).
 
-**How we review.** Codex has been out of credits and Copilot rate-limited
-or stalled, so each PR's gate is local `/code-review` rounds, with Copilot
-and CodeRabbit where they respond. The roster PR took nine rounds; smaller
-PRs (one warren change each in A4, logs apart from sync) should take
-fewer.
+**PR size.** Keep each PR to one piece (one warren change each in A4,
+logs apart from sync): review rounds grow quickly with a PR's size.

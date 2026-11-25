@@ -2,7 +2,6 @@ package memberlog
 
 import (
 	"errors"
-	"slices"
 
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/roster"
@@ -12,8 +11,8 @@ var (
 	// ErrForked means the author's log is forked: members keep the proof
 	// and accept nothing more from it.
 	ErrForked = errors.New("memberlog: log forked")
-	// ErrPastCutoff means the author was removed and the entry isn't on the
-	// chain ending at the head its remover recorded.
+	// ErrPastCutoff means the author was removed and the entry is past the
+	// head its remover recorded.
 	ErrPastCutoff = errors.New("memberlog: entry past the removal cutoff")
 	// ErrOffChain means the author was removed and the entry isn't (yet)
 	// anchored to the chain from the recorded head: the head itself, or
@@ -21,188 +20,219 @@ var (
 	// removed author's log from the head down, so an entry refused this way
 	// can be sent again once its successor has arrived.
 	ErrOffChain = errors.New("memberlog: entry not anchored to the removal's head")
+	// ErrTooFar means the entry is more than Window past the author's
+	// contiguous chain: sync fills logs from the bottom, so it is sent
+	// again once the gap closes.
+	ErrTooFar = errors.New("memberlog: entry too far past the held chain")
 	// ErrNotWriter means the roster doesn't let the author write a log: it
-	// was never admitted, or it is a mirror.
+	// was never admitted, or it is (or was) a mirror.
 	ErrNotWriter = errors.New("memberlog: author may not write a log")
-	// ErrUnknownEpoch means the entry names no key-making roster operation.
+	// ErrUnknownEpoch means the entry names no counting key-making roster
+	// operation.
 	ErrUnknownEpoch = errors.New("memberlog: unknown epoch")
 	// ErrWrongGroup means the entry belongs to another group.
 	ErrWrongGroup = errors.New("memberlog: entry of another group")
 )
 
+// Window is how far past an author's contiguous chain a member holds
+// entries, so nobody can make others store entries that are never shown.
+const Window = 4096
+
 // ForkProof is two entries the author signed that can't both be on one
 // chain: two at one sequence number, or one whose Prev isn't the other.
 type ForkProof struct{ A, B *Entry }
 
-// Log is one author's log as a member holds it.
+// Log is one author's log as a member holds it: at most one entry per
+// sequence number.
 type Log struct {
-	author  keys.PublicKey
-	entries map[ID]*Entry
-	bySeq   map[uint64][]ID
-	fork    *ForkProof
+	author keys.PublicKey
+	bySeq  map[uint64]*Entry
+	top    uint64 // the visible chain is 1..top
+	fork   *ForkProof
+
 	removed bool
 	cutSeq  uint64
 	cutHead ID
-	// low is, for a removed author, the lowest sequence number anchored to
-	// the head (cutSeq+1 while the head itself is missing).
+	// low is the lowest sequence number anchored to the recorded head
+	// (cutSeq+1 while the head itself is missing).
 	low uint64
 }
 
 func newLog(author keys.PublicKey) *Log {
-	return &Log{author: author, entries: map[ID]*Entry{}, bySeq: map[uint64][]ID{}}
+	return &Log{author: author, bySeq: map[uint64]*Entry{}}
 }
 
 // Fork returns the proof the log forked, or nil.
 func (l *Log) Fork() *ForkProof { return l.fork }
 
-// add stores e, checked against the log's chain. It reports whether e was
-// new.
-func (l *Log) add(e *Entry) (bool, error) {
-	if l.entries[e.id] != nil {
+// Entries returns the entries the app may see, in order: the unbroken,
+// linked chain from entry 1, stopping before the fork point of a forked
+// log (nobody can tell which branch is the author's) and, for a removed
+// author, at the cutoff.
+func (l *Log) Entries() []*Entry {
+	out := make([]*Entry, 0, l.top)
+	for seq := uint64(1); seq <= l.top; seq++ {
+		out = append(out, l.bySeq[seq])
+	}
+	return out
+}
+
+// Head returns the last entry the app may see, or nil.
+func (l *Log) Head() *Entry { return l.bySeq[l.top] }
+
+// limit is the highest sequence number the app may see.
+func (l *Log) limit() uint64 {
+	switch {
+	case l.removed:
+		return l.cutSeq
+	case l.fork != nil:
+		return min(l.fork.A.Seq, l.fork.B.Seq) - 1
+	}
+	return ^uint64(0)
+}
+
+// retop recomputes the visible chain's end after a change at or below seq.
+func (l *Log) retop(seq uint64) {
+	if seq <= l.top {
+		l.top = seq - 1
+	}
+	l.top = min(l.top, l.limit())
+	for l.top < l.limit() {
+		next := l.bySeq[l.top+1]
+		if next == nil || (l.top > 0 && next.Prev != l.bySeq[l.top].id) {
+			break
+		}
+		l.top++
+	}
+}
+
+// drop removes the entry at seq, reporting it in gone if it was visible.
+func (l *Log) drop(seq uint64, gone *[]*Entry) {
+	if e := l.bySeq[seq]; e != nil {
+		if seq <= l.top {
+			*gone = append(*gone, e)
+		}
+		delete(l.bySeq, seq)
+	}
+}
+
+// add stores e, checked against the log. It reports whether e was new, and
+// appends to gone any visible entries that leave the app's view.
+func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
+	if old := l.bySeq[e.Seq]; old != nil && old.id == e.id {
 		return false, nil
 	}
 	if l.removed {
-		// Only the chain ending at the recorded head is kept, filled from
-		// the head down one link at a time: a removed author's other
-		// histories are neither stored (it could sign any number) nor a
-		// fork that would hide the entries it wrote before removal.
-		if e.Seq > l.cutSeq || (e.Seq == l.cutSeq && e.id != l.cutHead) {
-			return false, ErrPastCutoff
-		}
-		if e.Seq+1 != l.low {
-			return false, ErrOffChain
-		}
-		if e.Seq < l.cutSeq && l.one(l.low).Prev != e.id {
-			return false, ErrOffChain
-		}
-		for _, id := range l.bySeq[e.Seq] { // a pre-removal entry off the chain
-			delete(l.entries, id)
-		}
-		l.bySeq[e.Seq] = nil
-		l.store(e)
-		l.low = e.Seq
-		return true, nil
+		return l.addRemoved(e, gone)
 	}
 	if l.fork != nil {
 		return false, ErrForked
 	}
-	if others := l.bySeq[e.Seq]; len(others) > 0 {
-		l.fork = &ForkProof{A: l.entries[others[0]], B: e}
-		return false, ErrForked
+	if e.Seq > l.top+Window {
+		return false, ErrTooFar
 	}
-	if prev := l.one(e.Seq - 1); prev != nil && e.Prev != prev.id {
+	if old := l.bySeq[e.Seq]; old != nil {
+		l.fork = &ForkProof{A: old, B: e}
+	} else if prev := l.bySeq[e.Seq-1]; prev != nil && e.Prev != prev.id {
 		l.fork = &ForkProof{A: prev, B: e}
-		return false, ErrForked
-	}
-	if next := l.one(e.Seq + 1); next != nil && next.Prev != e.id {
+	} else if next := l.bySeq[e.Seq+1]; next != nil && next.Prev != e.id {
 		l.fork = &ForkProof{A: e, B: next}
+	}
+	if l.fork != nil {
+		old := l.top
+		l.retop(l.top + 1)
+		for seq := l.top + 1; seq <= old; seq++ {
+			*gone = append(*gone, l.bySeq[seq])
+		}
 		return false, ErrForked
 	}
-	l.store(e)
+	l.bySeq[e.Seq] = e
+	l.retop(e.Seq)
 	return true, nil
 }
 
-func (l *Log) store(e *Entry) {
-	l.entries[e.id] = e
-	l.bySeq[e.Seq] = append(l.bySeq[e.Seq], e.id)
+// addRemoved accepts a removed author's entry only when anchored to the
+// recorded head, which keeps one entry per sequence number however many
+// histories the author signs, and confirms or evicts the held entry below.
+func (l *Log) addRemoved(e *Entry, gone *[]*Entry) (bool, error) {
+	if e.Seq > l.cutSeq || (e.Seq == l.cutSeq && e.id != l.cutHead) {
+		return false, ErrPastCutoff
+	}
+	anchored := e.Seq+1 == l.low && (e.Seq == l.cutSeq || l.bySeq[l.low].Prev == e.id)
+	if !anchored {
+		return false, ErrOffChain
+	}
+	if old := l.bySeq[e.Seq]; old != nil {
+		l.drop(e.Seq, gone) // held from before the removal, off the head's chain
+		l.retop(e.Seq)
+	}
+	l.bySeq[e.Seq] = e
+	l.low = e.Seq
+	l.anchorDown(gone)
+	l.retop(e.Seq)
+	return true, nil
 }
 
-// one returns the entry at seq if there is exactly one.
-func (l *Log) one(seq uint64) *Entry {
-	if ids := l.bySeq[seq]; len(ids) == 1 {
-		return l.entries[ids[0]]
-	}
-	return nil
-}
-
-// Entries returns the entries the app may see, in order: for a member, the
-// unbroken chain from entry 1, stopping at a gap, or before the fork point
-// of a forked log (which branch is the author's nobody can tell); for a
-// removed author, the chain ending at the recorded head, once it is
-// complete back to entry 1.
-func (l *Log) Entries() []*Entry {
-	if l.removed {
-		if l.cutSeq == 0 {
-			return nil
+// anchorDown extends the anchored chain over held entries the lowest
+// anchored one links to, and evicts the first one it contradicts.
+func (l *Log) anchorDown(gone *[]*Entry) {
+	for l.low > 1 {
+		below := l.bySeq[l.low-1]
+		if below == nil {
+			return
 		}
-		var chain []*Entry
-		e := l.entries[l.cutHead]
-		for e != nil {
-			chain = append(chain, e)
-			if e.Seq == 1 {
-				slices.Reverse(chain)
-				return chain
-			}
-			e = l.entries[e.Prev]
+		if below.id != l.bySeq[l.low].Prev {
+			l.drop(l.low-1, gone)
+			l.retop(l.low - 1)
+			return
 		}
-		return nil // incomplete until sync fills the gap
-	}
-	var out []*Entry
-	var prev ID
-	for seq := uint64(1); ; seq++ {
-		if l.fork != nil && seq >= min(l.fork.A.Seq, l.fork.B.Seq) {
-			return out
-		}
-		e := l.one(seq)
-		if e == nil || (seq > 1 && e.Prev != prev) {
-			return out
-		}
-		out = append(out, e)
-		prev = e.id
+		l.low--
 	}
 }
 
-// Head returns the last entry the app may see, or nil.
-func (l *Log) Head() *Entry {
-	es := l.Entries()
-	if len(es) == 0 {
-		return nil
+// cut applies a removal's cutoff, or with removed false lifts one: the
+// removal stopped counting.
+func (l *Log) cut(removed bool, seq uint64, head ID, gone *[]*Entry) {
+	if l.removed == removed && (!removed || (l.cutSeq == seq && l.cutHead == head)) {
+		return
 	}
-	return es[len(es)-1]
-}
-
-// cut applies a removal's cutoff and returns the entries that were visible
-// and no longer are, for the app to withdraw.
-func (l *Log) cut(seq uint64, head ID) []*Entry {
-	if l.removed && l.cutSeq == seq && l.cutHead == head {
-		return nil
+	if !removed {
+		// The author is a member again; what past the cutoff was dropped,
+		// sync fills in again.
+		l.removed, l.cutSeq, l.cutHead, l.low = false, 0, ID{}, 0
+		l.retop(l.top + 1)
+		return
 	}
-	before := l.Entries()
 	l.removed, l.cutSeq, l.cutHead, l.fork = true, seq, head, nil
-	// Keep only what is anchored to the head: the chain from it down, as
-	// far as held entries link.
-	keep := map[ID]bool{}
+	for s, e := range l.bySeq {
+		if s > seq || (s == seq && e.id != head) {
+			l.drop(s, gone)
+		}
+	}
+	l.retop(seq + 1)
 	l.low = seq + 1
-	for e := l.entries[head]; e != nil && seq > 0; e = l.entries[e.Prev] {
-		keep[e.id] = true
-		l.low = e.Seq
-		if e.Seq == 1 {
-			break
-		}
+	if seq > 0 && l.bySeq[seq] != nil {
+		l.low = seq
+		l.anchorDown(gone)
 	}
-	for id, e := range l.entries {
-		if !keep[id] {
-			delete(l.entries, id)
-			l.bySeq[e.Seq] = slices.DeleteFunc(l.bySeq[e.Seq], func(x ID) bool { return x == id })
-		}
-	}
-	after := map[ID]bool{}
-	for _, e := range l.Entries() {
-		after[e.id] = true
-	}
-	var gone []*Entry
-	for _, e := range before {
-		if !after[e.id] {
-			gone = append(gone, e)
-		}
-	}
-	return gone
 }
 
 // Set is every author's log in one group, checked against the roster.
 type Set struct {
 	group roster.ID
 	logs  map[keys.PublicKey]*Log
+	gone  []*Entry
+
+	// Facts from the last fold seen, which every Add asks.
+	fold     *roster.Result
+	epochs   map[roster.ID]bool             // counting key-making ops
+	lastRole map[keys.PublicKey]roster.Role // each key's last counting role
+	cutoffs  map[keys.PublicKey]cutoff      // each removed key's cutoff
+}
+
+type cutoff struct {
+	seq  uint64
+	head ID
 }
 
 // NewSet makes the logs of group.
@@ -213,33 +243,81 @@ func NewSet(group roster.ID) *Set {
 // Log returns author's log, or nil.
 func (s *Set) Log(author keys.PublicKey) *Log { return s.logs[author] }
 
-// Update applies the roster: a counting removal sets its author's cutoff
-// from the head its remover recorded. It returns the entries withdrawn.
-func (s *Set) Update(r *roster.Roster, f *roster.Result) []*Entry {
-	var gone []*Entry
-	for author, l := range s.logs {
-		if rid, ok := f.Removed[author]; ok {
-			rm := r.Op(rid)
-			gone = append(gone, l.cut(rm.LogSeq, ID(rm.LogHead))...)
-		}
-	}
-	return gone
+// Withdrawn returns, and forgets, the entries the app had been shown and
+// should withdraw: past a removal's cutoff, off its head's chain, or at or
+// past a fork point.
+func (s *Set) Withdrawn() []*Entry {
+	g := s.gone
+	s.gone = nil
+	return g
 }
 
-// Add checks e against the roster and its author's log and stores it. It
-// reports whether e was new.
-func (s *Set) Add(e *Entry, r *roster.Roster, f *roster.Result) (bool, error) {
-	if e.Group != s.group || r.Group() != s.group {
-		return false, ErrWrongGroup
+// learn caches what Add needs from fold f.
+func (s *Set) learn(f *roster.Result) {
+	if s.fold == f {
+		return
 	}
-	switch f.Roles[e.Author] {
-	case roster.Member, roster.Admin, roster.Owner:
-	default:
-		if _, removed := f.Removed[e.Author]; !removed {
-			return false, ErrNotWriter // never admitted, or a mirror
+	s.fold = f
+	s.epochs = map[roster.ID]bool{}
+	s.lastRole = map[keys.PublicKey]roster.Role{}
+	s.cutoffs = map[keys.PublicKey]cutoff{}
+	removing := map[roster.ID]bool{}
+	for _, rid := range f.Removed {
+		removing[rid] = true
+	}
+	for _, o := range f.Order {
+		if !f.Counts[o.ID()] {
+			continue
+		}
+		switch o.Kind {
+		case roster.Genesis:
+			s.epochs[o.ID()] = true
+			s.lastRole[o.Author] = roster.Owner
+		case roster.Rekey:
+			s.epochs[o.ID()] = true
+		case roster.Remove:
+			s.epochs[o.ID()] = true
+			if removing[o.ID()] {
+				s.cutoffs[o.Target] = cutoff{seq: o.LogSeq, head: ID(o.LogHead)}
+			}
+		case roster.Add, roster.SetRole:
+			s.lastRole[o.Target] = o.Role
 		}
 	}
-	if ep := r.Op(e.Epoch); ep == nil || (ep.Kind != roster.Genesis && ep.Kind != roster.Remove && ep.Kind != roster.Rekey) {
+}
+
+// apply brings author's log in line with the roster: cut by its counting
+// removal, or uncut if that removal no longer counts.
+func (s *Set) apply(author keys.PublicKey, l *Log) {
+	c, removed := s.cutoffs[author]
+	l.cut(removed, c.seq, c.head, &s.gone)
+}
+
+// Update applies a new fold of the roster to every log; entries leaving
+// the app's view collect for Withdrawn.
+func (s *Set) Update(f *roster.Result) {
+	s.learn(f)
+	for author, l := range s.logs {
+		s.apply(author, l)
+	}
+}
+
+// Add checks e against the roster fold f and its author's log, and stores
+// it. It reports whether e was new; entries leaving the app's view collect
+// for Withdrawn.
+func (s *Set) Add(e *Entry, f *roster.Result) (bool, error) {
+	if e.Group != s.group {
+		return false, ErrWrongGroup
+	}
+	s.learn(f)
+	_, removed := s.cutoffs[e.Author]
+	switch role := f.Roles[e.Author]; {
+	case role == roster.Member || role == roster.Admin || role == roster.Owner:
+	case removed && s.lastRole[e.Author] != roster.Mirror:
+	default:
+		return false, ErrNotWriter // never admitted, or a mirror
+	}
+	if !s.epochs[e.Epoch] {
 		return false, ErrUnknownEpoch
 	}
 	l := s.logs[e.Author]
@@ -247,9 +325,6 @@ func (s *Set) Add(e *Entry, r *roster.Roster, f *roster.Result) (bool, error) {
 		l = newLog(e.Author)
 		s.logs[e.Author] = l
 	}
-	if rid, removed := f.Removed[e.Author]; removed && !l.removed {
-		rm := r.Op(rid)
-		l.cut(rm.LogSeq, ID(rm.LogHead))
-	}
-	return l.add(e)
+	s.apply(e.Author, l)
+	return l.add(e, &s.gone)
 }

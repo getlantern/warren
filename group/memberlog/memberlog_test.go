@@ -132,7 +132,7 @@ func TestChainInAnyOrder(t *testing.T) {
 	s := NewSet(x.r.Group())
 	f := x.fold(t)
 	for _, i := range []int{2, 0, 3, 1} {
-		if _, err := s.Add(es[i], x.r, f); err != nil {
+		if _, err := s.Add(es[i], f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -140,7 +140,7 @@ func TestChainInAnyOrder(t *testing.T) {
 	if len(got) != 4 || got[3].ID() != es[3].ID() {
 		t.Fatalf("got %d entries", len(got))
 	}
-	if fresh, err := s.Add(es[1], x.r, f); fresh || err != nil {
+	if fresh, err := s.Add(es[1], f); fresh || err != nil {
 		t.Fatalf("a duplicate: %v %v", fresh, err)
 	}
 }
@@ -151,7 +151,7 @@ func TestGapHidesLaterEntries(t *testing.T) {
 	s := NewSet(x.r.Group())
 	f := x.fold(t)
 	for _, e := range []*Entry{es[0], es[2]} {
-		if _, err := s.Add(e, x.r, f); err != nil {
+		if _, err := s.Add(e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -173,11 +173,11 @@ func TestForks(t *testing.T) {
 	f := x.fold(t)
 	s := NewSet(g)
 	for _, e := range []*Entry{a1, a2} {
-		if _, err := s.Add(e, x.r, f); err != nil {
+		if _, err := s.Add(e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.Add(b2, x.r, f); !errors.Is(err, ErrForked) {
+	if _, err := s.Add(b2, f); !errors.Is(err, ErrForked) {
 		t.Fatalf("two entries at one sequence number: %v", err)
 	}
 	l := s.Log(x.member.Public())
@@ -188,16 +188,16 @@ func TestForks(t *testing.T) {
 		t.Fatal("the forked sequence number is still visible")
 	}
 	a3, _ := Write(x.member, g, a2, ep, key, App, []byte("a3"))
-	if _, err := s.Add(a3, x.r, f); !errors.Is(err, ErrForked) {
+	if _, err := s.Add(a3, f); !errors.Is(err, ErrForked) {
 		t.Fatalf("a forked log accepted more: %v", err)
 	}
 
 	// An entry whose prev contradicts the held chain is also a fork.
 	s2 := NewSet(g)
-	if _, err := s2.Add(a1, x.r, f); err != nil {
+	if _, err := s2.Add(a1, f); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s2.Add(c2, x.r, f); !errors.Is(err, ErrForked) {
+	if _, err := s2.Add(c2, f); !errors.Is(err, ErrForked) {
 		t.Fatalf("an entry chained to another history: %v", err)
 	}
 }
@@ -211,19 +211,19 @@ func TestRosterChecks(t *testing.T) {
 
 	stranger := me(9)
 	e, _ := Write(stranger, g, nil, ep, key, App, nil)
-	if _, err := s.Add(e, x.r, f); !errors.Is(err, ErrNotWriter) {
+	if _, err := s.Add(e, f); !errors.Is(err, ErrNotWriter) {
 		t.Fatalf("a stranger: %v", err)
 	}
 	e, _ = Write(x.mirror, g, nil, ep, key, App, nil)
-	if _, err := s.Add(e, x.r, f); !errors.Is(err, ErrNotWriter) {
+	if _, err := s.Add(e, f); !errors.Is(err, ErrNotWriter) {
 		t.Fatalf("a mirror: %v", err)
 	}
 	e, _ = Write(x.member, g, nil, roster.ID{7}, key, App, nil)
-	if _, err := s.Add(e, x.r, f); !errors.Is(err, ErrUnknownEpoch) {
+	if _, err := s.Add(e, f); !errors.Is(err, ErrUnknownEpoch) {
 		t.Fatalf("an unknown epoch: %v", err)
 	}
 	e, _ = Write(x.member, roster.ID{8}, nil, ep, key, App, nil)
-	if _, err := s.Add(e, x.r, f); !errors.Is(err, ErrWrongGroup) {
+	if _, err := s.Add(e, f); !errors.Is(err, ErrWrongGroup) {
 		t.Fatalf("another group: %v", err)
 	}
 }
@@ -235,7 +235,7 @@ func TestRemovalCutoff(t *testing.T) {
 	s := NewSet(g)
 	f := x.fold(t)
 	for _, e := range es {
-		if _, err := s.Add(e, x.r, f); err != nil {
+		if _, err := s.Add(e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -244,7 +244,8 @@ func TestRemovalCutoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	f = x.fold(t)
-	gone := s.Update(x.r, f)
+	s.Update(f)
+	gone := s.Withdrawn()
 	if len(gone) != 2 || gone[0].Seq < 4 || gone[1].Seq < 4 {
 		t.Fatalf("withdrew %d entries", len(gone))
 	}
@@ -252,7 +253,7 @@ func TestRemovalCutoff(t *testing.T) {
 	if got := l.Entries(); len(got) != 3 || got[2].ID() != es[2].ID() {
 		t.Fatalf("%d entries after the cutoff", len(got))
 	}
-	if _, err := s.Add(es[4], x.r, f); !errors.Is(err, ErrPastCutoff) {
+	if _, err := s.Add(es[4], f); !errors.Is(err, ErrPastCutoff) {
 		t.Fatalf("an entry past the cutoff: %v", err)
 	}
 
@@ -266,12 +267,12 @@ func TestRemovalCutoff(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Add(forged, x.r, f); !errors.Is(err, ErrOffChain) {
+		if _, err := s.Add(forged, f); !errors.Is(err, ErrOffChain) {
 			t.Fatalf("a removed author's other history below the cutoff: %v", err)
 		}
 	}
-	if got := l.Entries(); len(got) != 3 || got[1].ID() != es[1].ID() || l.Fork() != nil || len(l.entries) != 3 {
-		t.Fatalf("the forged history was kept: %d held", len(l.entries))
+	if got := l.Entries(); len(got) != 3 || got[1].ID() != es[1].ID() || l.Fork() != nil || len(l.bySeq) != 3 {
+		t.Fatalf("the forged history was kept: %d held", len(l.bySeq))
 	}
 }
 
@@ -286,14 +287,14 @@ func TestRemovedLogFillsFromTheHead(t *testing.T) {
 	}
 	f := x.fold(t)
 	s := NewSet(x.r.Group())
-	if _, err := s.Add(es[0], x.r, f); !errors.Is(err, ErrOffChain) {
+	if _, err := s.Add(es[0], f); !errors.Is(err, ErrOffChain) {
 		t.Fatalf("entry 1 before the head: %v", err)
 	}
-	if _, err := s.Add(es[3], x.r, f); !errors.Is(err, ErrPastCutoff) {
+	if _, err := s.Add(es[3], f); !errors.Is(err, ErrPastCutoff) {
 		t.Fatalf("entry 4, past the head: %v", err)
 	}
 	for _, i := range []int{2, 1, 0} {
-		if _, err := s.Add(es[i], x.r, f); err != nil {
+		if _, err := s.Add(es[i], f); err != nil {
 			t.Fatalf("entry %d, top-down: %v", i+1, err)
 		}
 	}
@@ -310,11 +311,186 @@ func TestRemovalBeforeAnyEntrySeen(t *testing.T) {
 	}
 	f := x.fold(t)
 	s := NewSet(x.r.Group())
-	if _, err := s.Add(es[0], x.r, f); !errors.Is(err, ErrPastCutoff) {
+	if _, err := s.Add(es[0], f); !errors.Is(err, ErrPastCutoff) {
 		t.Fatalf("an entry from a member removed before any was seen: %v", err)
 	}
-	if s.Log(x.member.Public()).Entries() != nil {
+	if l := s.Log(x.member.Public()); l != nil && len(l.Entries()) != 0 {
 		t.Fatal("entries visible")
 	}
 }
 
+// TestLaggingMemberKeepsEntries: a member that holds a removed author's
+// early entries but not the recorded head keeps showing them, and drops
+// one only when the head's chain contradicts it.
+func TestLaggingMemberKeepsEntries(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 3)
+	s := NewSet(x.r.Group())
+	f := x.fold(t)
+	for _, e := range es[:2] {
+		if _, err := s.Add(e, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.member.Public(), 3, es[2].ID()); err != nil {
+		t.Fatal(err)
+	}
+	f = x.fold(t)
+	s.Update(f)
+	l := s.Log(x.member.Public())
+	if len(s.Withdrawn()) != 0 || len(l.Entries()) != 2 {
+		t.Fatalf("a lagging member lost entries on the head's chain: %d left", len(l.Entries()))
+	}
+	if _, err := s.Add(es[2], f); err != nil {
+		t.Fatal(err)
+	}
+	if len(l.Entries()) != 3 || l.low != 1 {
+		t.Fatalf("the head didn't anchor the held chain: %d visible, low %d", len(l.Entries()), l.low)
+	}
+}
+
+// TestHeadEvictsContradictedEntry: when the head's chain names a different
+// entry than one held, the held one is withdrawn and reported.
+func TestHeadEvictsContradictedEntry(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	a1, _ := Write(x.member, g, nil, ep, key, App, []byte("a1"))
+	a2, _ := Write(x.member, g, a1, ep, key, App, []byte("a2"))
+	b2, _ := Write(x.member, g, a1, ep, key, App, []byte("b2"))
+	b3, _ := Write(x.member, g, b2, ep, key, App, []byte("b3"))
+	s := NewSet(g)
+	f := x.fold(t)
+	for _, e := range []*Entry{a1, a2} {
+		if _, err := s.Add(e, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The remover had seen the b branch.
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.member.Public(), 3, b3.ID()); err != nil {
+		t.Fatal(err)
+	}
+	f = x.fold(t)
+	if _, err := s.Add(b3, f); err != nil { // Add applies the removal itself
+		t.Fatal(err)
+	}
+	gone := s.Withdrawn()
+	if len(gone) != 1 || gone[0].ID() != a2.ID() {
+		t.Fatalf("withdrew %d entries", len(gone))
+	}
+	if _, err := s.Add(b2, f); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Log(x.member.Public()).Entries(); len(got) != 3 || got[1].ID() != b2.ID() {
+		t.Fatalf("%d entries visible", len(got))
+	}
+}
+
+// TestRemovalThatStopsCounting: a log cut by a removal is a member's log
+// again once that removal no longer counts.
+func TestRemovalThatStopsCounting(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 3)
+	s := NewSet(x.r.Group())
+	f := x.fold(t)
+	for _, e := range es {
+		if _, err := s.Add(e, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A removal written in a copy where the admin hasn't seen its own
+	// demotion: in the merged roster it doesn't count.
+	stale, err := roster.New(x.r.Op(x.r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range f.Order[1:] {
+		if _, err := stale.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).SetRole(x.admin.Public(), roster.Member); err != nil {
+		t.Fatal(err)
+	}
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.member.Public(), 1, es[0].ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First a member sees only the removal.
+	if _, err := stale.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	sf, _ := stale.Fold()
+	s.Update(sf)
+	if len(s.Log(x.member.Public()).Entries()) != 1 {
+		t.Fatal("setup: the removal should cut the log")
+	}
+	// Then the demotion, which sorts first, so the removal stops counting.
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	f = x.fold(t)
+	if f.Counts[rm.ID()] {
+		t.Fatal("setup: the removal should no longer count")
+	}
+	s.Update(f)
+	for _, e := range es[1:] {
+		if _, err := s.Add(e, f); err != nil {
+			t.Fatalf("an entry from a member no longer removed: %v", err)
+		}
+	}
+	if len(s.Log(x.member.Public()).Entries()) != 3 {
+		t.Fatal("the log wasn't restored")
+	}
+}
+
+func TestEpochMustCount(t *testing.T) {
+	x := newFixture(t)
+	s := NewSet(x.r.Group())
+	// A rekey by a member doesn't count; an entry under it is refused.
+	rk := &roster.Op{Group: x.r.Group(), Kind: roster.Rekey, Parents: x.r.Heads(), CommitSecret: [32]byte{1}, CommitEpoch: [32]byte{2}}
+	for _, p := range rk.Parents {
+		rk.Lamport = max(rk.Lamport, x.r.Op(p).Lamport)
+	}
+	rk.Lamport++
+	rk.Sign(x.member)
+	if _, err := x.r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	f := x.fold(t)
+	e, _ := Write(x.member, x.r.Group(), nil, rk.ID(), keys.EpochKey{3}, App, nil)
+	if _, err := s.Add(e, f); !errors.Is(err, ErrUnknownEpoch) {
+		t.Fatalf("an entry under a non-counting rekey: %v", err)
+	}
+}
+
+func TestRemovedMirrorStillNoWriter(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.mirror.Public(), 1, [32]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	f := x.fold(t)
+	e, _ := Write(x.mirror, x.r.Group(), nil, ep, key, App, nil)
+	if _, err := NewSet(x.r.Group()).Add(e, f); !errors.Is(err, ErrNotWriter) {
+		t.Fatalf("a removed mirror: %v", err)
+	}
+}
+
+func TestWindow(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	f := x.fold(t)
+	first, _ := Write(x.member, x.r.Group(), nil, ep, key, App, nil)
+	far := first
+	for range Window + 1 {
+		far, _ = Write(x.member, x.r.Group(), far, ep, key, App, nil)
+	}
+	s := NewSet(x.r.Group())
+	if _, err := s.Add(far, f); !errors.Is(err, ErrTooFar) {
+		t.Fatalf("an entry %d past an empty log: %v", far.Seq, err)
+	}
+	if _, err := s.Add(first, f); err != nil {
+		t.Fatal(err)
+	}
+}
