@@ -14,6 +14,13 @@ import (
 	"github.com/getlantern/warren/group/keys"
 )
 
+const (
+	// MaxName bounds a group's or member's display name, in bytes.
+	MaxName = 256
+	// MaxShards bounds the directory's shard count.
+	MaxShards = 1 << 16
+)
+
 // ID names an operation: the SHA-256 of its signed encoding. Since the
 // encoding includes the parents' IDs, an ID commits to the operation's
 // whole history. A key-making operation's ID also names the group secret
@@ -74,9 +81,9 @@ func (k Kind) needsAdmin() bool {
 
 // Seal is a box of keys sealed to one member key. Holds lists, in the
 // clear, which keys the box carries, so other members can tell what the
-// recipient holds without opening it; the recipient checks every key it
-// opens against its maker's commitment, so a false list only costs a
-// redundant delivery.
+// recipient holds without opening it. Only the recipient can check it, so
+// a sender trusts only the lists of the owner, admins and itself (see
+// Writer.Deliver).
 type Seal struct {
 	To    keys.PublicKey
 	Box   []byte
@@ -278,11 +285,11 @@ func Decode(b []byte) (*Op, error) {
 			ok = good && n <= int64(Owner)
 			o.Role = Role(n)
 		case "n":
-			ok = val.Kind == bencode.String && len(val.Str) <= 256
+			ok = val.Kind == bencode.String && len(val.Str) <= MaxName
 			o.Name = string(val.Str)
 		case "s":
 			n, good := nonneg(val)
-			ok = good && n <= 1<<16
+			ok = good && n <= MaxShards
 			o.Shards = uint32(n)
 		case "hs":
 			n, good := nonneg(val)
@@ -338,14 +345,28 @@ func Decode(b []byte) (*Op, error) {
 		len(slices.Compact(slices.Clone(o.Parents))) != len(o.Parents) {
 		return nil, ErrMalformed
 	}
-	if !slices.IsSortedFunc(o.Seals, func(a, b Seal) int { return bytes.Compare(a.To[:], b.To[:]) }) {
-		return nil, ErrMalformed
+	for i := 1; i < len(o.Seals); i++ {
+		if bytes.Compare(o.Seals[i-1].To[:], o.Seals[i].To[:]) >= 0 {
+			return nil, ErrMalformed // unsorted, or two seals to one key
+		}
 	}
 	if err := o.Author.Valid(); err != nil {
 		return nil, ErrMalformed
 	}
+	// A kind with a target must carry a usable one, and others none: a
+	// missing target must never count as a key on the roster.
 	var zero keys.PublicKey
-	if o.Target != zero && o.Target.Valid() != nil {
+	switch o.Kind {
+	case Add, Remove, Deliver, SetRole:
+		if o.Target.Valid() != nil {
+			return nil, ErrMalformed
+		}
+	default:
+		if o.Target != zero {
+			return nil, ErrMalformed
+		}
+	}
+	if (o.Kind == Invite || o.Invite != zero) && o.Invite.Valid() != nil {
 		return nil, ErrMalformed
 	}
 	if !o.Author.Verify(o.signed(), o.Sig) {

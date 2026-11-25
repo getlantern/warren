@@ -96,8 +96,8 @@ func translate(t *testing.T, u m.Store) *translation {
 	tr := &translation{real: map[m.ID]ID{}, model: map[ID]m.ID{}, secrets: map[ID]keys.Secret{}, epochs: map[ID]keys.EpochKey{}}
 	for _, mo := range f.Order {
 		o := &Op{Kind: kindOf[mo.Kind], Lamport: mo.Lamport, Role: roleOf[mo.Role]}
-		if mo.Target != 0 {
-			o.Target = ident(mo.Target).Public()
+		if mo.Target != 0 && mo.Kind != m.Rekey && mo.Kind != m.Genesis {
+			o.Target = ident(mo.Target).Public() // a rekey takes no target
 		}
 		if tr.r != nil {
 			o.Group = tr.r.group

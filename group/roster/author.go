@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"math"
 	"slices"
 
 	"github.com/getlantern/warren/group/keys"
@@ -15,6 +16,9 @@ var ErrNotAllowed = errors.New("roster: operation not allowed")
 
 // Found starts a group founded by founder, its owner.
 func Found(founder *keys.Identity, name string, shards uint32) (*Roster, error) {
+	if len(name) > MaxName || shards == 0 || shards > MaxShards {
+		return nil, ErrNotAllowed
+	}
 	o := &Op{Kind: Genesis, Lamport: 1, Name: name, Shards: shards}
 	o.Author = founder.Public()
 	if err := freshKeys(o, map[keys.PublicKey]Role{o.Author: Owner}, keys.PublicKey{}); err != nil {
@@ -117,7 +121,7 @@ func (w *Writer) Add(target keys.PublicKey, name string, role Role, invite keys.
 	a := f.Roles[w.Me.Public()]
 	can := a == Owner || (a == Admin && role != Admin)
 	_, haveG := k.Secrets[f.Current]
-	if !can || (role != Member && role != Mirror && role != Admin) || target.Valid() != nil ||
+	if !can || (role != Member && role != Mirror && role != Admin) || target.Valid() != nil || len(name) > MaxName ||
 		f.Roles[target] != None || f.Removed[target] != (ID{}) || !haveG {
 		return nil, ErrNotAllowed
 	}
@@ -145,7 +149,7 @@ func (w *Writer) Remove(target keys.PublicKey, logSeq uint64, logHead [32]byte) 
 	}
 	a, t := f.Roles[w.Me.Public()], f.Roles[target]
 	can := a == Owner || (a == Admin && t != Admin)
-	if !can || t == None || t == Owner {
+	if !can || t == None || t == Owner || logSeq > math.MaxInt64 {
 		return nil, ErrNotAllowed
 	}
 	o := w.base(Remove)
@@ -185,7 +189,7 @@ func (w *Writer) Deliver(target keys.PublicKey, invite keys.PublicKey) (*Op, err
 	if f.Roles[w.Me.Public()] == None || t == None || target == w.Me.Public() {
 		return nil, ErrNotAllowed
 	}
-	has := w.holdings(target)
+	has := w.holdings(f, target)
 	var es []entry
 	if g, ok := k.Secrets[f.Current]; ok && !has[f.Current].secret {
 		es = append(es, entry{made: f.Current, secret: true, key: g})
@@ -210,11 +214,19 @@ func (w *Writer) Deliver(target keys.PublicKey, invite keys.PublicKey) (*Op, err
 
 type held struct{ secret, epoch bool }
 
-// holdings is what target holds as far as the roster's seals say, by the
-// operation that made each key.
-func (w *Writer) holdings(target keys.PublicKey) map[ID]held {
+// holdings is what target holds as far as trusted seals say, by the
+// operation that made each key. A seal's key list isn't checked by anyone
+// but its recipient, so a member could list keys it never sealed and stop
+// others delivering them; only lists in counting operations by the owner
+// or an admin (trusted with membership anyway), or by this writer, count.
+func (w *Writer) holdings(f *Result, target keys.PublicKey) map[ID]held {
 	h := map[ID]held{}
 	for _, o := range w.R.ops {
+		trusted := o.Author == w.Me.Public() ||
+			(f.Counts[o.id] && (f.Roles[o.Author] == Owner || f.Roles[o.Author] == Admin))
+		if !trusted {
+			continue
+		}
 		for _, s := range o.Seals {
 			if s.To != target {
 				continue

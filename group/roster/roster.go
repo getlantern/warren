@@ -16,13 +16,17 @@ var (
 	// ErrMissingParent means an operation arrived before a parent: a roster
 	// is causally closed, so the caller adds the parent first.
 	ErrMissingParent = errors.New("roster: missing parent")
+	// ErrLamport means an operation's Lamport clock isn't one more than its
+	// parents' greatest.
+	ErrLamport = errors.New("roster: Lamport clock doesn't follow its parents")
 	// ErrNoFixpoint means the view rules never settle on these operations.
 	ErrNoFixpoint = errors.New("roster: view rule has no fixpoint")
 )
 
 // Roster is a causally closed set of verified operations of one group.
 // Members exchange operations by gossip and fold them; every member holding
-// the same operations folds the same roster.
+// the same operations folds the same roster. A Roster caches as it folds,
+// so it isn't safe for concurrent use, even of Fold.
 type Roster struct {
 	group ID
 	ops   map[ID]*Op
@@ -41,7 +45,7 @@ type view struct {
 
 // New starts a roster from a genesis operation.
 func New(genesis *Op) (*Roster, error) {
-	if genesis.Kind != Genesis || len(genesis.Parents) != 0 {
+	if genesis.Kind != Genesis || len(genesis.Parents) != 0 || genesis.Lamport != 1 {
 		return nil, ErrMalformed
 	}
 	r := &Roster{group: genesis.id, ops: map[ID]*Op{}, hist: map[ID]map[ID]bool{}, views: map[ID]*view{}}
@@ -73,10 +77,18 @@ func (r *Roster) Add(o *Op) (bool, error) {
 	if len(o.Parents) == 0 {
 		return false, ErrMalformed
 	}
+	var clock uint64
 	for _, p := range o.Parents {
 		if r.ops[p] == nil {
 			return false, ErrMissingParent
 		}
+		clock = max(clock, r.ops[p].Lamport)
+	}
+	// Exactly one more than the parents' greatest, as every honest writer
+	// sets it: an author can't choose its place in the total order by its
+	// clock, nor push the clock toward overflow.
+	if o.Lamport != clock+1 {
+		return false, ErrLamport
 	}
 	r.ops[o.id] = o
 	return true, nil
@@ -101,10 +113,14 @@ func (r *Roster) Heads() []ID {
 	return hs
 }
 
-// History returns id's strict causal ancestors.
+// History returns id's strict causal ancestors, or nil if the roster
+// doesn't hold id.
 func (r *Roster) History(id ID) map[ID]bool {
 	if h := r.hist[id]; h != nil {
 		return h
+	}
+	if r.ops[id] == nil {
+		return nil
 	}
 	h := map[ID]bool{}
 	stack := slices.Clone(r.ops[id].Parents)

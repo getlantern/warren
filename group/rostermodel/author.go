@@ -179,8 +179,9 @@ func withheldFrom(s Store, rules Rules, target Key) map[ID]bool {
 }
 
 // AuthorBackdated writes an operation by a removed or demoted author with
-// parents from before it saw that, so it looks concurrent with it, and a
-// low Lamport clock, so it sorts early. It seals whatever the author holds.
+// parents from before it saw that, so it looks concurrent with it. Its
+// Lamport clock follows its parents, as a roster requires of every
+// operation. It seals whatever the author holds.
 // It returns nil unless s holds a remove or demotion of author.
 func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
 	// The counting operation that took the author's authority: its removal,
@@ -205,7 +206,7 @@ func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
 	if len(pre) == len(s) {
 		return nil
 	}
-	o := newOp(s, kind, author, target, role, pre.Heads(), 1)
+	o := newOp(s, kind, author, target, role, pre.Heads(), 0)
 	o.Backdated = true
 	epochs, gs := held(pre, author)
 	switch kind {

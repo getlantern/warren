@@ -152,7 +152,9 @@ The roster is a set of operations signed by member keys, kept by members
 - `deliver` (the current `G`, and for a member but not a mirror any epoch
   keys it lacks, sealed to one member already added) by any member. Every
   seal also lists, in the clear, which keys its box carries (each by the
-  operation that made it), so a sender can tell what a member lacks. A
+  operation that made it), so a sender can tell what a member lacks; a
+  sender trusts only the lists of counting operations by the owner or an
+  admin, and its own, since a member could list keys it never sealed. A
   `deliver` grants no rights, and only fills in keys a member missed
   (*Removal*). The
   recipient checks each key against the commitment of the operation that
@@ -166,7 +168,9 @@ The roster is a set of operations signed by member keys, kept by members
   those keys.
 
 Every operation names the genesis's hash, which is the group's ID, and
-carries a Lamport clock and its causal parents (the hashes of the latest
+carries a Lamport clock, exactly one more than its parents' greatest (so an
+author can't pick its place in the order by its clock), and its causal
+parents (the hashes of the latest
 operations the author had seen). Folding is deterministic:
 
 - operations apply in one **total order** every member computes alike: a

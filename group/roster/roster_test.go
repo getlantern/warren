@@ -263,3 +263,114 @@ func TestKeyringChecksCommitments(t *testing.T) {
 		t.Fatal("a key not matching its commitment was accepted")
 	}
 }
+
+func TestLamportMustFollowParents(t *testing.T) {
+	r, owner, _, _ := group(t)
+	for _, delta := range []int64{-1, 0, 2, 1 << 40} {
+		o := (&Writer{R: r, Me: owner}).base(Rekey)
+		o.Lamport = uint64(int64(o.Lamport) + delta - 1)
+		o.Sign(owner)
+		if _, err := r.Add(o); !errors.Is(err, ErrLamport) {
+			t.Fatalf("clock off by %d: %v", delta-1, err)
+		}
+	}
+	g := r.Op(r.Group())
+	bad := *g
+	bad.Lamport = 2
+	bad.Sign(owner)
+	if _, err := New(&bad); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a genesis with clock 2: %v", err)
+	}
+}
+
+// TestLyingHoldsDontStarve: a member's seal claiming the recipient already
+// holds a key it never got doesn't stop an admin delivering it.
+func TestLyingHoldsDontStarve(t *testing.T) {
+	r, owner, admin, member := group(t)
+	// The owner rekeys in a copy that hasn't seen the member's add, so the
+	// member misses the new keys.
+	stale, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.ops {
+		if o.Kind == Add && o.Target == admin.Public() {
+			if _, err := stale.Add(o); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rk, err := (&Writer{R: stale, Me: owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	// The member lies that it already holds the rekey's keys, so nobody
+	// delivers them.
+	lie := (&Writer{R: r, Me: member}).base(Deliver)
+	lie.Target = member.Public()
+	if err := seal(lie, member.Public(), nil); err != nil {
+		t.Fatal(err)
+	}
+	lie.Seals[0].Holds = []KeyRef{{Made: rk.ID()}, {Made: rk.ID(), Secret: true}}
+	lie.Sign(member)
+	if _, err := r.Add(lie); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Keyring(member).Epochs[rk.ID()]; ok {
+		t.Fatal("setup: the member already holds the rekey's epoch key")
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Deliver(member.Public(), keys.PublicKey{}); err != nil {
+		t.Fatalf("the lie stopped the admin's deliver: %v", err)
+	}
+	if _, ok := r.Keyring(member).Epochs[rk.ID()]; !ok {
+		t.Fatal("the member still lacks the rekey's epoch key")
+	}
+}
+
+func TestDecodeChecksTargets(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	w := &Writer{R: r, Me: owner}
+	noTarget := w.base(Add)
+	noTarget.Role = Member
+	noTarget.Sign(owner)
+	if _, err := Decode(noTarget.Encode()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("an add with no target: %v", err)
+	}
+	rekeyWithTarget := w.base(Rekey)
+	rekeyWithTarget.Target = admin.Public()
+	rekeyWithTarget.Sign(owner)
+	if _, err := Decode(rekeyWithTarget.Encode()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a rekey with a target: %v", err)
+	}
+	twice := w.base(Deliver)
+	twice.Target = admin.Public()
+	for range 2 {
+		if err := seal(twice, admin.Public(), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	twice.Sign(owner)
+	if _, err := Decode(twice.Encode()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("two seals to one key: %v", err)
+	}
+}
+
+func TestWritersStayDecodable(t *testing.T) {
+	long := string(bytes.Repeat([]byte("x"), MaxName+1))
+	if _, err := Found(me(1), long, 3); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("a long group name: %v", err)
+	}
+	if _, err := Found(me(1), "g", MaxShards+1); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("too many shards: %v", err)
+	}
+	r, owner, _, _ := group(t)
+	if _, err := (&Writer{R: r, Me: owner}).Add(me(7).Public(), long, Member, keys.PublicKey{}); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("a long display name: %v", err)
+	}
+	if r.History(ID{9}) != nil {
+		t.Fatal("History of an unknown op isn't nil")
+	}
+}
