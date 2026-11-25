@@ -275,7 +275,8 @@ func Fold(s Store) (*Result, error) {
 						if hist[o.ID] == nil {
 							hist[o.ID] = s.History(o.ID)
 						}
-						if p.Role == Admin && hist[p.ID][d.ID] && hist[o.ID][p.ID] && mutation != "demotions never restored" {
+						seen := hist[o.ID][p.ID] || mutation == "restores need not be seen"
+						if p.Role == Admin && hist[p.ID][d.ID] && seen && mutation != "demotions never restored" {
 							restored = true
 						}
 					}

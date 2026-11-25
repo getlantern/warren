@@ -119,7 +119,7 @@ func actions(w world, rules Rules) []action {
 				op(r, Add, N, Admin, false)
 				// Promote or demote each, whichever its role allows, so
 				// demote-then-promote chains get explored.
-				for _, k := range []Key{A, B, M} {
+				for _, k := range []Key{A, B, M, N} {
 					switch f.Roles[k] {
 					case Admin:
 						op(r, SetRole, k, Member, false)
@@ -259,7 +259,10 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 		}
 	}
 	for _, o := range f.Order {
-		if o.Backdated && f.Counts[o.ID] && (f.Removed[o.Author] != 0 || (demoted(f, o.Author) && needsAdmin(o))) {
+		// A backdated op was written after its author lost its authority,
+		// so it may count only at member level (a deliver by a demoted
+		// admin), even if the author has been promoted again since.
+		if o.Backdated && f.Counts[o.ID] && (f.Removed[o.Author] != 0 || needsAdmin(o)) {
 			return fmt.Errorf("backdated %v by removed or demoted %v counts", o.Kind, o.Author)
 		}
 	}
@@ -299,8 +302,8 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 	if f, err = Fold(r); err != nil {
 		return fmt.Errorf("after recovery: %w", err)
 	}
-	if le, lg := r.HoldingsExcept(memberLeak(f)); leaked(f, le, lg) != "" {
-		leak := leaked(f, le, lg)
+	le, lg := r.HoldingsExcept(memberLeak(f))
+	if leak := leaked(f, le, lg); leak != "" {
 		return fmt.Errorf("after recovery, %s", leak)
 	}
 	// What members actually hold, including keys a malicious member handed
@@ -432,10 +435,8 @@ func explore(t *testing.T, rules Rules, pred func(Store, *Result) bool, depth in
 }
 
 // TestRosterModel model-checks the roster rules, with Removal step 3's
-// corrective-rekey condition as written. Honest concurrency can also put the
-// current keys on a mirror or on a key whose add didn't count, but only by a
-// key-maker that hadn't seen a removal, which then also sealed them to the
-// removed member, so the written condition fires.
+// corrective-rekey condition: the current keys reached a key the fold
+// doesn't keep, or the current epoch key reached a mirror.
 func TestRosterModel(t *testing.T) {
 	maxPasses = 0
 	states, failure := explore(t, Rules{}, docPredicate, *depth)
@@ -459,7 +460,7 @@ func TestMutations(t *testing.T) {
 		// stray delivery, so delivery's roster check only spares a rekey.
 		"members add", "members remove", "members rekey", "role changes count",
 		"admins set roles", "no demotion view rule", "unseen grants count",
-		"removers need not see demotions",
+		"removers need not see demotions", "restores need not be seen",
 	} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m
@@ -603,10 +604,21 @@ func TestFourPassChain(t *testing.T) {
 // while nobody removed holds it.
 func TestRemovedOnlyCondition(t *testing.T) {
 	_, failure := explore(t, Rules{}, removedPredicate, *depth)
-	if failure == "" {
-		t.Fatal("no counterexample found")
+	if !strings.Contains(failure, "off the roster") || !strings.Contains(failure, "as member;") {
+		t.Fatalf("want the demotion counterexample, got: %q", failure)
 	}
 	t.Logf("counterexample: %s", failure)
+}
+
+// TestDeliverOffRosterHealed checks delivery's roster check is defence in
+// depth: with senders delivering off the roster, the corrective rekey still
+// leaves no off-roster key holding the current keys.
+func TestDeliverOffRosterHealed(t *testing.T) {
+	mutation = "deliver off the roster"
+	defer func() { mutation = "" }()
+	if _, failure := explore(t, Rules{}, docPredicate, min(*depth, 3)); failure != "" {
+		t.Fatal(failure)
+	}
 }
 
 // TestNoCorrectiveRekey checks the corrective rekey is needed: without it,

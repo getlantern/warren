@@ -125,7 +125,7 @@ func Author(s Store, rules Rules, kind Kind, author, target Key, role Role) *Op 
 		}
 	case Deliver:
 		t := f.Roles[target]
-		if a == None || t == None {
+		if a == None || (t == None && mutation != "deliver off the roster") {
 			return nil
 		}
 		tEpochs, tGs := held(s, target)
