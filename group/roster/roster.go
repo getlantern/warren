@@ -82,6 +82,9 @@ func (r *Roster) Has(id ID) bool { return r.ops[id] != nil }
 // exactly what peers would accept, and the caller's later changes to o
 // can't reach it. It reports whether the operation was new.
 func (r *Roster) Add(o *Op) (bool, error) {
+	if h := r.ops[o.id]; h != nil && bytes.Equal(h.Encode(), o.Encode()) {
+		return false, nil // already held, byte for byte: gossip's common case
+	}
 	o, err := Decode(o.Encode())
 	if err != nil {
 		return false, err
@@ -331,9 +334,14 @@ func (r *Roster) fold() (*Result, error) {
 		res := r.apply(order, dropped)
 		res.Passes = pass
 		next := map[ID]bool{}
+		// These rules ask whether each of an author's ops is an ancestor of
+		// one remove or demotion: a different ancestor per question, which
+		// the descends memo can't reuse, so they walk that op's history
+		// once instead.
 		for k, rid := range res.Removed {
+			h := r.History(rid)
 			for _, o := range order {
-				if o.Author == k && o.id != rid && !r.descends(rid, o.id) {
+				if o.Author == k && o.id != rid && !h[o.id] {
 					next[o.id] = true
 				}
 			}
@@ -343,8 +351,9 @@ func (r *Roster) fold() (*Result, error) {
 				if d.Role != Member {
 					continue
 				}
+				h := r.History(d.id)
 				for _, o := range order {
-					if o.Author != k || !o.Kind.needsAdmin() || r.descends(d.id, o.id) {
+					if o.Author != k || !o.Kind.needsAdmin() || h[o.id] {
 						continue
 					}
 					restored := false

@@ -3,6 +3,7 @@ package roster
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -464,5 +465,49 @@ func TestFoldScales(t *testing.T) {
 		t.Fatalf("folding %d ops took %v", n, d)
 	} else {
 		t.Logf("folded %d ops in %v", len(f.Order), d)
+	}
+}
+
+// TestFoldScalesAfterRemoval: removing or demoting an author with a long
+// chain of ops folds in linear memory: the view rules ask a different
+// ancestor per op, which must not be memoized pairwise.
+func TestFoldScalesAfterRemoval(t *testing.T) {
+	for _, demote := range []bool{false, true} {
+		r, owner, admin, _ := group(t)
+		w := &Writer{R: r, Me: admin}
+		inv := me(8).Public()
+		const n = 3000
+		for i := range n {
+			o := w.base(Invite)
+			o.Invite, o.Expires = inv, int64(i+1)
+			o.Sign(admin)
+			if _, err := r.Add(o); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ow := &Writer{R: r, Me: owner}
+		var err error
+		if demote {
+			_, err = ow.SetRole(admin.Public(), Member)
+		} else {
+			_, err = ow.Remove(admin.Public(), 0, [32]byte{})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		start := time.Now()
+		if _, err := r.Fold(); err != nil {
+			t.Fatal(err)
+		}
+		d := time.Since(start)
+		runtime.ReadMemStats(&after)
+		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 200<<20 || d > 5*time.Second {
+			t.Fatalf("demote=%v: folding %d ops allocated %d MB in %v", demote, n, alloc>>20, d)
+		} else {
+			t.Logf("demote=%v: folded in %v, allocating %d MB", demote, d, alloc>>20)
+		}
 	}
 }

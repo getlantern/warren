@@ -138,7 +138,10 @@ func (o *Op) clone() *Op {
 	c := *o
 	c.Parents = slices.Clone(o.Parents)
 	c.Sig = slices.Clone(o.Sig)
-	c.Seals = make([]Seal, len(o.Seals))
+	c.Seals = nil
+	if o.Seals != nil {
+		c.Seals = make([]Seal, len(o.Seals))
+	}
 	for i, s := range o.Seals {
 		c.Seals[i] = Seal{To: s.To, Box: slices.Clone(s.Box), Holds: slices.Clone(s.Holds)}
 	}
