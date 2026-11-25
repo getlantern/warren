@@ -201,20 +201,23 @@ type Result struct {
 // checker notices.
 var mutation string
 
-// ErrNoFixpoint means the view rule never settled: whether an operation
-// counts kept flipping between passes.
+// ErrNoFixpoint means the view rule never settles: the passes cycle through
+// dropped sets, so whether an operation counts keeps flipping.
 var ErrNoFixpoint = errors.New("rostermodel: view rule has no fixpoint")
 
 // Fold folds the store: a total order (causal, then Lamport clock, then
 // hash), each operation checked when applied, and a removed author's
 // operations dropped unless the counting remove has them in its history.
 // The view rule can drop operations that earlier passes applied, so the
-// fold repeats until the dropped set is stable.
+// fold repeats until the dropped set is stable, or cycles.
 func Fold(s Store) (*Result, error) {
 	order := totalOrder(s)
 	hist := map[ID]map[ID]bool{}
 	dropped := map[ID]bool{}
-	for pass := 1; pass <= 8; pass++ {
+	// Each pass is a function of the dropped set, so the passes either
+	// settle or revisit a dropped set and cycle forever.
+	var tried []map[ID]bool
+	for pass := 1; ; pass++ {
 		r := apply(order, dropped)
 		r.Passes = pass
 		next := map[ID]bool{}
@@ -234,9 +237,12 @@ func Fold(s Store) (*Result, error) {
 		if equalSets(next, dropped) {
 			return r, nil
 		}
+		tried = append(tried, dropped)
+		if slices.ContainsFunc(tried, func(t map[ID]bool) bool { return equalSets(t, next) }) {
+			return nil, ErrNoFixpoint
+		}
 		dropped = next
 	}
-	return nil, ErrNoFixpoint
 }
 
 // admitted caches, per add, whether its author had already admitted the
