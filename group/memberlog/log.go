@@ -391,13 +391,32 @@ func (s *Set) apply(author keys.PublicKey, l *Log) {
 
 // Update applies a new fold of the roster to every log, and Add checks
 // against it from then on; entries leaving the app's view collect for
-// Withdrawn. Pass the newest fold: the Set follows the one given last.
-func (s *Set) Update(f *roster.Result) {
+// Withdrawn. Pass the newest fold: the Set follows the one given last. A
+// fold of another group is refused, leaving the Set as it was.
+func (s *Set) Update(f *roster.Result) error {
+	if !s.ours(f) {
+		return ErrWrongGroup
+	}
 	s.learn(f)
 	for author, l := range s.logs {
 		s.apply(author, l)
 		l.retop(1, &s.gone) // eligibility may have changed either way
+		if !l.removed {
+			l.trim() // what just left view is held ahead, within bounds
+		}
 	}
+	return nil
+}
+
+// ours reports whether f folds this Set's group: its genesis is the op
+// whose ID names the group.
+func (s *Set) ours(f *roster.Result) bool {
+	for _, o := range f.Order {
+		if o.Kind == roster.Genesis {
+			return o.ID() == s.group
+		}
+	}
+	return false
 }
 
 // Add checks e against the last fold given to Update and its author's log,
@@ -419,7 +438,11 @@ func (s *Set) Add(e *Entry) (bool, error) {
 	if !s.writer(e.Author) {
 		return false, ErrNotWriter // never admitted, or a mirror
 	}
-	if !s.epochs[e.Epoch] {
+	// A removed author's log is filled top-down from the recorded head, so
+	// an entry whose epoch stopped counting must still be taken to anchor
+	// the eligible ones below it; it stays hidden (eligible), and anchoring
+	// bounds what is held.
+	if _, removed := s.cutoffs[e.Author]; !removed && !s.epochs[e.Epoch] {
 		return false, ErrUnknownEpoch
 	}
 	l := s.logs[e.Author]

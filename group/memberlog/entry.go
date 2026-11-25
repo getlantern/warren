@@ -129,8 +129,8 @@ func Write(author *keys.Identity, group roster.ID, prev *Entry, epoch roster.ID,
 		if prev.Author != e.Author || prev.Group != group {
 			return nil, ErrMalformed
 		}
-		if prev.Seq >= math.MaxInt64 {
-			return nil, ErrMalformed // its successor couldn't be encoded
+		if prev.Seq == 0 || prev.Seq >= math.MaxInt64 {
+			return nil, ErrMalformed // not an entry, or its successor couldn't be encoded
 		}
 		e.Seq, e.Prev = prev.Seq+1, prev.id
 	}

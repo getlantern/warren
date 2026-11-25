@@ -252,7 +252,7 @@ func TestRemovalCutoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	f = x.fold(t)
-	s.Update(f)
+	update(t, s, f)
 	gone := s.Withdrawn()
 	if len(gone) != 2 || gone[0].Seq < 4 || gone[1].Seq < 4 {
 		t.Fatalf("withdrew %d entries", len(gone))
@@ -346,7 +346,7 @@ func TestLaggingMemberKeepsEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	f = x.fold(t)
-	s.Update(f)
+	update(t, s, f)
 	l := s.Log(x.member.Public())
 	if len(s.Withdrawn()) != 0 || len(l.Entries()) != 2 {
 		t.Fatalf("a lagging member lost entries on the head's chain: %d left", len(l.Entries()))
@@ -433,7 +433,7 @@ func TestRemovalThatStopsCounting(t *testing.T) {
 		t.Fatal(err)
 	}
 	sf, _ := stale.Fold()
-	s.Update(sf)
+	update(t, s, sf)
 	if len(s.Log(x.member.Public()).Entries()) != 1 {
 		t.Fatal("setup: the removal should cut the log")
 	}
@@ -445,7 +445,7 @@ func TestRemovalThatStopsCounting(t *testing.T) {
 	if f.Counts[rm.ID()] {
 		t.Fatal("setup: the removal should no longer count")
 	}
-	s.Update(f)
+	update(t, s, f)
 	for _, e := range es[1:] {
 		if _, err := add(s, e, f); err != nil {
 			t.Fatalf("an entry from a member no longer removed: %v", err)
@@ -535,7 +535,7 @@ func TestCutKeepsForkHidden(t *testing.T) {
 		t.Fatal(err)
 	}
 	f = x.fold(t)
-	s.Update(f)
+	update(t, s, f)
 	l := s.Log(x.member.Public())
 	if n := len(l.Entries()); n != 1 {
 		t.Fatalf("cutting a forked log showed %d entries", n)
@@ -556,8 +556,17 @@ func TestCutKeepsForkHidden(t *testing.T) {
 
 // add gives s fold f (as a caller does when its roster changes) and adds e.
 func add(s *Set, e *Entry, f *roster.Result) (bool, error) {
-	s.Update(f)
+	if err := s.Update(f); err != nil {
+		return false, err
+	}
 	return s.Add(e)
+}
+
+func update(t *testing.T, s *Set, f *roster.Result) {
+	t.Helper()
+	if err := s.Update(f); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAddNeedsAFold(t *testing.T) {
@@ -573,7 +582,7 @@ func TestMaxAhead(t *testing.T) {
 	ep, key := x.epoch(t, x.member)
 	f := x.fold(t)
 	s := NewSet(x.r.Group())
-	s.Update(f)
+	update(t, s, f)
 	// A full-size entry 1, so with the budget full it can't fit except
 	// through the gap-closing exemption.
 	first, err := Write(x.member, x.r.Group(), nil, ep, key, App, make([]byte, MaxBody))
@@ -626,7 +635,7 @@ func TestForkSurvivesLiftedRemoval(t *testing.T) {
 	a2, b2 := w(a1, "a2"), w(a1, "b2")
 	s := NewSet(g)
 	f := x.fold(t)
-	s.Update(f)
+	update(t, s, f)
 	for _, e := range []*Entry{a1, a2} {
 		if _, err := s.Add(e); err != nil {
 			t.Fatal(err)
@@ -658,14 +667,14 @@ func TestForkSurvivesLiftedRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Update(sf)
+	update(t, s, sf)
 	if l := s.Log(x.member.Public()); !l.removed || l.cutSeq != 2 {
 		t.Fatal("setup: the stale fold should cut the log")
 	}
 	if _, err := x.r.Add(rm); err != nil {
 		t.Fatal(err)
 	}
-	s.Update(x.fold(t))
+	update(t, s, x.fold(t))
 	l := s.Log(x.member.Public())
 	if l.removed || l.Fork() == nil || len(l.Entries()) != 1 || len(s.Withdrawn()) != 0 {
 		t.Fatalf("after a lifted removal: removed %v, fork %v, %d visible", l.removed, l.Fork() != nil, len(l.Entries()))
@@ -711,7 +720,7 @@ func (x *fixture) stalePair(t *testing.T, f *roster.Result) *roster.Roster {
 func TestAddVerifiesWhatItStores(t *testing.T) {
 	x := newFixture(t)
 	s := NewSet(x.r.Group())
-	s.Update(x.fold(t))
+	update(t, s, x.fold(t))
 	e := x.chain(t, x.member, 1)[0]
 	mutated := *e
 	mutated.Seq = 7
@@ -728,7 +737,7 @@ func TestAddVerifiesWhatItStores(t *testing.T) {
 func TestReadsAreCopies(t *testing.T) {
 	x := newFixture(t)
 	s := NewSet(x.r.Group())
-	s.Update(x.fold(t))
+	update(t, s, x.fold(t))
 	es := x.chain(t, x.member, 2)
 	for _, e := range es {
 		if _, err := s.Add(e); err != nil {
@@ -755,7 +764,7 @@ func TestForkFoundAtCapacity(t *testing.T) {
 	ep, key := x.epoch(t, x.member)
 	g := x.r.Group()
 	s := NewSet(g)
-	s.Update(x.fold(t))
+	update(t, s, x.fold(t))
 	first, _ := Write(x.member, g, nil, ep, key, App, nil)
 	prev := first
 	var second *Entry
@@ -805,7 +814,7 @@ func TestEpochThatStopsCountingHides(t *testing.T) {
 	e1, _ := Write(x.owner, x.r.Group(), nil, rm.ID(), key, App, []byte("1"))
 	e2, _ := Write(x.owner, x.r.Group(), e1, rm.ID(), key, App, []byte("2"))
 	s := NewSet(x.r.Group())
-	s.Update(sf)
+	update(t, s, sf)
 	for _, e := range []*Entry{e1, e2} {
 		if _, err := s.Add(e); err != nil {
 			t.Fatal(err)
@@ -814,7 +823,7 @@ func TestEpochThatStopsCountingHides(t *testing.T) {
 	if _, err := x.r.Add(rm); err != nil {
 		t.Fatal(err)
 	}
-	s.Update(x.fold(t))
+	update(t, s, x.fold(t))
 	if n := len(s.Log(x.owner.Public()).Entries()); n != 0 {
 		t.Fatalf("%d entries under a no-longer-counting epoch still show", n)
 	}
@@ -822,7 +831,7 @@ func TestEpochThatStopsCountingHides(t *testing.T) {
 		t.Fatalf("withdrew %d", n)
 	}
 	// Back on the stale fold, where it counts, they show again.
-	s.Update(sf)
+	update(t, s, sf)
 	if n := len(s.Log(x.owner.Public()).Entries()); n != 2 {
 		t.Fatalf("%d entries after the epoch counts again", n)
 	}
@@ -855,7 +864,7 @@ func TestLiftedCutTrims(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewSet(g)
-	s.Update(sf)
+	update(t, s, sf)
 	for i := 79; i >= 1; i-- { // top-down, entry 1 withheld
 		if _, err := s.Add(es[i]); err != nil {
 			t.Fatal(err)
@@ -868,7 +877,7 @@ func TestLiftedCutTrims(t *testing.T) {
 	if _, err := x.r.Add(rm); err != nil {
 		t.Fatal(err)
 	}
-	s.Update(x.fold(t))
+	update(t, s, x.fold(t))
 	if l.removed || l.ahead() > MaxAhead {
 		t.Fatalf("after the lift: removed %v, %d bytes held ahead", l.removed, l.ahead())
 	}
@@ -882,6 +891,13 @@ func TestWriteRefusesUnencodableSeq(t *testing.T) {
 	if _, err := Write(x.member, x.r.Group(), last, ep, key, App, nil); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("a successor of the last encodable entry: %v", err)
 	}
+	// A predecessor at sequence 0 isn't an entry: its successor would be
+	// entry 1 sealed under a Prev the wire never carries.
+	zero := x.chain(t, x.member, 1)[0].clone()
+	zero.Seq = 0
+	if _, err := Write(x.member, x.r.Group(), zero, ep, key, App, nil); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a predecessor at sequence 0: %v", err)
+	}
 }
 
 func TestDecodeRefusesEmptyBox(t *testing.T) {
@@ -893,4 +909,96 @@ func TestDecodeRefusesEmptyBox(t *testing.T) {
 	if _, err := Decode(c.Encode()); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("an empty box: %v", err)
 	}
+}
+
+func TestUpdateRefusesForeignFold(t *testing.T) {
+	x := newFixture(t)
+	other, err := roster.Found(me(9), "h", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	of, err := other.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSet(x.r.Group())
+	if err := s.Update(of); !errors.Is(err, ErrWrongGroup) {
+		t.Fatalf("another group's fold: %v", err)
+	}
+	if _, err := s.Add(x.chain(t, x.member, 1)[0]); !errors.Is(err, ErrNoRoster) {
+		t.Fatalf("a refused fold was kept: %v", err)
+	}
+}
+
+// TestRemovedHeadUnderStaleEpoch: a removed author's recorded head under an
+// epoch that stopped counting still anchors the eligible entries below it,
+// so a fresh member shows what one that held them all along shows.
+func TestRemovedHeadUnderStaleEpoch(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 2)
+	f := x.fold(t)
+	stale := x.stalePair(t, f)
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.mirror.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e3, err := Write(x.member, x.r.Group(), es[1], rm.ID(), stale.Keyring(x.member).Epochs[rm.ID()], App, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Remove(x.member.Public(), 3, e3.ID()); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSet(x.r.Group())
+	update(t, s, x.fold(t))
+	for _, e := range []*Entry{e3, es[1], es[0]} {
+		if _, err := s.Add(e); err != nil {
+			t.Fatalf("entry %d: %v", e.Seq, err)
+		}
+	}
+	l := s.Log(x.member.Public())
+	if n := len(l.Entries()); n != 2 {
+		t.Fatalf("%d entries show, want the 2 under a counting epoch", n)
+	}
+	checkCounts(t, l)
+}
+
+// TestHidingKeepsBounds: entries a fold hides are held ahead within a live
+// log's bounds.
+func TestHidingKeepsBounds(t *testing.T) {
+	x := newFixture(t)
+	f := x.fold(t)
+	stale := x.stalePair(t, f)
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.mirror.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf, err := stale.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := stale.Keyring(x.owner).Epochs[rm.ID()]
+	s := NewSet(x.r.Group())
+	update(t, s, sf)
+	var prev *Entry
+	for range 80 {
+		if prev, err = Write(x.owner, x.r.Group(), prev, rm.ID(), key, App, make([]byte, MaxBody)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Add(prev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	update(t, s, x.fold(t))
+	l := s.Log(x.owner.Public())
+	if l.top != 0 || l.ahead() > MaxAhead {
+		t.Fatalf("after the epoch stopped counting: top %d, %d bytes held ahead", l.top, l.ahead())
+	}
+	checkCounts(t, l)
 }
