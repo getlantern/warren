@@ -217,12 +217,12 @@ func (l *Log) cut(removed bool, seq uint64, head ID, gone *[]*Entry) {
 			l.drop(s, gone)
 		}
 	}
-	l.retop(seq + 1)
 	l.low = seq + 1
 	if seq > 0 && l.bySeq[seq] != nil {
 		l.low = seq
 		l.anchorDown(gone)
 	}
+	l.retop(1) // after low: what shows past a fork point depends on it
 }
 
 // Set is every author's log in one group, checked against the roster.
