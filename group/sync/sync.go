@@ -83,9 +83,10 @@ func (s *Sync) Start() []Message {
 func (s *Sync) Done() bool { return s.err == nil && s.opsDone && s.logsDone && len(s.wants) == 0 }
 
 // Finished reports whether the exchange is over: this side is done and
-// has said so, and so has the peer. Streams are ordered, so everything
-// either side sent (a fork proof found late, say) has arrived; the session
-// can close.
+// has said so, and so has the peer. Streams are ordered, so everything the
+// peer sent (a fork proof found late, say) has arrived. This side's own
+// Bye may still be on its way, as the two can cross: close gracefully,
+// flushing what was written, never by reset.
 func (s *Sync) Finished() bool { return s.Done() && s.sentBye && s.gotBye }
 
 // Handle takes the peer's next message and returns the messages to send
@@ -112,6 +113,12 @@ func violation(format string, a ...any) error {
 }
 
 func (s *Sync) handle(m Message) ([]Message, error) {
+	switch m.(type) {
+	case Ops, Fork, Logs, Want, Bye:
+		if s.gotBye { // a peer that said Bye only answers Wants
+			return nil, violation("%T after bye", m)
+		}
+	}
 	switch m := m.(type) {
 	case Have:
 		if s.gotHave {
@@ -176,15 +183,15 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		}
 		return out, nil
 	case Want:
-		if !s.opsDone || s.gotBye {
-			return nil, violation("want before the roster is merged, or after bye")
+		if !s.opsDone {
+			return nil, violation("want before the roster is merged")
 		}
 		return []Message{Entries{Author: m.Author, Entries: s.logs.Serve(m.Author, m.Seq, m.Down, Budget, MaxBatch)}}, nil
 	case Entries:
 		return s.entries(m)
 	case Bye:
-		if s.gotBye || !s.opsDone {
-			return nil, violation("bye out of turn")
+		if !s.logsDone {
+			return nil, violation("bye before the peer's log heads")
 		}
 		s.gotBye = true
 		return nil, nil

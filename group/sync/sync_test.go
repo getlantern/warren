@@ -483,7 +483,7 @@ func TestTamperedExchanges(t *testing.T) {
 		if err != nil && !errors.Is(err, ErrProtocol) {
 			t.Fatalf("message %d duplicated: %v", i, err)
 		}
-		if err == nil && (!sa.Done() || !sb.Done() || shape(a) != want || state(a) != state(b)) {
+		if err == nil && (!sa.Finished() || !sb.Finished() || shape(a) != want || state(a) != state(b)) {
 			t.Fatalf("message %d duplicated: no error, but not converged: done %v %v\n%s\n%s\n%s", i, sa.Done(), sb.Done(), want, shape(a), shape(b))
 		}
 
@@ -499,11 +499,13 @@ func TestTamperedExchanges(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		_, isFork := dropped.(Fork)
-		e, isEntries := dropped.(Entries)
-		harmless := isFork || (isEntries && len(e.Entries) == 0)
-		if sa.Done() && sb.Done() && !harmless && (shape(a) != want || state(a) != state(b)) {
-			t.Fatalf("a dropped %T left both sides done and apart", dropped)
+		// A fork proof needs no answer, so losing one costs the proof until
+		// a later session; anything else lost leaves the exchange unfinished.
+		if _, isFork := dropped.(Fork); !isFork && sa.Finished() && sb.Finished() {
+			t.Fatalf("a dropped %T left both sides finished", dropped)
+		}
+		if _, isBye := dropped.(Bye); isBye && (!sa.Done() || !sb.Done()) {
+			t.Fatal("a dropped Bye left a side not done")
 		}
 	}
 }
@@ -822,12 +824,29 @@ func TestByeOutOfTurn(t *testing.T) {
 		t.Fatalf("bye before the roster: %v", err)
 	}
 	s = New(p.r, p.logs)
-	for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}, Bye{}} {
+	for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}, Logs{}, Bye{}} {
 		if _, err := s.Handle(m); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.Handle(Want{Author: g.m1.Public(), Seq: 1}); !errors.Is(err, ErrProtocol) {
-		t.Fatalf("a want after bye: %v", err)
+	for _, m := range []Message{Want{Author: g.m1.Public(), Seq: 1}, Logs{}, Ops{}} {
+		s2 := New(p.r, p.logs)
+		for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}, Logs{}, Bye{}} {
+			if _, err := s2.Handle(m); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s2.Handle(m); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("a %T after bye: %v", m, err)
+		}
+	}
+	s = New(p.r, p.logs)
+	for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}} {
+		if _, err := s.Handle(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Handle(Bye{}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("bye before log heads: %v", err)
 	}
 }

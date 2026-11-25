@@ -312,7 +312,10 @@ recovery and memory caps.
   roster, and set reconciliation if rosters grow far past that), then
   liveness (members each has
   reached lately), then log heads (*Logs*) and content inventories
-  (*Swarming*).
+  (*Swarming*). Each side
+  says Bye once it has taken what it asked for, after anything it found
+  meanwhile (a fork proof), and keeps answering the other's requests; the
+  session closes, gracefully, once both have.
 - **Join sessions** (*Invites*) are separate: they are admitted under an
   invite's key, carry only a join request and its answer, and serve no
   member data.
