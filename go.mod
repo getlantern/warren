@@ -3,8 +3,10 @@ module github.com/getlantern/warren
 go 1.26
 
 require (
+	filippo.io/edwards25519 v1.2.0
 	github.com/sagernet/sing v0.9.6-0.20260922013354-87c33f17688f
 	github.com/sagernet/sing-quic v0.7.1-0.20260924092235-6a3a24d65b99
+	golang.org/x/crypto v0.54.0
 	golang.org/x/sys v0.47.0
 )
 
@@ -20,7 +22,6 @@ require (
 	github.com/metacubex/utls v1.8.7 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
