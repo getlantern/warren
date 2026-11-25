@@ -130,10 +130,14 @@ The roster is a set of operations signed by member keys, kept by members
 - `add` (member key, display name, role, and the current `G` and every
   epoch key so far sealed to the new member; a mirror gets `G` only) by an
   admin, or by the owner when the role is `admin`. A role is fixed when the
-  key is added: v1 has no role changes, and an `add` of a key already on
-  the roster never counts. To change a device's role, it is removed and
-  added again under a fresh member key (a full removal, see *Open
-  problems*);
+  key is added: v1 has no role changes, and an `add` of a key its author
+  had already admitted (on its roster or removed since, in the fold of the
+  `add`'s causal history) never counts. An `add` whose author hadn't is
+  concurrent with the one that admitted the key, and both have sealed their
+  keys, so the key takes the role holding more (admin over member over
+  mirror) rather than leaving a mirror with epoch keys. To change a device's
+  role, it is removed and added again under a fresh member key (a full
+  removal, see *Open problems*);
 - `remove` (member key; the remover's view of that member: the hashes of its
   latest roster operations and the head of its log the remover has seen,
   sequence number and entry hash; and the rekey, see *Removal*) by an admin,
@@ -145,8 +149,10 @@ The roster is a set of operations signed by member keys, kept by members
   keys it lacks, sealed to one member already added) by any member: it
   grants no rights, and only fills in keys a member missed (*Removal*). The
   recipient checks each key against the commitment of the operation that
-  made it (*Keys*), so a forged key is ignored. A sender never delivers a
-  key made by, or causally after, an operation that removes the recipient.
+  made it (*Keys*), so a forged key is ignored. A sender delivers only to
+  a recipient on its own folded roster, which a counting `remove` takes it
+  off, and withholds nothing else: withholding after a `remove` that doesn't
+  count would starve a member still on the roster.
   A `deliver` to a recipient removed concurrently doesn't count but has
   still handed over its keys, so it is treated like a key sealed to a
   removed member (*Removal*, step 3). One whose author was removed
@@ -156,9 +162,11 @@ Every operation names the genesis's hash, which is the group's ID, and
 carries a Lamport clock and its causal parents (the hashes of the latest
 operations the author had seen). Folding is deterministic:
 
-- operations apply in one **total order** every member computes alike:
-  causal order, with concurrent operations ordered by Lamport clock and
-  then by operation hash;
+- operations apply in one **total order** every member computes alike: a
+  topological order of the causal graph that, among operations whose
+  parents are all placed, takes the lowest Lamport clock and then the lowest
+  hash first. (Sorting by Lamport clock alone would break causal order
+  whenever an author writes a clock lower than a parent's.)
 - `genesis` is valid only as the root: no parents, signed by the founder key
   it names, and it makes the founder the group's **owner**;
 - each other operation is checked **when applied**, against the roster the
@@ -353,7 +361,11 @@ pieces on disk.
 **Blind mirrors** (an always-on device that serves without reading) are
 added with the `mirror` role: they receive `G` (to find the directory) but no
 epoch keys, so they fetch and serve ciphertext and verify pieces by the tree
-but can't unwrap blob keys or read logs. A mirror fetches every blob in the
+but can't unwrap blob keys or read logs. One exception, from concurrency:
+an admin that hasn't yet seen a change can seal an epoch key to a device the
+fold ends up treating as a mirror; the corrective rekey (*Removal*) keeps
+that from reaching the current key, but the earlier one stays readable to
+it. A mirror fetches every blob in the
 inventories it receives, up to its storage budget; it learns blob IDs and
 sizes, which it would see by serving anyway. A rekey seals the new `G'` to
 mirrors as to members, and the new epoch key to members only.
@@ -380,7 +392,11 @@ Removing a member:
    **publishes nothing**: the app's posts and blobs wait in a queue. Anything
    published before a member learned of the concurrent removal was readable
    by the removed member; that window is as short as gossip and can't be
-   closed. A member added concurrently with any key-making operation (a `remove`
+   closed. The condition also covers the other ways honest concurrency puts
+   the current keys where they don't belong (on a key whose `add` didn't
+   count, or on a mirror): each comes from a key-maker that hadn't seen a
+   removal, which therefore also sealed them to the removed member. The
+   roster model checks this (*Open problems*). A member added concurrently with any key-making operation (a `remove`
    or a `rekey` whose author didn't know of the `add`) gets the new `G` and
    any epoch keys it lacks from any member that notices, in a `deliver`
    operation.
@@ -454,8 +470,33 @@ signing.
 
 ## Open problems
 
-These need the dedicated protocol review (ideally a model checker over the
-fold) before phase 1 builds the roster:
+The fold, the authority rules, key delivery and the corrective rekey are
+model-checked by `group/rostermodel`: an abstract model of this section's
+rules (keys as names, sealing as recipient sets) and an explorer that runs
+every interleaving of an owner, two admins and a member writing, syncing,
+and acting as compromised or removed authors (20 million states at depth 6,
+about 23 minutes with `-roster.depth=6 -timeout=1h`; `go test` runs depth 4
+in about five seconds). It checks that the owner keeps its role, only the
+owner makes admins, backdated operations by removed authors never count, the
+view rule settles (in at most three passes in every explored state; a deeper
+chain, where dropping a removed admin's branch makes an owner's `add` count
+and so on down, takes four, and is a regression test; the fold detects a
+cycle rather than capping passes), and once the corrective rekey and
+deliveries run, no off-roster key holds the current group secret or epoch
+key, mirrors hold the current group secret but no current epoch key, and
+every member holds the current keys and every epoch key any other member
+holds. Admins and members also sign, as compromised devices would, the
+operations their role has no authority for, and none may count. Mutation
+tests break each admin and member authority rule, the role-change rule, the
+view rule, delivery's roster check and the corrective rekey in turn, and the
+explorer catches each. No explored replica is a mirror, so mirrors'
+authority (the same rule as members') isn't explored. It found two rules
+above that were wrong as first written (concurrent duplicate `add`s, and
+`deliver` withholding after any `remove`), and writing it pinned the total
+order down as an algorithm.
+
+Still open, and not modeled (the grace window, invites and log cutoffs are
+outside the model):
 
 - **Re-invites and role changes are full removals.** Each rekeys the group,
   cuts the device's log at the remover's view (dropping what it wrote
