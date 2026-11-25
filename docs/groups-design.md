@@ -474,9 +474,12 @@ carries neither `G` nor any member key.
   genesis and the roster's operations (small for v1 groups), so the invitee
   can check its own `add` and compute the members' rendezvous keys. The
   invitee then leaves the join session for normal ones.
-- Single-use invites are spent at the first `add` against them; all are
-  refused after expiry, and invites issued before a removal are refused
-  after it (*Removal*).
+- An `add` admitting an invitee names the invite it answers, and so does a
+  rejoin's `deliver` (below). Each such operation spends one of the
+  invite's uses, so a single-use invite is spent by the first of either;
+  since both are roster operations, every admin counts the uses alike. All
+  invites are refused after expiry, and invites issued before a removal
+  are refused after it (*Removal*).
 
 **Rejoining.** A member offline past the grace window (*Removal*, step 4)
 comes back through an invite too, issued after it was last online and
@@ -484,8 +487,9 @@ handed to its user out of band. In the join session it presents its
 **existing** member key instead of a new one, and signs the session's secret
 with it as well as proving it knows `I`. The admin checks that key is on its
 roster and not removed, and answers with a `deliver` of the current `G` and
-every epoch key it lacks (mirrors get `G` only), plus the genesis and the
-roster's operations, as for a new member. Nothing else changes: no `add`, no
+every epoch key it lacks (mirrors get `G` only), naming the invite and so
+spending one of its uses, plus the genesis and the roster's operations, as
+for a new member. Nothing else changes: no `add`, no
 removal, no rekey, and its log carries on. A removed member can't do this:
 its key is off the roster. A stolen device can, as it could use any member
 key; the admin sees which member is rejoining, and the answer to a stolen
