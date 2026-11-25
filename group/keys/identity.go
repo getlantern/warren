@@ -26,9 +26,10 @@ func (pk PublicKey) Verify(msg, sig []byte) bool {
 	return ed25519.Verify(pk[:], msg, sig)
 }
 
-// ErrBadKey means a public key isn't a usable point: not on the curve, of
-// small order, or encoded non-canonically (so that two encodings could name
-// one key).
+// ErrBadKey means a public key isn't a usable point: not on the curve,
+// outside the prime-order subgroup (small order, or an honest key plus a
+// small-order component), or encoded non-canonically. Each of the last two
+// would let one secret appear as several keys.
 var ErrBadKey = errors.New("keys: unusable public key")
 
 func (pk PublicKey) point() (*edwards25519.Point, error) {
@@ -36,13 +37,29 @@ func (pk PublicKey) point() (*edwards25519.Point, error) {
 	if err != nil || PublicKey(p.Bytes()) != pk {
 		return nil, ErrBadKey
 	}
-	if new(edwards25519.Point).MultByCofactor(p).Equal(edwards25519.NewIdentityPoint()) == 1 {
+	// P is in the prime-order subgroup exactly when 8⁻¹·(8·P) = P; a
+	// small-order component is lost by multiplying by the cofactor.
+	eight := new(edwards25519.Point).MultByCofactor(p)
+	if eight.Equal(edwards25519.NewIdentityPoint()) == 1 ||
+		new(edwards25519.Point).ScalarMult(invEight, eight).Equal(p) != 1 {
 		return nil, ErrBadKey
 	}
 	return p, nil
 }
 
-// X25519 converts pk to the X25519 key sealing to it uses.
+var invEight = func() *edwards25519.Scalar {
+	var b [32]byte
+	b[0] = 8
+	s, err := new(edwards25519.Scalar).SetCanonicalBytes(b[:])
+	if err != nil {
+		panic(err)
+	}
+	return s.Invert(s)
+}()
+
+// X25519 converts pk to the X25519 key sealing to it uses. Only member keys
+// are sealed to: a blinded key has no Identity to open with, so a box
+// sealed to one can't be opened.
 func (pk PublicKey) X25519() (*ecdh.PublicKey, error) {
 	p, err := pk.point()
 	if err != nil {

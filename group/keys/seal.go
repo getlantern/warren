@@ -22,16 +22,22 @@ func sealKey(shared, ePub, rPub []byte, context string) ([]byte, error) {
 	return hkdf.Key(sha256.New, shared, salt, label+"seal "+context, chacha20poly1305.KeySize)
 }
 
-// Seal encrypts plaintext to the member key to, for context: a label
-// naming what the box is for (the operation sealing it, say), which Open
-// must be given too. The box is an ephemeral X25519 key followed by an
+// Seal encrypts plaintext to the member key to (not a blinded key), for
+// context: a label naming what the box is for (the operation sealing it,
+// say), which Open must be given too. The box is an ephemeral X25519 key followed by an
 // XChaCha20-Poly1305 ciphertext under a key used once.
 func Seal(rand io.Reader, to PublicKey, context string, plaintext []byte) ([]byte, error) {
 	rPub, err := to.X25519()
 	if err != nil {
 		return nil, err
 	}
-	e, err := ecdh.X25519().GenerateKey(rand)
+	// Read the ephemeral key from rand rather than GenerateKey, which since
+	// Go 1.26 ignores its reader.
+	var eb [32]byte
+	if _, err := io.ReadFull(rand, eb[:]); err != nil {
+		return nil, err
+	}
+	e, err := ecdh.X25519().NewPrivateKey(eb[:])
 	if err != nil {
 		return nil, err
 	}

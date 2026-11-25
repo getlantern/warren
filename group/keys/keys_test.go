@@ -82,13 +82,37 @@ func TestRendezvousRotatesAndSeparates(t *testing.T) {
 	}
 }
 
+// order8 is a point of order 8; its multiples are all eight small-order
+// points.
+const order8 = "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"
+
 func TestBlindRejectsSmallOrderKeys(t *testing.T) {
-	identity := PublicKey(edwards25519.NewIdentityPoint().Bytes())
-	if _, err := identity.Blind([32]byte{1}); err != ErrBadKey {
-		t.Fatalf("blinding the identity point: %v", err)
+	b, _ := hex.DecodeString(order8)
+	T, err := new(edwards25519.Point).SetBytes(b)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := identity.X25519(); err != ErrBadKey {
-		t.Fatalf("converting the identity point: %v", err)
+	honest, err := new(edwards25519.Point).SetBytes(func() []byte { k := id(t, 1).Public(); return k[:] }())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := edwards25519.NewIdentityPoint()
+	for i := 1; i <= 8; i++ {
+		m = new(edwards25519.Point).Add(m, T) // i·T
+		small := PublicKey(m.Bytes())
+		if _, err := small.Blind([32]byte{1}); err != ErrBadKey {
+			t.Fatalf("blinding %d·T: %v", i, err)
+		}
+		if _, err := small.X25519(); err != ErrBadKey {
+			t.Fatalf("converting %d·T: %v", i, err)
+		}
+		if i == 8 {
+			break // 8·T is the identity: honest + 8·T is honest itself
+		}
+		mixed := PublicKey(new(edwards25519.Point).Add(honest, m).Bytes())
+		if _, err := mixed.Blind([32]byte{1}); err != ErrBadKey {
+			t.Fatalf("blinding an honest key plus %d·T: %v", i, err)
+		}
 	}
 	// Find an encoding that isn't a point (about half of all y values).
 	var notOnCurve PublicKey
@@ -163,6 +187,18 @@ func TestSealOpen(t *testing.T) {
 	}
 }
 
+func TestSealUsesRand(t *testing.T) {
+	to := id(t, 1).Public()
+	a, err := Seal(bytes.NewReader(make([]byte, 32)), to, "c", []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := Seal(bytes.NewReader(make([]byte, 32)), to, "c", []byte("x"))
+	if !bytes.Equal(a, b) {
+		t.Fatal("Seal ignored its reader")
+	}
+}
+
 func TestX25519Agrees(t *testing.T) {
 	alice, bob := id(t, 1), id(t, 2)
 	ap, err := alice.Public().X25519()
@@ -200,7 +236,10 @@ func TestDerivationsSeparate(t *testing.T) {
 	if bytes.Equal(g.DirectorySalt(0, 0), g.DirectorySalt(0, 1)) || bytes.Equal(g.DirectorySalt(0, 0), g.DirectorySalt(1, 0)) {
 		t.Fatal("directory salts repeat across shards or periods")
 	}
-	callee := id(t, 1).Public()
+	callee, err := Rendezvous(g, 0, id(t, 1).Public())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if bytes.Equal(g.SyncKey(0, callee), g.SyncKey(1, callee)) {
 		t.Fatal("the sync key doesn't change with the period")
 	}

@@ -69,12 +69,12 @@ func (g Secret) DirectorySalt(p uint64, shard uint32) []byte {
 	return m.Sum(nil)
 }
 
-// SyncKey is the caller key for calling callee's rendezvous key in period
-// p when callee may not know the caller yet: only a holder of G can compute
-// it, and signaling offers are signed by it, so it proves G before any
-// session exists.
-func (g Secret) SyncKey(p uint64, callee PublicKey) ed25519.PrivateKey {
-	info := "sync" + string(periodBytes(p)) + string(callee[:])
+// SyncKey is the caller key for calling rendezvous, the callee's period-p
+// rendezvous key (not its member key), when the callee may not know the
+// caller yet: only a holder of G can compute it, and signaling offers are
+// signed by it, so it proves G before any session exists.
+func (g Secret) SyncKey(p uint64, rendezvous PublicKey) ed25519.PrivateKey {
+	info := "sync" + string(periodBytes(p)) + string(rendezvous[:])
 	return ed25519.NewKeyFromSeed(derive(g[:], info, ed25519.SeedSize))
 }
 
