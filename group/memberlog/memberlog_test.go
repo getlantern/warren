@@ -560,7 +560,9 @@ func TestMaxAhead(t *testing.T) {
 	f := x.fold(t)
 	s := NewSet(x.r.Group())
 	s.Update(f)
-	first, _ := Write(x.member, x.r.Group(), nil, ep, key, App, nil)
+	// A full-size entry 1, so with the budget full it can't fit except
+	// through the gap-closing exemption.
+	first, _ := Write(x.member, x.r.Group(), nil, ep, key, App, make([]byte, MaxBody))
 	prev := first
 	held := 0
 	for range 100 {
