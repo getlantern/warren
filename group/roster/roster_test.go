@@ -794,3 +794,24 @@ func TestDecodeBoundsValues(t *testing.T) {
 		t.Fatalf("decoding it allocated %d MB", alloc>>20)
 	}
 }
+
+// TestWritersRefuseTooManyValues: a rekey whose seals exceed the decoder's
+// value budget, though under the byte bound, fails with ErrTooLarge.
+func TestWritersRefuseTooManyValues(t *testing.T) {
+	r, owner, _, _ := group(t)
+	ow := &Writer{R: r, Me: owner}
+	o := ow.base(Rekey)
+	o.CommitSecret, o.CommitEpoch = [32]byte{1}, [32]byte{2}
+	for i := range 4300 { // eight values a seal: past the budget
+		k := keys.IdentityFromSeed([32]byte{0xc0, byte(i), byte(i >> 8)}).Public()
+		if err := seal(o, k, []entry{{secret: true}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ow.finish(o); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("a rekey past the value budget: %v (%d bytes)", err, len(o.Encode()))
+	}
+	if len(o.Encode()) > MaxOpBytes {
+		t.Fatal("setup: the op should be under the byte bound")
+	}
+}

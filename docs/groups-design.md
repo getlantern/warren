@@ -153,8 +153,10 @@ The roster is a set of operations signed by member keys, kept by members
   keys it lacks, sealed to one member already added) by any member. Every
   seal also lists, in the clear, which keys its box carries (each by the
   operation that made it), so a sender can tell what a member lacks; a
-  sender trusts only the lists of counting operations by the owner or an
-  admin, and its own, since a member could list keys it never sealed. A
+  sender trusts only its own lists and those of counting operations whose
+  author was the owner or an admin both when the operation counted and
+  still is, since a member could list keys it never sealed (and a removed
+  or demoted admin's lists stop counting). A
   `deliver` grants no rights, and only fills in keys a member missed
   (*Removal*). The
   recipient checks each key against the commitment of the operation that

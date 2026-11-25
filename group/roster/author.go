@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/getlantern/warren/bencode"
 	"github.com/getlantern/warren/group/keys"
 )
 
@@ -50,7 +51,11 @@ func (w *Writer) base(kind Kind) *Op {
 
 func (w *Writer) finish(o *Op) (*Op, error) {
 	o.Sign(w.Me)
-	if len(o.Encode()) > MaxOpBytes {
+	enc := o.Encode()
+	if len(enc) > MaxOpBytes {
+		return nil, ErrTooLarge
+	}
+	if _, err := bencode.DecodeLimit(enc, maxOpValues); errors.Is(err, bencode.ErrTooLarge) {
 		return nil, ErrTooLarge
 	}
 	if _, err := w.R.Add(o); err != nil {
@@ -239,7 +244,10 @@ func (w *Writer) holdings(f *Result, target keys.PublicKey) map[ID]held {
 	for _, o := range w.R.ops {
 		// Trusted only if the author was an admin both when the op counted
 		// and now: a member's list doesn't become trusted when it's
-		// promoted later, and a removed or demoted admin's stops counting.
+		// promoted later, and a removed or demoted admin's stops counting,
+		// even for keys it made itself (a removed admin could have lied
+		// about those too). The cost is redundant deliveries of an honest
+		// former admin's keys.
 		then, now := f.As[o.id], f.Roles[o.Author]
 		trusted := o.Author == w.Me.Public() ||
 			((then == Owner || then == Admin) && (now == Owner || now == Admin))

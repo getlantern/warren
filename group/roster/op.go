@@ -23,9 +23,11 @@ const (
 	// thousands of members, or an add carrying thousands of epoch keys.
 	MaxOpBytes = 1 << 20
 	// maxOpValues bounds its bencode values, which cost far more in memory
-	// than on the wire: enough for a rekey sealed to about 4,000 members
-	// (about seven values a seal) or an add carrying 30,000 epoch keys,
-	// while one hostile op can't make a decoder allocate hundreds of MB.
+	// than on the wire, so one hostile op can't make a decoder allocate
+	// hundreds of MB. A member's seal in a rekey is nine values and a
+	// mirror's eight, so a rekey reaches it at about 3,400 recipients; an
+	// add carries about 10,000 epoch keys before MaxOpBytes binds. Writers
+	// refuse what would exceed either (ErrTooLarge).
 	maxOpValues = MaxOpBytes / 32
 )
 
