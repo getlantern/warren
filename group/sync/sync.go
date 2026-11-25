@@ -10,6 +10,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/getlantern/warren/group/keys"
@@ -28,8 +29,12 @@ const (
 // walk is called per step of closure's walk; tests count with it.
 var walk = func() {}
 
-// opsChunk is the operation bytes one Ops message carries; tests lower it.
-var opsChunk = MaxMessage - 1024
+// opsChunk is the operation bytes one Ops message carries, past which it
+// splits; tests lower it. A single larger operation goes alone.
+var opsChunk = 1 << 20
+
+// headsChunk is the heads one Heads message carries; tests lower it.
+var headsChunk = 16384
 
 // ErrProtocol means the peer sent a message out of turn, or one that
 // doesn't answer what was asked.
@@ -42,13 +47,12 @@ type Sync struct {
 	logs *memberlog.Set
 
 	gotHeads  bool
-	opsDone   bool // the peer's operations are all in, and logs updated
-	logsDone  bool // the peer's log heads are all in
-	peerHeads []roster.ID
+	opsDone   bool               // the peer's operations are all in, and logs updated
+	logsDone  bool               // the peer's log heads are all in
+	peerHeads map[roster.ID]bool // those this side holds: the rest it can't use
 	peerTop   map[keys.PublicKey]uint64
 	wants     map[keys.PublicKey]Want // asked and not yet answered
 	stopped   map[keys.PublicKey]bool // nothing more from this peer
-	forks     map[keys.PublicKey]Fork // from the peer, not yet taken
 	err       error
 }
 
@@ -57,15 +61,23 @@ type Sync struct {
 func New(r *roster.Roster, logs *memberlog.Set) *Sync {
 	return &Sync{
 		r: r, logs: logs,
-		peerTop: map[keys.PublicKey]uint64{},
-		wants:   map[keys.PublicKey]Want{},
-		stopped: map[keys.PublicKey]bool{},
-		forks:   map[keys.PublicKey]Fork{},
+		peerTop:   map[keys.PublicKey]uint64{},
+		wants:     map[keys.PublicKey]Want{},
+		stopped:   map[keys.PublicKey]bool{},
+		peerHeads: map[roster.ID]bool{},
 	}
 }
 
 // Start returns the first messages to send.
-func (s *Sync) Start() []Message { return []Message{Heads{IDs: s.r.Heads()}} }
+func (s *Sync) Start() []Message {
+	hs := s.r.Heads()
+	var out []Message
+	for len(hs) > headsChunk {
+		out = append(out, Heads{IDs: hs[:headsChunk], More: true})
+		hs = hs[headsChunk:]
+	}
+	return append(out, Heads{IDs: hs})
+}
 
 // Done reports whether this side has taken everything the peer offered.
 // The peer may still be asking; the session ends when both are done.
@@ -96,7 +108,15 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		if s.gotHeads {
 			return nil, violation("heads twice")
 		}
-		s.gotHeads, s.peerHeads = true, m.IDs
+		for _, id := range m.IDs {
+			if s.r.Has(id) {
+				s.peerHeads[id] = true
+			}
+		}
+		if m.More {
+			return nil, nil
+		}
+		s.gotHeads = true
 		return s.missingOps(), nil
 	case Ops:
 		if !s.gotHeads || s.opsDone {
@@ -123,8 +143,9 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		if !s.opsDone || m.A.Author != m.B.Author {
 			return nil, violation("fork proof out of turn or of two authors")
 		}
-		s.forks[m.A.Author] = m
-		s.tryFork(m.A.Author)
+		// A proof for a log this side wouldn't take, or not a fork, is
+		// ignored: the peer's roster is merged, so that's its own state.
+		_, _ = s.logs.AddFork(&memberlog.ForkProof{A: m.A, B: m.B})
 		return nil, nil
 	case Logs:
 		if !s.opsDone || s.logsDone {
@@ -161,7 +182,7 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 // knows or in their history, parents first, split to fit messages. A head
 // this side doesn't know means the peer is ahead there, and sends it.
 func (s *Sync) missingOps() []Message {
-	theirs := s.closure(s.peerHeads)
+	theirs := s.closure(slices.Collect(maps.Keys(s.peerHeads)))
 	var send []*roster.Op
 	for id := range s.closure(s.r.Heads()) {
 		if o := s.r.Op(id); !theirs[id] && o.Kind != roster.Genesis {
@@ -290,25 +311,7 @@ func (s *Sync) entries(m Entries) ([]Message, error) {
 			break
 		}
 	}
-	s.tryFork(m.Author)
 	return s.want(m.Author), nil
-}
-
-// tryFork adds a fork proof the peer sent, once both entries can be
-// taken: each is checked like any entry, so a proof only counts against a
-// log this side would accept them for.
-func (s *Sync) tryFork(a keys.PublicKey) {
-	f, ok := s.forks[a]
-	if !ok {
-		return
-	}
-	_, _ = s.logs.Add(f.A)
-	_, _ = s.logs.Add(f.B)
-	// Kept only while the log still takes entries: the roster bounds what
-	// waits, and a proof taken, or one for a log that takes nothing, is done.
-	if _, _, done := s.logs.Next(a); done {
-		delete(s.forks, a)
-	}
 }
 
 func sortedKeys(m map[keys.PublicKey]uint64) []keys.PublicKey {

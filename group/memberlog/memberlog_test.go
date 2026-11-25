@@ -1104,3 +1104,42 @@ func TestForkedLogFillsItsPrefix(t *testing.T) {
 	}
 	checkCounts(t, l)
 }
+
+func TestAddForkChecksTheProof(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 3)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	other3, _ := Write(x.member, g, es[1], ep, key, App, []byte("other"))
+	s := NewSet(g)
+	update(t, s, x.fold(t))
+	for name, p := range map[string]*ForkProof{
+		"linked neighbors": {A: es[0], B: es[1]},
+		"one entry twice":  {A: es[2], B: es[2]},
+		"far apart":        {A: es[0], B: other3},
+		"two authors":      {A: es[2], B: x.chain(t, x.admin, 3)[2]},
+	} {
+		if ok, err := s.AddFork(p); ok || err == nil {
+			t.Fatalf("%s taken: %v", name, err)
+		}
+	}
+	if ok, err := s.AddFork(&ForkProof{A: es[2], B: other3}); !ok || err != nil {
+		t.Fatalf("a fork at entry 3: %v %v", ok, err)
+	}
+	if ok, _ := s.AddFork(&ForkProof{A: es[2], B: other3}); ok {
+		t.Fatal("the same proof taken twice")
+	}
+	l := s.Log(x.member.Public())
+	if l.Fork() == nil || len(l.Entries()) != 0 || len(s.Withdrawn()) != 0 {
+		t.Fatal("a proof showed or withdrew something")
+	}
+	if seq, _, done := s.Next(x.member.Public()); done || seq != 1 {
+		t.Fatalf("next %d done %v: the prefix is still wanted", seq, done)
+	}
+	s.Add(es[0])
+	s.Add(es[1])
+	if n := len(l.Entries()); n != 2 {
+		t.Fatalf("%d shown below the fork point", n)
+	}
+	checkCounts(t, l)
+}

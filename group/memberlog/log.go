@@ -186,15 +186,11 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 	// A forked log still takes what lies below its fork point, the prefix
 	// every member shows, so one that learned of the fork first can catch
 	// up with those that held the prefix already.
-	point := ^uint64(0)
-	if l.fork != nil {
-		point = min(l.fork.A.Seq, l.fork.B.Seq)
-		if e.Seq >= point {
-			return false, ErrForked
-		}
+	if l.fork != nil && e.Seq >= min(l.fork.A.Seq, l.fork.B.Seq) {
+		return false, ErrForked
 	}
 	// Conflicts first: fork evidence needs no new slot, so the budget
-	// mustn't hide it. One below the known fork point replaces the proof.
+	// mustn't hide it.
 	var p *ForkProof
 	if old := l.bySeq[e.Seq]; old != nil {
 		p = &ForkProof{A: old, B: e}
@@ -204,9 +200,7 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 		p = &ForkProof{A: e, B: next}
 	}
 	if p != nil {
-		if min(p.A.Seq, p.B.Seq) < point {
-			l.fork = p
-		}
+		l.fork = p // every proof found here lies below the known point
 		l.retop(l.top+1, gone)
 		l.trim() // what the fork hid is held ahead; the proof keeps its own
 		return false, ErrForked
@@ -444,21 +438,8 @@ func (s *Set) Add(e *Entry) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if e.Group != s.group {
-		return false, ErrWrongGroup
-	}
-	if s.fold == nil {
-		return false, ErrNoRoster
-	}
-	if !s.writer(e.Author) {
-		return false, ErrNotWriter // never admitted, or a mirror
-	}
-	// A removed author's log is filled top-down from the recorded head, so
-	// an entry whose epoch stopped counting must still be taken to anchor
-	// the eligible ones below it; it stays hidden (eligible), and anchoring
-	// bounds what is held.
-	if _, removed := s.cutoffs[e.Author]; !removed && !s.epochs[e.Epoch] {
-		return false, ErrUnknownEpoch
+	if err := s.check(e); err != nil {
+		return false, err
 	}
 	l := s.logs[e.Author]
 	if l == nil {
@@ -467,6 +448,68 @@ func (s *Set) Add(e *Entry) (bool, error) {
 	}
 	s.apply(e.Author, l)
 	return l.add(e, &s.gone)
+}
+
+// AddFork takes a fork proof a peer holds: two entries the author signed
+// that can't both be on one chain. Neither is stored, so taking a proof
+// never shows an entry, and it needs no room in the log's window. A proof
+// below the one held replaces it. It reports whether the proof was taken.
+func (s *Set) AddFork(p *ForkProof) (bool, error) {
+	var es [2]*Entry
+	for i, e := range []*Entry{p.A, p.B} {
+		d, err := Decode(e.Encode())
+		if err != nil {
+			return false, err
+		}
+		if err := s.check(d); err != nil {
+			return false, err
+		}
+		es[i] = d
+	}
+	a, b := es[0], es[1]
+	if b.Seq < a.Seq {
+		a, b = b, a
+	}
+	if a.Author != b.Author || a.id == b.id ||
+		(a.Seq != b.Seq && (b.Seq != a.Seq+1 || b.Prev == a.id)) {
+		return false, ErrMalformed // not a fork
+	}
+	l := s.logs[a.Author]
+	if l == nil {
+		l = newLog(a.Author, s.eligible)
+		s.logs[a.Author] = l
+	}
+	s.apply(a.Author, l)
+	if l.fork != nil && min(l.fork.A.Seq, l.fork.B.Seq) <= a.Seq {
+		return false, nil
+	}
+	l.fork = &ForkProof{A: a, B: b}
+	l.retop(l.top+1, &s.gone)
+	if !l.removed {
+		l.trim()
+	}
+	return true, nil
+}
+
+// check is what any entry must pass to be taken, against the current fold.
+func (s *Set) check(e *Entry) error {
+	if e.Group != s.group {
+		return ErrWrongGroup
+	}
+	if s.fold == nil {
+		return ErrNoRoster
+	}
+	if !s.writer(e.Author) {
+		return ErrNotWriter // never admitted, or a mirror
+	}
+	// A removed author's log is filled top-down from the recorded head, so
+	// an entry whose epoch stopped counting must still be taken to anchor
+	// the eligible ones below it; it stays hidden (eligible), and anchoring
+	// bounds what is held.
+	if _, removed := s.cutoffs[e.Author]; !removed && !s.epochs[e.Epoch] {
+		return ErrUnknownEpoch
+	}
+	return nil
 }
 
 // Authors returns the authors whose logs the Set holds, in key order.

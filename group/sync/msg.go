@@ -11,9 +11,10 @@ import (
 )
 
 // MaxMessage bounds a message's encoding. Every message the Sync sends
-// fits: operations and log heads are split across messages, and a batch
-// of entries is bounded by Budget and MaxBatch.
-const MaxMessage = 1 << 20
+// fits: heads, operations and log heads are split across messages, an
+// operation of roster.MaxOpBytes fits with room for its envelope, and a
+// batch of entries is bounded by Budget and MaxBatch.
+const MaxMessage = roster.MaxOpBytes + 4096
 
 // maxElements bounds the values in one message: a batch, a split list of
 // operations or log heads, each a few values apiece.
@@ -25,8 +26,12 @@ var ErrMalformed = errors.New("sync: malformed message")
 // A Message is one step of the exchange.
 type Message interface{ kind() int64 }
 
-// Heads is the roster's heads, the first message each side sends.
-type Heads struct{ IDs []roster.ID }
+// Heads is the roster's heads, the first message each side sends. More
+// means another Heads message follows.
+type Heads struct {
+	IDs  []roster.ID
+	More bool
+}
 
 // Ops is roster operations the peer lacks, parents before children. More
 // means another Ops message follows.
@@ -95,7 +100,7 @@ func Encode(m Message) []byte {
 		for _, id := range m.IDs {
 			ids = append(ids, str(id[:]))
 		}
-		d = append(d, pair("h", list(ids)))
+		d = append(d, pair("h", list(ids)), pair("m", flag(m.More)))
 	case Ops:
 		d = append(d, pair("m", flag(m.More)))
 		var ops []bencode.Value
@@ -165,10 +170,11 @@ func decode(v bencode.Value) (Message, error) {
 	switch t.Int {
 	case Heads{}.kind():
 		hs, ok := field("h", bencode.List)
-		if !ok {
+		more, ok2 := boolean("m")
+		if !ok || !ok2 {
 			return nil, ErrMalformed
 		}
-		var m Heads
+		m := Heads{More: more}
 		for _, h := range hs.List {
 			var id roster.ID
 			if h.Kind != bencode.String || len(h.Str) != len(id) {

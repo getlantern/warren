@@ -512,7 +512,7 @@ func TestMessageRoundTrip(t *testing.T) {
 	op := p.r.Op(p.r.Heads()[0])
 	for _, m := range []Message{
 		Heads{IDs: p.r.Heads()},
-		Heads{},
+		Heads{More: true},
 		Ops{Ops: []*roster.Op{op}, More: true},
 		Fork{A: es[0], B: es[1]},
 		Logs{Heads: []LogHead{{Author: g.m1.Public(), Top: 9}}},
@@ -532,7 +532,8 @@ func TestMessageRoundTrip(t *testing.T) {
 		"extra field":    []byte("d1:hle1:xi1e1:ti1ee"),
 		"want seq 0":     slices.Concat([]byte("d1:a32:"), make([]byte, 32), []byte("1:di0e1:si0e1:ti5ee")),
 		"flag of 2":      slices.Concat([]byte("d1:a32:"), make([]byte, 32), []byte("1:di2e1:si1e1:ti5ee")),
-		"trailing bytes": []byte("d1:hle1:ti1eex"),
+		"trailing bytes": []byte("d1:hle1:mi0e1:ti1eex"),
+		"heads no flag":  []byte("d1:hle1:ti1ee"),
 		"too large":      make([]byte, MaxMessage+1),
 	} {
 		if _, err := Decode(b); err == nil {
@@ -583,8 +584,8 @@ func TestStrangersCostNothing(t *testing.T) {
 	if _, err := s.Handle(Logs{Heads: []LogHead{{Author: stranger.Public(), Top: 5}}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.peerTop) != 0 || len(s.forks) != 0 {
-		t.Fatalf("kept %d log heads and %d fork proofs of a stranger", len(s.peerTop), len(s.forks))
+	if len(s.peerTop) != 0 || p.logs.Log(stranger.Public()) != nil {
+		t.Fatalf("kept %d log heads, or a log, of a stranger", len(s.peerTop))
 	}
 	if _, err := s.Handle(Entries{Author: g.m1.Public()}); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("an empty batch nobody asked for: %v", err)
@@ -610,5 +611,85 @@ func TestRepeatedHeadsCostLittle(t *testing.T) {
 	}
 	if visits > 4*p.r.Len() {
 		t.Fatalf("%d visits for a roster of %d", visits, p.r.Len())
+	}
+}
+
+// TestHeadsSplit: heads that don't fit one message go in several.
+func TestHeadsSplit(t *testing.T) {
+	defer func(n int) { headsChunk = n }(headsChunk)
+	headsChunk = 1
+	g := newGroup(t)
+	a, b, c := newPeer(t, g.r), newPeer(t, g.r), newPeer(t, g.r)
+	for i, p := range []*peer{a, b} { // concurrent ops: two heads once merged
+		if _, err := p.writer(g.owner).Add(me(byte(30+i)).Public(), "y", roster.Member, keys.PublicKey{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	converge(t, a, b)
+	if len(a.r.Heads()) < 2 {
+		t.Fatal("setup: one head")
+	}
+	var heads int
+	if _, _, err := run(t, a, c, func(_ int, m Message) []Message {
+		if h, ok := m.(Heads); ok {
+			heads++
+			if len(h.IDs) > headsChunk {
+				t.Fatalf("%d heads in one message", len(h.IDs))
+			}
+		}
+		return []Message{m}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if heads < 3 || state(a) != state(c) {
+		t.Fatalf("%d Heads messages", heads)
+	}
+}
+
+// TestLargestOpFits: an Ops message carrying one operation of the largest
+// size the roster takes still decodes.
+func TestLargestOpFits(t *testing.T) {
+	g := newGroup(t)
+	op := g.r.Op(g.r.Heads()[0])
+	env := len(Encode(Ops{Ops: []*roster.Op{op}, More: true})) - len(op.Encode())
+	// A longer string length prefix: up to 7 digits for roster.MaxOpBytes.
+	if env+7+roster.MaxOpBytes > MaxMessage {
+		t.Fatalf("an operation of %d bytes needs %d", roster.MaxOpBytes, env+7+roster.MaxOpBytes)
+	}
+}
+
+// TestForkProofShowsNothingNew: taking a peer's fork proof never makes the
+// app see, then withdraw, one of its entries.
+func TestForkProofShowsNothingNew(t *testing.T) {
+	g := newGroup(t)
+	a, b := newPeer(t, g.r), newPeer(t, g.r)
+	es := a.chain(t, g.m1, nil, 3, 10)
+	y := a.chain(t, g.m1, es[1], 1, 11)
+	a.add(t, es...)
+	if _, err := a.logs.Add(y[0]); !errors.Is(err, memberlog.ErrForked) {
+		t.Fatalf("setup: %v", err)
+	}
+	b.add(t, es[:2]...)
+	converge(t, a, b)
+	if n := len(b.logs.Withdrawn()); n != 0 || b.logs.Log(g.m1.Public()).Fork() == nil {
+		t.Fatalf("b withdrew %d entries it never showed", n)
+	}
+}
+
+// TestUnknownHeadsNotKept: heads this side doesn't hold are of no use to
+// it, so a peer listing many costs no memory.
+func TestUnknownHeadsNotKept(t *testing.T) {
+	g := newGroup(t)
+	p := newPeer(t, g.r)
+	s := New(p.r, p.logs)
+	ids := make([]roster.ID, 1000)
+	for i := range ids {
+		ids[i] = roster.ID{byte(i), byte(i >> 8), 1}
+	}
+	if _, err := s.Handle(Heads{IDs: ids, More: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.peerHeads) != 0 {
+		t.Fatalf("kept %d unknown heads", len(s.peerHeads))
 	}
 }
