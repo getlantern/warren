@@ -626,14 +626,22 @@ so an app chooses where data lives and how much.
 
 ## Phasing
 
-1. Keys, identity, roster (folding, gossip), logs. Unit-tested.
-2. Warren: multiple listeners, a signer interface, listener-aware
-   `Authorize`; directory over mutable items. Discovery, sessions and
-   invites between members in the simulator.
+1. Keys, identity, roster, logs, sync. Unit-tested. **Keys** (`group/keys`)
+   and the **roster** (`group/roster`, conformance-tested against
+   `group/rostermodel`) are built; logs and the sync state machine are
+   next.
+2. Warren: a signer interface, multiple listeners, listener-aware
+   `Authorize`, mutable puts and replica-aware reads. Then discovery,
+   sessions and invites between members in the simulator.
 3. Content: encryption, tree, announcements; single-source fetch.
 4. Swarming: bitfields, rarest-first, streaming order, work stealing,
    resume, storage budget.
-5. Removal and rekey; blind mirrors.
+5. Removal's runtime parts (grace-window listening, the publish pause,
+   session teardown) and blind mirrors; removal and rekey themselves are
+   in the roster.
+
+Content and the swarming scheduler are pure libraries and can be built
+alongside phase 2. DESIGN.md's *Next steps* keeps the current order.
 
 ## Decisions
 

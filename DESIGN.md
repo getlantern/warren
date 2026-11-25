@@ -898,4 +898,68 @@ and carrier allocator. The design therefore splits measurement in two:
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
 | 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
 | 6 | iOS integration, memory budget, network-change rebind | Rebind and live-session migration built (see *Network changes*). Stall detection built: a caller migrates on its own when the provider goes silent. iOS: builds for device; memory measured in the simulator; open-file budget for punch sockets; memory-pressure hooks for the host's monitor. Next: wiring into radiance and lantern-box, and device measurements (`phys_footprint`, `RLIMIT_NOFILE`) |
-| 7 | Private groups | Design only, in `docs/groups-design.md`: groups of up to ~50, members reached under blinded per-period rendezvous keys by Connect-by-key (an encrypted DHT directory only hints who is online), invites that carry no group secret, members-only sessions, signed per-member logs, encrypted content swarmed piece by piece, rekey on removal. The roster rules are model-checked by `group/rostermodel`. Needs several listeners per endpoint, listener-aware `Authorize`, Ed25519 key blinding, and mutable-item puts from the endpoint |
+| 7 | Private groups | Designed in `docs/groups-design.md`: groups of up to ~50, members reached under blinded per-period rendezvous keys by Connect-by-key (an encrypted DHT directory only hints who is online), invites that carry no group secret, members-only sessions, signed per-member logs, encrypted content swarmed piece by piece, rekey on removal, rejoin by existing key, owner-only role changes. Roster rules model-checked by `group/rostermodel`. Built: `group/keys` (derivation, Ed25519 blinding with a `Signer`, sealing, commitments) and `group/roster` (signed operations, the fold, keyring, writers; conformance-tested against the model). Next: see *Next steps* |
+
+## Next steps
+
+The plan, in order of what unblocks what. Four tracks; A is the main
+line, B runs alongside it, C waits on device time, D is maintenance.
+
+**A. Private groups** (`docs/groups-design.md`, *Phasing*)
+
+1. **Logs** (`group/log`): per-member append-only logs, entries signed
+   and hash-chained, encrypted under the epoch key current when written;
+   fork detection (two signed entries at one sequence number); a removal's
+   cutoff (only entries on the chain ending at the head the remover saw).
+   Pure Go.
+2. **Sync, as a state machine** (`group/sync`): what two members exchange
+   on connect (roster heads and missing operations, liveness, log heads
+   and missing entries), with no networking, so phase 2 only has to carry
+   it over a session and the simulator can drive it in-process. Pure Go.
+3. **Protocol review**, started now, before step 5 needs it: a human
+   review of what the model doesn't cover (join and rejoin sessions,
+   invite-use counting, the grace window), and an independent review of
+   the Ed25519 blinding and expanded-key signer in `group/keys`.
+4. **Warren changes**, each its own small PR, signer first since every
+   later step signs with blinded keys:
+   1. a signer interface (`keys.Signer`) through `endpoint.Listen`,
+      `Connect`, `driver.Node.Listen`/`Signal`, `dht.Node.Listen`/
+      `ListenKey`/`Signal`, and the identity a `Conn` keeps;
+   2. several listeners per endpoint, and `Authorize` told the listener key;
+   3. mutable-item puts from the endpoint, and reads that return every
+      distinct value the replicas hold.
+5. **Sessions and the directory** in the simulator: rendezvous under
+   blinded keys, admission (roster, then member-key proof in the
+   session), sync sessions under the sync key, join and rejoin sessions,
+   the directory over mutable items. Drives step 2's state machine.
+6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
+   tree over ciphertext, announcements. Pure library, so it can be built
+   alongside steps 4 and 5.
+7. **Swarming**: bitfields, rarest-first, playhead order, work stealing,
+   resume, storage budget; inventories for mirrors. The scheduler is pure
+   and can also start alongside 4 and 5; wiring it needs 5.
+8. **Removal's runtime parts**: grace-window listening under superseded
+   secrets, the publish pause until a corrective rekey, session teardown
+   on removal, and mirrors. (Removal and rekey themselves are in the
+   roster.)
+
+**B. DHT speed** (*Performance against libtorrent*): the hit median is
+still about twice libtorrent's, which is routing-table work, not tuning:
+larger far buckets, preferring low-RTT nodes, and evicting only after two
+failures. Measured with `cmd/dhtbench` against libtorrent, one change at a
+time. Independent of A, so it fills the time while step A3's reviews run.
+
+**C. iOS** (row 6): wire warren into radiance and lantern-box (memory
+monitor to `CloseOldest`/`CloseAll`/`SetRefusing`, path monitor to
+`Rebind`), then measure `phys_footprint` and `RLIMIT_NOFILE` on a device.
+Needs device time and changes in those repos.
+
+**D. Maintenance**: field-validate stall detection's 1 s ack grace on
+phones, and rebind debounce, once C gives real-network data; signaling's
+keepalive answers and store-and-poll fallback (row 3).
+
+**How we review.** Codex has been out of credits and Copilot rate-limited
+or stalled, so each PR's gate is local `/code-review` rounds, with Copilot
+and CodeRabbit where they respond. The roster PR took nine rounds; smaller
+PRs (one warren change each in A4, logs apart from sync) should take
+fewer.
