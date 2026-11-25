@@ -23,8 +23,12 @@ func TestIdentityMatchesStdlib(t *testing.T) {
 		t.Fatal("public key differs from crypto/ed25519")
 	}
 	for _, msg := range [][]byte{nil, []byte("x"), bytes.Repeat([]byte("m"), 1000)} {
-		if got, want := ours.Sign(msg), ed25519.Sign(std, msg); !bytes.Equal(got, want) {
+		got, want := ours.Sign(msg), ed25519.Sign(std, msg)
+		if !bytes.Equal(got, want) {
 			t.Fatalf("signature of %d bytes differs from crypto/ed25519", len(msg))
+		}
+		if !ours.Public().Verify(msg, got) {
+			t.Fatalf("PublicKey.Verify rejects the member's own signature of %d bytes", len(msg))
 		}
 	}
 }
@@ -46,6 +50,12 @@ func TestBlindedSignerVerifiesUnderStdlib(t *testing.T) {
 		sig := s.Sign(msg)
 		if !ed25519.Verify(want[:], msg, sig) {
 			t.Fatalf("period %d: crypto/ed25519 rejects the blinded signature", p)
+		}
+		if !want.Verify(msg, sig) {
+			t.Fatalf("period %d: PublicKey.Verify rejects the blinded signature", p)
+		}
+		if want.Valid() != nil {
+			t.Fatalf("period %d: Valid rejects an honest rendezvous key", p)
 		}
 		if alice.Public().Verify(msg, sig) {
 			t.Fatal("a blinded signature verifies under the member key")
