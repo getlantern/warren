@@ -454,6 +454,11 @@ func (s *Set) Add(e *Entry) (bool, error) {
 // that can't both be on one chain. Neither is stored, so taking a proof
 // never shows an entry, and it needs no room in the log's window. A proof
 // below the one held replaces it. It reports whether the proof was taken.
+//
+// A removed author's proofs are refused: it can sign a second history
+// after its removal, which members never store (see addRemoved), so a
+// proof from a peer can't be told from one made to hide its log. A proof
+// a member held from before the removal stays (see cut).
 func (s *Set) AddFork(p *ForkProof) (bool, error) {
 	var es [2]*Entry
 	for i, e := range []*Entry{p.A, p.B} {
@@ -465,6 +470,9 @@ func (s *Set) AddFork(p *ForkProof) (bool, error) {
 			return false, err
 		}
 		es[i] = d
+	}
+	if _, removed := s.cutoffs[es[0].Author]; removed {
+		return false, nil
 	}
 	a, b := es[0], es[1]
 	if b.Seq < a.Seq {

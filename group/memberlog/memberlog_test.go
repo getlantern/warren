@@ -1143,3 +1143,30 @@ func TestAddForkChecksTheProof(t *testing.T) {
 	}
 	checkCounts(t, l)
 }
+
+// TestAddForkRefusesRemovedAuthors: a removed author can sign a second
+// history after its removal; a proof built from it isn't taken.
+func TestAddForkRefusesRemovedAuthors(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 3)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.member.Public(), 3, es[2].ID()); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSet(g)
+	update(t, s, x.fold(t))
+	for i := 2; i >= 0; i-- {
+		if _, err := s.Add(es[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forged, _ := Write(x.member, g, es[0], ep, key, App, []byte("after removal"))
+	if ok, err := s.AddFork(&ForkProof{A: es[1], B: forged}); ok || err != nil {
+		t.Fatalf("a removed author's proof: %v %v", ok, err)
+	}
+	l := s.Log(x.member.Public())
+	if l.Fork() != nil || len(l.Entries()) != 3 {
+		t.Fatalf("forked %v, %d shown", l.Fork() != nil, len(l.Entries()))
+	}
+}
