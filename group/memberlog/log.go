@@ -30,13 +30,20 @@ var (
 	// ErrUnknownEpoch means the entry names no counting key-making roster
 	// operation.
 	ErrUnknownEpoch = errors.New("memberlog: unknown epoch")
+	// ErrNoRoster means Add came before any Update gave the Set a fold.
+	ErrNoRoster = errors.New("memberlog: no roster fold yet")
 	// ErrWrongGroup means the entry belongs to another group.
 	ErrWrongGroup = errors.New("memberlog: entry of another group")
 )
 
-// Window is how far past an author's contiguous chain a member holds
-// entries, so nobody can make others store entries that are never shown.
-const Window = 4096
+// Window and MaxAhead bound what a member holds past an author's
+// contiguous chain, in entries and in bytes, so nobody can make others
+// store entries that are never shown. Sync fills logs from the bottom, so
+// a refused entry (ErrTooFar) is sent again once the gap closes.
+const (
+	Window   = 1024
+	MaxAhead = 4 << 20
+)
 
 // ForkProof is two entries the author signed that can't both be on one
 // chain: two at one sequence number, or one whose Prev isn't the other.
@@ -121,6 +128,17 @@ func (l *Log) retop(seq uint64, gone *[]*Entry) {
 	}
 }
 
+// ahead is the bytes of entries held past the visible chain.
+func (l *Log) ahead() int {
+	n := 0
+	for s, e := range l.bySeq {
+		if s > l.top {
+			n += len(e.Box)
+		}
+	}
+	return n
+}
+
 // drop removes the entry at seq, reporting it in gone if it was visible.
 func (l *Log) drop(seq uint64, gone *[]*Entry) {
 	if e := l.bySeq[seq]; e != nil {
@@ -143,7 +161,7 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 	if l.fork != nil {
 		return false, ErrForked
 	}
-	if e.Seq > l.top+Window {
+	if e.Seq > l.top+Window || l.ahead()+len(e.Box) > MaxAhead {
 		return false, ErrTooFar
 	}
 	if old := l.bySeq[e.Seq]; old != nil {
@@ -306,8 +324,9 @@ func (s *Set) apply(author keys.PublicKey, l *Log) {
 	l.cut(removed, c.seq, c.head, &s.gone)
 }
 
-// Update applies a new fold of the roster to every log; entries leaving
-// the app's view collect for Withdrawn.
+// Update applies a new fold of the roster to every log, and Add checks
+// against it from then on; entries leaving the app's view collect for
+// Withdrawn. Pass the newest fold: the Set follows the one given last.
 func (s *Set) Update(f *roster.Result) {
 	s.learn(f)
 	for author, l := range s.logs {
@@ -315,14 +334,17 @@ func (s *Set) Update(f *roster.Result) {
 	}
 }
 
-// Add checks e against the roster fold f and its author's log, and stores
-// it. It reports whether e was new; entries leaving the app's view collect
-// for Withdrawn.
-func (s *Set) Add(e *Entry, f *roster.Result) (bool, error) {
+// Add checks e against the last fold given to Update and its author's log,
+// and stores it. It reports whether e was new; entries leaving the app's
+// view collect for Withdrawn.
+func (s *Set) Add(e *Entry) (bool, error) {
 	if e.Group != s.group {
 		return false, ErrWrongGroup
 	}
-	s.learn(f)
+	if s.fold == nil {
+		return false, ErrNoRoster
+	}
+	f := s.fold
 	_, removed := s.cutoffs[e.Author]
 	switch role := f.Roles[e.Author]; {
 	case role == roster.Member || role == roster.Admin || role == roster.Owner:

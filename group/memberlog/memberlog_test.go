@@ -132,7 +132,7 @@ func TestChainInAnyOrder(t *testing.T) {
 	s := NewSet(x.r.Group())
 	f := x.fold(t)
 	for _, i := range []int{2, 0, 3, 1} {
-		if _, err := s.Add(es[i], f); err != nil {
+		if _, err := add(s, es[i], f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -140,7 +140,7 @@ func TestChainInAnyOrder(t *testing.T) {
 	if len(got) != 4 || got[3].ID() != es[3].ID() {
 		t.Fatalf("got %d entries", len(got))
 	}
-	if fresh, err := s.Add(es[1], f); fresh || err != nil {
+	if fresh, err := add(s, es[1], f); fresh || err != nil {
 		t.Fatalf("a duplicate: %v %v", fresh, err)
 	}
 }
@@ -151,7 +151,7 @@ func TestGapHidesLaterEntries(t *testing.T) {
 	s := NewSet(x.r.Group())
 	f := x.fold(t)
 	for _, e := range []*Entry{es[0], es[2]} {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -173,11 +173,11 @@ func TestForks(t *testing.T) {
 	f := x.fold(t)
 	s := NewSet(g)
 	for _, e := range []*Entry{a1, a2} {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.Add(b2, f); !errors.Is(err, ErrForked) {
+	if _, err := add(s, b2, f); !errors.Is(err, ErrForked) {
 		t.Fatalf("two entries at one sequence number: %v", err)
 	}
 	l := s.Log(x.member.Public())
@@ -188,16 +188,16 @@ func TestForks(t *testing.T) {
 		t.Fatal("the forked sequence number is still visible")
 	}
 	a3, _ := Write(x.member, g, a2, ep, key, App, []byte("a3"))
-	if _, err := s.Add(a3, f); !errors.Is(err, ErrForked) {
+	if _, err := add(s, a3, f); !errors.Is(err, ErrForked) {
 		t.Fatalf("a forked log accepted more: %v", err)
 	}
 
 	// An entry whose prev contradicts the held chain is also a fork.
 	s2 := NewSet(g)
-	if _, err := s2.Add(a1, f); err != nil {
+	if _, err := add(s2, a1, f); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s2.Add(c2, f); !errors.Is(err, ErrForked) {
+	if _, err := add(s2, c2, f); !errors.Is(err, ErrForked) {
 		t.Fatalf("an entry chained to another history: %v", err)
 	}
 }
@@ -211,19 +211,19 @@ func TestRosterChecks(t *testing.T) {
 
 	stranger := me(9)
 	e, _ := Write(stranger, g, nil, ep, key, App, nil)
-	if _, err := s.Add(e, f); !errors.Is(err, ErrNotWriter) {
+	if _, err := add(s, e, f); !errors.Is(err, ErrNotWriter) {
 		t.Fatalf("a stranger: %v", err)
 	}
 	e, _ = Write(x.mirror, g, nil, ep, key, App, nil)
-	if _, err := s.Add(e, f); !errors.Is(err, ErrNotWriter) {
+	if _, err := add(s, e, f); !errors.Is(err, ErrNotWriter) {
 		t.Fatalf("a mirror: %v", err)
 	}
 	e, _ = Write(x.member, g, nil, roster.ID{7}, key, App, nil)
-	if _, err := s.Add(e, f); !errors.Is(err, ErrUnknownEpoch) {
+	if _, err := add(s, e, f); !errors.Is(err, ErrUnknownEpoch) {
 		t.Fatalf("an unknown epoch: %v", err)
 	}
 	e, _ = Write(x.member, roster.ID{8}, nil, ep, key, App, nil)
-	if _, err := s.Add(e, f); !errors.Is(err, ErrWrongGroup) {
+	if _, err := add(s, e, f); !errors.Is(err, ErrWrongGroup) {
 		t.Fatalf("another group: %v", err)
 	}
 }
@@ -235,7 +235,7 @@ func TestRemovalCutoff(t *testing.T) {
 	s := NewSet(g)
 	f := x.fold(t)
 	for _, e := range es {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -253,7 +253,7 @@ func TestRemovalCutoff(t *testing.T) {
 	if got := l.Entries(); len(got) != 3 || got[2].ID() != es[2].ID() {
 		t.Fatalf("%d entries after the cutoff", len(got))
 	}
-	if _, err := s.Add(es[4], f); !errors.Is(err, ErrPastCutoff) {
+	if _, err := add(s, es[4], f); !errors.Is(err, ErrPastCutoff) {
 		t.Fatalf("an entry past the cutoff: %v", err)
 	}
 
@@ -267,7 +267,7 @@ func TestRemovalCutoff(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Add(forged, f); !errors.Is(err, ErrOffChain) {
+		if _, err := add(s, forged, f); !errors.Is(err, ErrOffChain) {
 			t.Fatalf("a removed author's other history below the cutoff: %v", err)
 		}
 	}
@@ -287,14 +287,14 @@ func TestRemovedLogFillsFromTheHead(t *testing.T) {
 	}
 	f := x.fold(t)
 	s := NewSet(x.r.Group())
-	if _, err := s.Add(es[0], f); !errors.Is(err, ErrOffChain) {
+	if _, err := add(s, es[0], f); !errors.Is(err, ErrOffChain) {
 		t.Fatalf("entry 1 before the head: %v", err)
 	}
-	if _, err := s.Add(es[3], f); !errors.Is(err, ErrPastCutoff) {
+	if _, err := add(s, es[3], f); !errors.Is(err, ErrPastCutoff) {
 		t.Fatalf("entry 4, past the head: %v", err)
 	}
 	for _, i := range []int{2, 1, 0} {
-		if _, err := s.Add(es[i], f); err != nil {
+		if _, err := add(s, es[i], f); err != nil {
 			t.Fatalf("entry %d, top-down: %v", i+1, err)
 		}
 	}
@@ -311,7 +311,7 @@ func TestRemovalBeforeAnyEntrySeen(t *testing.T) {
 	}
 	f := x.fold(t)
 	s := NewSet(x.r.Group())
-	if _, err := s.Add(es[0], f); !errors.Is(err, ErrPastCutoff) {
+	if _, err := add(s, es[0], f); !errors.Is(err, ErrPastCutoff) {
 		t.Fatalf("an entry from a member removed before any was seen: %v", err)
 	}
 	if l := s.Log(x.member.Public()); l != nil && len(l.Entries()) != 0 {
@@ -328,7 +328,7 @@ func TestLaggingMemberKeepsEntries(t *testing.T) {
 	s := NewSet(x.r.Group())
 	f := x.fold(t)
 	for _, e := range es[:2] {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -341,7 +341,7 @@ func TestLaggingMemberKeepsEntries(t *testing.T) {
 	if len(s.Withdrawn()) != 0 || len(l.Entries()) != 2 {
 		t.Fatalf("a lagging member lost entries on the head's chain: %d left", len(l.Entries()))
 	}
-	if _, err := s.Add(es[2], f); err != nil {
+	if _, err := add(s, es[2], f); err != nil {
 		t.Fatal(err)
 	}
 	if len(l.Entries()) != 3 || l.low != 1 {
@@ -362,7 +362,7 @@ func TestHeadEvictsContradictedEntry(t *testing.T) {
 	s := NewSet(g)
 	f := x.fold(t)
 	for _, e := range []*Entry{a1, a2} {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -371,14 +371,14 @@ func TestHeadEvictsContradictedEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	f = x.fold(t)
-	if _, err := s.Add(b3, f); err != nil { // Add applies the removal itself
+	if _, err := add(s, b3, f); err != nil { // Add applies the removal itself
 		t.Fatal(err)
 	}
 	gone := s.Withdrawn()
 	if len(gone) != 1 || gone[0].ID() != a2.ID() {
 		t.Fatalf("withdrew %d entries", len(gone))
 	}
-	if _, err := s.Add(b2, f); err != nil {
+	if _, err := add(s, b2, f); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.Log(x.member.Public()).Entries(); len(got) != 3 || got[1].ID() != b2.ID() {
@@ -394,7 +394,7 @@ func TestRemovalThatStopsCounting(t *testing.T) {
 	s := NewSet(x.r.Group())
 	f := x.fold(t)
 	for _, e := range es {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -435,7 +435,7 @@ func TestRemovalThatStopsCounting(t *testing.T) {
 	}
 	s.Update(f)
 	for _, e := range es[1:] {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatalf("an entry from a member no longer removed: %v", err)
 		}
 	}
@@ -459,7 +459,7 @@ func TestEpochMustCount(t *testing.T) {
 	}
 	f := x.fold(t)
 	e, _ := Write(x.member, x.r.Group(), nil, rk.ID(), keys.EpochKey{3}, App, nil)
-	if _, err := s.Add(e, f); !errors.Is(err, ErrUnknownEpoch) {
+	if _, err := add(s, e, f); !errors.Is(err, ErrUnknownEpoch) {
 		t.Fatalf("an entry under a non-counting rekey: %v", err)
 	}
 }
@@ -472,7 +472,7 @@ func TestRemovedMirrorStillNoWriter(t *testing.T) {
 	}
 	f := x.fold(t)
 	e, _ := Write(x.mirror, x.r.Group(), nil, ep, key, App, nil)
-	if _, err := NewSet(x.r.Group()).Add(e, f); !errors.Is(err, ErrNotWriter) {
+	if _, err := add(NewSet(x.r.Group()), e, f); !errors.Is(err, ErrNotWriter) {
 		t.Fatalf("a removed mirror: %v", err)
 	}
 }
@@ -487,10 +487,10 @@ func TestWindow(t *testing.T) {
 		far, _ = Write(x.member, x.r.Group(), far, ep, key, App, nil)
 	}
 	s := NewSet(x.r.Group())
-	if _, err := s.Add(far, f); !errors.Is(err, ErrTooFar) {
+	if _, err := add(s, far, f); !errors.Is(err, ErrTooFar) {
 		t.Fatalf("an entry %d past an empty log: %v", far.Seq, err)
 	}
-	if _, err := s.Add(first, f); err != nil {
+	if _, err := add(s, first, f); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -508,11 +508,11 @@ func TestCutKeepsForkHidden(t *testing.T) {
 	s := NewSet(g)
 	f := x.fold(t)
 	for _, e := range []*Entry{a1, a2} {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.Add(b2, f); !errors.Is(err, ErrForked) {
+	if _, err := add(s, b2, f); !errors.Is(err, ErrForked) {
 		t.Fatal(err)
 	}
 	if gone := s.Withdrawn(); len(gone) != 1 || gone[0].ID() != a2.ID() {
@@ -531,11 +531,50 @@ func TestCutKeepsForkHidden(t *testing.T) {
 		t.Fatalf("the cut withdrew %d entries already withdrawn", len(gone))
 	}
 	for _, e := range []*Entry{b3, b2} {
-		if _, err := s.Add(e, f); err != nil {
+		if _, err := add(s, e, f); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if got := l.Entries(); len(got) != 3 || got[1].ID() != b2.ID() {
 		t.Fatalf("the head's chain didn't show past the fork point: %d", len(got))
+	}
+}
+
+// add gives s fold f (as a caller does when its roster changes) and adds e.
+func add(s *Set, e *Entry, f *roster.Result) (bool, error) {
+	s.Update(f)
+	return s.Add(e)
+}
+
+func TestAddNeedsAFold(t *testing.T) {
+	x := newFixture(t)
+	e := x.chain(t, x.member, 1)[0]
+	if _, err := NewSet(x.r.Group()).Add(e); !errors.Is(err, ErrNoRoster) {
+		t.Fatalf("an Add before any Update: %v", err)
+	}
+}
+
+func TestMaxAhead(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	f := x.fold(t)
+	s := NewSet(x.r.Group())
+	s.Update(f)
+	prev, _ := Write(x.member, x.r.Group(), nil, ep, key, App, nil)
+	held := 0
+	for range 100 {
+		var err error
+		if prev, err = Write(x.member, x.r.Group(), prev, ep, key, App, make([]byte, MaxBody)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Add(prev); errors.Is(err, ErrTooFar) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		held++
+	}
+	if held*MaxBody > MaxAhead+MaxBody || held == 100 {
+		t.Fatalf("held %d full entries past a gap", held)
 	}
 }
