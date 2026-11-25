@@ -829,7 +829,8 @@ func TestByeOutOfTurn(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, m := range []Message{Want{Author: g.m1.Public(), Seq: 1}, Logs{}, Ops{}} {
+	es := p.chain(t, g.m1, nil, 2, 10)
+	for _, m := range []Message{Want{Author: g.m1.Public(), Seq: 1}, Logs{}, Ops{}, Fork{A: es[0], B: es[1]}} {
 		s2 := New(p.r, p.logs)
 		for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}, Logs{}, Bye{}} {
 			if _, err := s2.Handle(m); err != nil {
