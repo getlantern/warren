@@ -66,8 +66,12 @@ func (v Value) Get(key string) (Value, bool) {
 }
 
 // Decode parses exactly one bencoded value occupying all of b.
-func Decode(b []byte) (Value, error) {
-	d := decoder{buf: b}
+func Decode(b []byte) (Value, error) { return DecodeLimit(b, MaxElements) }
+
+// DecodeLimit is Decode with a caller's bound on the number of values, for
+// documents larger than a datagram.
+func DecodeLimit(b []byte, maxElements int) (Value, error) {
+	d := decoder{buf: b, limit: maxElements}
 	v, err := d.value(0)
 	if err != nil {
 		return Value{}, err
@@ -82,13 +86,14 @@ type decoder struct {
 	buf      []byte
 	pos      int
 	elements int
+	limit    int
 }
 
 func (d *decoder) value(depth int) (Value, error) {
 	if depth > MaxDepth {
 		return Value{}, ErrDepth
 	}
-	if d.elements++; d.elements > MaxElements {
+	if d.elements++; d.elements > d.limit {
 		return Value{}, ErrTooLarge
 	}
 	if d.pos >= len(d.buf) {

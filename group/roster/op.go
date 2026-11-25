@@ -19,6 +19,12 @@ const (
 	MaxName = 256
 	// MaxShards bounds the directory's shard count.
 	MaxShards = 1 << 16
+	// MaxOpBytes bounds an operation's encoding: room for a rekey sealed to
+	// thousands of members, or an add carrying thousands of epoch keys.
+	MaxOpBytes = 1 << 20
+	// maxOpValues bounds its bencode values: every value takes at least
+	// two bytes, so this never binds before MaxOpBytes does.
+	maxOpValues = MaxOpBytes / 2
 )
 
 // ID names an operation: the SHA-256 of its signed encoding. Since the
@@ -281,7 +287,10 @@ func (o *Op) Encode() []byte { return o.encode(true) }
 // Decode parses and verifies an operation: well-formed, canonical (it
 // re-encodes to exactly b), with usable keys, signed by its author.
 func Decode(b []byte) (*Op, error) {
-	v, err := bencode.Decode(b)
+	if len(b) > MaxOpBytes {
+		return nil, ErrMalformed
+	}
+	v, err := bencode.DecodeLimit(b, maxOpValues)
 	if err != nil || v.Kind != bencode.Dict {
 		return nil, ErrMalformed
 	}

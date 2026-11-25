@@ -704,3 +704,30 @@ func TestUnseenPromotionDoesntTrustLists(t *testing.T) {
 		t.Fatalf("a deliver written before its author saw its promotion is recorded as %v", f.As[lie.ID()])
 	}
 }
+
+// TestLargeGroupOpsDecode: a rekey sealed to hundreds of members stays
+// decodable (a datagram's bencode budget would refuse it).
+func TestLargeGroupOpsDecode(t *testing.T) {
+	r, owner, _, _ := group(t)
+	ow := &Writer{R: r, Me: owner}
+	for i := range 200 {
+		k := keys.IdentityFromSeed([32]byte{0xd0, byte(i)}).Public()
+		if _, err := ow.Add(k, "m", Member, keys.PublicKey{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rk, err := ow.Rekey()
+	if err != nil {
+		t.Fatalf("a rekey to 200+ members: %v", err)
+	}
+	if len(rk.Seals) < 200 {
+		t.Fatalf("rekey sealed to %d", len(rk.Seals))
+	}
+	if _, err := Decode(rk.Encode()); err != nil {
+		t.Fatal(err)
+	}
+	big := make([]byte, MaxOpBytes+1)
+	if _, err := Decode(big); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("an oversized encoding: %v", err)
+	}
+}
