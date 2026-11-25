@@ -471,9 +471,6 @@ func (s *Set) AddFork(p *ForkProof) (bool, error) {
 		}
 		es[i] = d
 	}
-	if _, removed := s.cutoffs[es[0].Author]; removed {
-		return false, nil
-	}
 	a, b := es[0], es[1]
 	if b.Seq < a.Seq {
 		a, b = b, a
@@ -481,6 +478,9 @@ func (s *Set) AddFork(p *ForkProof) (bool, error) {
 	if a.Author != b.Author || a.id == b.id ||
 		(a.Seq != b.Seq && (b.Seq != a.Seq+1 || b.Prev == a.id)) {
 		return false, ErrMalformed // not a fork
+	}
+	if _, removed := s.cutoffs[a.Author]; removed {
+		return false, nil
 	}
 	l := s.logs[a.Author]
 	if l == nil {

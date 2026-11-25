@@ -71,6 +71,10 @@ type Want struct {
 	Down   bool
 }
 
+// Bye says the sender has taken everything it asked for: whatever it
+// sends before Bye, the receiver gets first. It keeps answering Wants.
+type Bye struct{}
+
 // Entries answers a Want: entries in the order asked, at most MaxBatch and
 // Budget box bytes. None means the sender has nothing from there.
 type Entries struct {
@@ -84,6 +88,7 @@ func (Fork) kind() int64    { return 3 }
 func (Logs) kind() int64    { return 4 }
 func (Want) kind() int64    { return 5 }
 func (Entries) kind() int64 { return 6 }
+func (Bye) kind() int64     { return 7 }
 
 func str(b []byte) bencode.Value                  { return bencode.Value{Kind: bencode.String, Str: b} }
 func num(n int64) bencode.Value                   { return bencode.Value{Kind: bencode.Int, Int: n} }
@@ -253,6 +258,8 @@ func decode(v bencode.Value) (Message, error) {
 		}
 		m.Seq, m.Down = uint64(s.Int), down
 		return m, nil
+	case Bye{}.kind():
+		return Bye{}, nil
 	case Entries{}.kind():
 		var m Entries
 		es, ok := field("e", bencode.List)

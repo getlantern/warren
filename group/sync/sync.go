@@ -48,6 +48,8 @@ type Sync struct {
 	wants    map[keys.PublicKey]Want // asked and not yet answered
 	walking  map[keys.PublicKey]bool // walking down a peer's branch of a fork
 	stopped  map[keys.PublicKey]bool // nothing more from this peer
+	sentBye  bool
+	gotBye   bool
 	err      error
 }
 
@@ -76,8 +78,15 @@ func (s *Sync) Start() []Message {
 }
 
 // Done reports whether this side has taken everything the peer offered.
-// The peer may still be asking; the session ends when both are done.
+// The peer may still be asking, and messages this side has returned may
+// still be on their way: the session ends at Finished, not Done.
 func (s *Sync) Done() bool { return s.err == nil && s.opsDone && s.logsDone && len(s.wants) == 0 }
+
+// Finished reports whether the exchange is over: this side is done and
+// has said so, and so has the peer. Streams are ordered, so everything
+// either side sent (a fork proof found late, say) has arrived; the session
+// can close.
+func (s *Sync) Finished() bool { return s.Done() && s.sentBye && s.gotBye }
 
 // Handle takes the peer's next message and returns the messages to send
 // in reply. After an error the exchange is over: every later call returns
@@ -90,6 +99,10 @@ func (s *Sync) Handle(m Message) ([]Message, error) {
 	if err != nil {
 		s.err = err
 		return nil, err
+	}
+	if s.Done() && !s.sentBye {
+		s.sentBye = true
+		out = append(out, Bye{}) // after everything this side found
 	}
 	return out, nil
 }
@@ -163,12 +176,18 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		}
 		return out, nil
 	case Want:
-		if !s.opsDone {
-			return nil, violation("want before the roster is merged")
+		if !s.opsDone || s.gotBye {
+			return nil, violation("want before the roster is merged, or after bye")
 		}
 		return []Message{Entries{Author: m.Author, Entries: s.logs.Serve(m.Author, m.Seq, m.Down, Budget, MaxBatch)}}, nil
 	case Entries:
 		return s.entries(m)
+	case Bye:
+		if s.gotBye || !s.opsDone {
+			return nil, violation("bye out of turn")
+		}
+		s.gotBye = true
+		return nil, nil
 	}
 	return nil, violation("unknown message")
 }
@@ -225,8 +244,12 @@ func (s *Sync) logHeads() []Message {
 // it parts from this one.
 func (s *Sync) start(a keys.PublicKey) []Message {
 	h := s.peer[a]
-	if mine := s.logs.At(a, h.Top); mine != nil && mine.ID() != h.ID {
-		return s.walk(a, h.Top)
+	// A removed author's log fills only from its recorded head down, so it
+	// never walks: its branches are settled by the head's chain.
+	if _, down, _ := s.logs.Next(a); !down {
+		if mine := s.logs.At(a, h.Top); mine != nil && mine.ID() != h.ID {
+			return s.walk(a, h.Top)
+		}
 	}
 	return s.want(a)
 }
@@ -310,7 +333,7 @@ func (s *Sync) entries(m Entries) ([]Message, error) {
 // took adds a batch asked for with want, then asks for more. A fork found
 // on the way may lie above where the branches part, but the peer, longer
 // on its branch, sees this side's head differ from its own entry there and
-// walks down itself, sending the lower proof.
+// walks down itself, sending the lower proof before its Bye.
 func (s *Sync) took(a keys.PublicKey, es []*memberlog.Entry) []Message {
 	if len(es) == 0 {
 		s.stopped[a] = true

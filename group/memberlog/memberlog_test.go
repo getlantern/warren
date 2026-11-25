@@ -1165,6 +1165,9 @@ func TestAddForkRefusesRemovedAuthors(t *testing.T) {
 	if ok, err := s.AddFork(&ForkProof{A: es[1], B: forged}); ok || err != nil {
 		t.Fatalf("a removed author's proof: %v %v", ok, err)
 	}
+	if _, err := s.AddFork(&ForkProof{A: es[1], B: x.chain(t, x.admin, 2)[1]}); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a removed author's entry with another's: %v", err)
+	}
 	l := s.Log(x.member.Public())
 	if l.Fork() != nil || len(l.Entries()) != 3 {
 		t.Fatalf("forked %v, %d shown", l.Fork() != nil, len(l.Entries()))

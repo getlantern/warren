@@ -308,7 +308,9 @@ recovery and memory caps.
   refused once the chain is checked), and nobody else.
 - On connect the two exchange the IDs of the roster operations each holds
   and then the operations the other lacks (32 bytes an operation, so a
-  peer one operation ahead is sent one), then liveness (members each has
+  peer one operation ahead is sent one; tens of KB for a v1 group's
+  roster, and set reconciliation if rosters grow far past that), then
+  liveness (members each has
   reached lately), then log heads (*Logs*) and content inventories
   (*Swarming*).
 - **Join sessions** (*Invites*) are separate: they are admitted under an

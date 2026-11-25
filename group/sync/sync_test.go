@@ -128,6 +128,9 @@ func run(t *testing.T, a, b *peer, tamper func(i int, m Message) []Message) (*Sy
 		if i > 100000 {
 			t.Fatal("the exchange doesn't end")
 		}
+		if sa.Finished() && sb.Finished() {
+			t.Fatalf("both finished with %d messages on their way", len(q))
+		}
 		next := q[0]
 		q = q[1:]
 		ms := []Message{next.m}
@@ -196,8 +199,8 @@ func converge(t *testing.T, a, b *peer) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sa.Done() || !sb.Done() {
-		t.Fatalf("done: %v %v", sa.Done(), sb.Done())
+	if !sa.Finished() || !sb.Finished() {
+		t.Fatalf("finished: %v %v", sa.Finished(), sb.Finished())
 	}
 	if state(a) != state(b) {
 		t.Fatal("the peers hold different state after syncing")
@@ -518,6 +521,7 @@ func TestMessageRoundTrip(t *testing.T) {
 		Logs{Heads: []LogHead{{Author: g.m1.Public(), Top: 9, ID: es[1].ID()}}},
 		Want{Author: g.m1.Public(), Seq: 3, Down: true},
 		Entries{Author: g.m1.Public(), Entries: es},
+		Bye{},
 	} {
 		d, err := Decode(Encode(m))
 		if err != nil {
@@ -767,5 +771,63 @@ func TestWalkStopsWhereBranchesPart(t *testing.T) {
 	}
 	if shown(a, g.m1) != len(common) || shown(b, g.m1) != len(common) || sent > 2*MaxBatch {
 		t.Fatalf("shown %d and %d of %d, %d entries sent", shown(a, g.m1), shown(b, g.m1), len(common), sent)
+	}
+}
+
+// TestRemovedLogNeverWalks: a removed author's visible head differing from
+// this side's (two pre-removal branches) still leads to the top-down fill
+// from the recorded head, not a walk the peer can't serve.
+func TestRemovedLogNeverWalks(t *testing.T) {
+	g := newGroup(t)
+	p, r := newPeer(t, g.r), newPeer(t, g.r)
+	x := p.chain(t, g.m1, nil, 5, 10)
+	y := r.chain(t, g.m1, x[0], 3, 11) // r's branch parts above entry 1
+	p.add(t, x[0], x[1])
+	r.add(t, x[0])
+	r.add(t, y...)
+	rm, err := p.writer(g.admin).Remove(g.m1.Public(), 5, x[4].ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	p.update(t)
+	r.update(t)
+	p.add(t, x[4]) // the recorded head, anchored
+	if _, _, err := run(t, p, r, nil); err != nil {
+		t.Fatal(err)
+	}
+	if seq, _, _ := r.logs.Next(g.m1.Public()); seq != 4 {
+		t.Fatalf("r's next is %d: the recorded head never came", seq)
+	}
+}
+
+// TestByeComesLast: a side says Bye only after everything it found, so
+// a driver closing once both are finished loses nothing.
+func TestByeComesLast(t *testing.T) {
+	for _, n := range [][2]int{{5, 5}, {5, 7}, {7, 5}, {2 * MaxBatch, 3}} {
+		g := newGroup(t)
+		a, b := newPeer(t, g.r), newPeer(t, g.r)
+		branches(t, g, a, b, n[0], n[1])
+		converge(t, a, b) // run fails if both finish with messages queued
+	}
+}
+
+func TestByeOutOfTurn(t *testing.T) {
+	g := newGroup(t)
+	p := newPeer(t, g.r)
+	s := New(p.r, p.logs)
+	if _, err := s.Handle(Bye{}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("bye before the roster: %v", err)
+	}
+	s = New(p.r, p.logs)
+	for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}, Bye{}} {
+		if _, err := s.Handle(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Handle(Want{Author: g.m1.Public(), Seq: 1}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("a want after bye: %v", err)
 	}
 }
