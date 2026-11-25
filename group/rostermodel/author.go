@@ -125,7 +125,7 @@ func Author(s Store, rules Rules, kind Kind, author, target Key, role Role) *Op 
 		}
 	case Deliver:
 		t := f.Roles[target]
-		if a == None || (t == None && mutation != "deliver off the roster") {
+		if a == None || t == None {
 			return nil
 		}
 		tEpochs, tGs := held(s, target)
@@ -183,18 +183,22 @@ func withheldFrom(s Store, rules Rules, target Key) map[ID]bool {
 // low Lamport clock, so it sorts early. It seals whatever the author holds.
 // It returns nil unless s holds a remove or demotion of author.
 func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
-	lost := func(o *Op) bool {
-		return o.Target == author && (o.Kind == Remove || (o.Kind == SetRole && o.Role == Member))
+	// The counting operation that took the author's authority: its removal,
+	// or its last grant if that was a demotion.
+	f, err := Fold(s)
+	if err != nil {
+		return nil
+	}
+	lost := f.Removed[author]
+	if g := f.Grants[author]; lost == 0 && len(g) > 0 && g[len(g)-1].Role == Member {
+		lost = g[len(g)-1].ID
+	}
+	if lost == 0 {
+		return nil
 	}
 	pre := Store{}
 	for id, o := range s {
-		before := lost(o)
-		for p := range s.History(id) {
-			if lost(s[p]) {
-				before = true
-			}
-		}
-		if !before {
+		if id != lost && !s.History(id)[lost] {
 			pre[id] = o
 		}
 	}

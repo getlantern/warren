@@ -71,13 +71,13 @@ type Op struct {
 	ID      ID
 	Kind    Kind
 	Author  Key
-	Target  Key  // add, remove, deliver
-	Role    Role // add
+	Target  Key  // add, remove, deliver, role
+	Role    Role // add, role
 	Parents []ID
 	Lamport uint64
 	Seals   []Seal
-	// Backdated marks an operation written by a removed author after it
-	// learned of its removal; Rogue, one written by a compromised device
+	// Backdated marks an operation written by a removed or demoted author
+	// after it learned of that; Rogue, one written by a compromised device
 	// without its role's authority for it. The fold reads neither; properties do.
 	Backdated, Rogue bool
 }
@@ -269,7 +269,13 @@ func Fold(s Store) (*Result, error) {
 					}
 					restored := false
 					for _, p := range grants[i+1:] {
-						if p.Role == Admin && s.History(p.ID)[d.ID] && s.History(o.ID)[p.ID] {
+						if hist[p.ID] == nil {
+							hist[p.ID] = s.History(p.ID)
+						}
+						if hist[o.ID] == nil {
+							hist[o.ID] = s.History(o.ID)
+						}
+						if p.Role == Admin && hist[p.ID][d.ID] && hist[o.ID][p.ID] && mutation != "demotions never restored" {
 							restored = true
 						}
 					}
@@ -290,12 +296,20 @@ func Fold(s Store) (*Result, error) {
 	}
 }
 
-// admitted caches, per add, whether its author had already admitted the
-// target. An ID hashes the op's content and its parents' IDs, so it commits
-// to the op's whole history and the answer never changes. That holds here
-// because seal computes every ID; a real roster taking ops from peers must
-// verify each ID against its content before caching by it.
-var admitted sync.Map // admittedKey -> bool
+// admitted caches, per operation, the fold of its causal history: its
+// author's view when it wrote it. An ID hashes the op's content and its
+// parents' IDs, so it commits to the op's whole history and the view never
+// changes. That holds here because seal computes every ID; a real roster
+// taking ops from peers must verify each ID against its content before
+// caching by it.
+var admitted sync.Map // admittedKey -> *authorView
+
+// authorView is what an operation's author saw: the roster of its history.
+type authorView struct {
+	roles   map[Key]Role
+	removed map[Key]ID
+	failed  bool // the history's fold had no fixpoint
+}
 
 type admittedKey struct {
 	mutation string
@@ -310,32 +324,49 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 	for _, o := range order {
 		byID[o.ID] = o
 	}
-	// sawTarget reports whether an add's author had already admitted its
-	// target, on the roster now or removed since, in the fold of the add's
-	// own causal history.
-	sawTarget := func(o *Op) bool {
-		if mutation == "role changes count" {
-			return false
-		}
+	viewOf := func(o *Op) *authorView {
 		k := admittedKey{mutation, o.ID}
 		if v, ok := admitted.Load(k); ok {
-			return v.(bool)
+			return v.(*authorView)
 		}
-		view, complete := Store{}, true
+		hist, complete := Store{}, true
 		for id := range byID.History(o.ID) {
 			if byID[id] == nil {
 				complete = false
 				continue
 			}
-			view[id] = byID[id]
+			hist[id] = byID[id]
 		}
-		f, err := Fold(view)
-		// A history with no fixpoint can't show the key wasn't admitted.
-		v := err != nil || f.Roles[o.Target] != None || f.Removed[o.Target] != 0
+		v := &authorView{}
+		if f, err := Fold(hist); err != nil {
+			v.failed = true
+		} else {
+			v.roles, v.removed = f.Roles, f.Removed
+		}
 		if complete {
 			admitted.Store(k, v)
 		}
 		return v
+	}
+	// sawTarget reports whether an add's author had already admitted its
+	// target, on the roster now or removed since, in its own view. A view
+	// with no fixpoint can't show the key wasn't admitted.
+	sawTarget := func(o *Op) bool {
+		if mutation == "role changes count" {
+			return false
+		}
+		v := viewOf(o)
+		return v.failed || v.roles[o.Target] != None || v.removed[o.Target] != 0
+	}
+	// adminInView reports whether a remove's target was an admin in its
+	// author's own view: an admin may not remove it then, even if the fold
+	// has since demoted it.
+	adminInView := func(o *Op) bool {
+		if mutation == "removers need not see demotions" {
+			return false
+		}
+		v := viewOf(o)
+		return v.failed || v.roles[o.Target] == Admin
 	}
 	// granted is the operation that gave each admin its role: its counting
 	// add as admin, or its latest promotion. An operation needing admin
@@ -394,7 +425,8 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			}
 		case Remove:
 			t := r.Roles[o.Target]
-			can := author == Owner || (author == Admin && (t != Admin || mutation == "admins remove admins")) ||
+			can := author == Owner ||
+				(author == Admin && ((t != Admin && !adminInView(o)) || mutation == "admins remove admins")) ||
 				((author == Member || author == Mirror) && mutation == "members remove")
 			if can && t != None && (t != Owner || mutation == "owner removable") {
 				delete(r.Roles, o.Target)

@@ -117,9 +117,16 @@ func actions(w world, rules Rules) []action {
 			}
 			if f.Roles[r] == Owner {
 				op(r, Add, N, Admin, false)
-				op(r, SetRole, M, Admin, false)
-				op(r, SetRole, A, Member, false)
-				op(r, SetRole, B, Member, false)
+				// Promote or demote each, whichever its role allows, so
+				// demote-then-promote chains get explored.
+				for _, k := range []Key{A, B, M} {
+					switch f.Roles[k] {
+					case Admin:
+						op(r, SetRole, k, Member, false)
+					case Member:
+						op(r, SetRole, k, Admin, false)
+					}
+				}
 			} else {
 				op(r, Add, N, Member, false)
 				op(r, Add, N, Mirror, false)
@@ -135,7 +142,7 @@ func actions(w world, rules Rules) []action {
 		// A compromised device signing what its role has no authority for.
 		switch f.Roles[r] {
 		case Owner:
-			// v1 has no role changes, not even by the owner.
+			// Roles change only through role operations, not by re-adding.
 			as = append(as, rogue(r, Add, M, Admin))
 		case Admin:
 			other := A
@@ -144,8 +151,10 @@ func actions(w world, rules Rules) []action {
 			}
 			// Re-adding N as a member is a role change once N is a mirror,
 			// and a re-add once it's removed: neither may count.
-			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin),
-				rogue(r, SetRole, M, Admin), rogue(r, SetRole, other, Member))
+			as = append(as, rogue(r, Remove, O, None), rogue(r, Add, N, Admin), rogue(r, SetRole, M, Admin))
+			if f.Roles[other] == Admin {
+				as = append(as, rogue(r, Remove, other, None), rogue(r, SetRole, other, Member))
+			}
 			if f.Roles[N] != None || f.Removed[N] != 0 {
 				as = append(as, rogue(r, Add, N, Member))
 			}
@@ -217,18 +226,6 @@ func memberLeak(f *Result) func(*Op) bool {
 	}
 }
 
-// demotedBefore reports whether o's target had been demoted before o in the
-// total order.
-func demotedBefore(f *Result, o *Op) bool {
-	pos := slices.IndexFunc(f.Order, func(x *Op) bool { return x.ID == o.ID })
-	for _, g := range f.Grants[o.Target] {
-		if g.Role == Member && slices.IndexFunc(f.Order, func(x *Op) bool { return x.ID == g.ID }) < pos {
-			return true
-		}
-	}
-	return false
-}
-
 // demoted reports whether k's last counting role change demoted it.
 func demoted(f *Result, k Key) bool {
 	g := f.Grants[k]
@@ -257,16 +254,13 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 		return fmt.Errorf("owner lost its role: %v", f.Roles[O])
 	}
 	for _, o := range f.Order {
-		// An admin may remove a member, including one the fold had
-		// demoted from admin before the remove, even if the remover
-		// hadn't seen the demotion.
-		if o.Rogue && f.Counts[o.ID] && (o.Kind != Remove || !demotedBefore(f, o)) {
+		if o.Rogue && f.Counts[o.ID] {
 			return fmt.Errorf("rogue %v by %v counts", opDesc(o), o.Author)
 		}
 	}
 	for _, o := range f.Order {
 		if o.Backdated && f.Counts[o.ID] && (f.Removed[o.Author] != 0 || (demoted(f, o.Author) && needsAdmin(o))) {
-			return fmt.Errorf("backdated %v by removed %v counts", o.Kind, o.Author)
+			return fmt.Errorf("backdated %v by removed or demoted %v counts", o.Kind, o.Author)
 		}
 	}
 	// Past (not current) epoch keys can reach a key that ends up a mirror
@@ -465,6 +459,7 @@ func TestMutations(t *testing.T) {
 		// stray delivery, so delivery's roster check only spares a rekey.
 		"members add", "members remove", "members rekey", "role changes count",
 		"admins set roles", "no demotion view rule", "unseen grants count",
+		"removers need not see demotions",
 	} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m
@@ -507,6 +502,50 @@ func TestRemovedReAdd(t *testing.T) {
 	}
 	if err := check(w.union(), Rules{}, docPredicate); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// restoredScenario is an admin demoted and then promoted again, which writes
+// a rekey after seeing both: the promotion restores its authority, so the
+// rekey counts.
+func restoredScenario(t *testing.T) error {
+	w := setup(t, Rules{})
+	steps := []func() *Op{
+		func() *Op { return Author(w[O], Rules{}, SetRole, O, A, Member) },
+		func() *Op { return Author(w[O], Rules{}, SetRole, O, A, Admin) },
+	}
+	for i, st := range steps {
+		if st() == nil {
+			return fmt.Errorf("step %d not written", i)
+		}
+	}
+	for id, o := range w[O] {
+		w[A][id] = o
+	}
+	rk := Author(w[A], Rules{}, Rekey, A, 0, None)
+	if rk == nil {
+		return fmt.Errorf("A can't rekey after its promotion")
+	}
+	f, err := Fold(w.union())
+	if err != nil {
+		return err
+	}
+	if !f.Counts[rk.ID] {
+		return fmt.Errorf("A's rekey after its re-promotion doesn't count")
+	}
+	return nil
+}
+
+func TestRestoredByPromotion(t *testing.T) {
+	admitted.Clear()
+	if err := restoredScenario(t); err != nil {
+		t.Fatal(err)
+	}
+	mutation = "demotions never restored"
+	defer func() { mutation = "" }()
+	admitted.Clear()
+	if restoredScenario(t) == nil {
+		t.Fatal("mutation not caught")
 	}
 }
 
