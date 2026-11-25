@@ -186,6 +186,18 @@ func TestSealOpen(t *testing.T) {
 	}
 }
 
+func TestSealFreshEphemeral(t *testing.T) {
+	to := id(t, 1).Public()
+	a, err := Seal(to, "c", []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := Seal(to, "c", []byte("x"))
+	if bytes.Equal(a[:32], b[:32]) {
+		t.Fatal("two seals shared an ephemeral key, so they reuse a key and nonce")
+	}
+}
+
 func TestVerifyRejectsSmallOrderKeys(t *testing.T) {
 	// Under the identity point A, R = r·B and S = r verify for any message,
 	// since the challenge term c·A vanishes.
@@ -290,6 +302,9 @@ func TestVectors(t *testing.T) {
 		"commitEpoch":   h(ce[:]),
 		"rendezvous":    h(rk[:]),
 		"blindedSig":    h(alice.Rendezvous(g, p).Sign([]byte("offer"))),
+	}
+	if len(got) != len(vectors) {
+		t.Fatalf("%d derivations computed, %d pinned", len(got), len(vectors))
 	}
 	for name, v := range got {
 		if v != vectors[name] {

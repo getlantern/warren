@@ -76,7 +76,7 @@ func (g Secret) DirectorySalt(p uint64, shard uint32) []byte {
 // rendezvous key (not its member key), when the callee may not know the
 // caller yet: only a holder of G can compute it, and signaling offers are
 // signed by it, so it proves G before any session exists.
-func (g Secret) SyncKey(p uint64, rendezvous PublicKey) *Identity {
+func (g Secret) SyncKey(p uint64, rendezvous PublicKey) Signer {
 	info := "sync" + string(periodBytes(p)) + string(rendezvous[:])
 	return IdentityFromSeed([32]byte(derive(g[:], info, 32)))
 }

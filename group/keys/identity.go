@@ -31,8 +31,8 @@ func (pk PublicKey) Verify(msg, sig []byte) bool {
 	return ed25519.Verify(pk[:], msg, sig)
 }
 
-// Valid reports whether pk is a usable key (see ErrBadKey). A roster checks
-// it before admitting a member key.
+// Valid returns ErrBadKey if pk isn't a usable key, the check to run before
+// admitting a member key.
 func (pk PublicKey) Valid() error {
 	_, err := pk.point()
 	return err
