@@ -210,7 +210,8 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 
 // trim drops what a live log holds past its bounds, highest first: after a
 // lifted removal, a head's chain may have filled more than a live log
-// holds ahead, and a fork or a fold can hide a long visible chain. Sync fetches what it drops again as the gap closes.
+// holds ahead, and a fork or a fold can hide a long visible chain. Sync
+// fetches what it drops again as the gap closes.
 func (l *Log) trim() {
 	var none []*Entry // nothing dropped here is visible
 	for s := range l.bySeq {
