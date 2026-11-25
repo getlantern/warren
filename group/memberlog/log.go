@@ -80,15 +80,21 @@ func (l *Log) Entries() []*Entry {
 // Head returns the last entry the app may see, or nil.
 func (l *Log) Head() *Entry { return l.bySeq[l.top] }
 
-// limit is the highest sequence number the app may see.
+// limit is the highest sequence number the app may see: below a fork
+// point, except where a removal's head has anchored the chain past it, and
+// never past a removal's cutoff.
 func (l *Log) limit() uint64 {
-	switch {
-	case l.removed:
-		return l.cutSeq
-	case l.fork != nil:
-		return min(l.fork.A.Seq, l.fork.B.Seq) - 1
+	lim := ^uint64(0)
+	if l.fork != nil {
+		point := min(l.fork.A.Seq, l.fork.B.Seq)
+		if !l.removed || l.low > point {
+			lim = point - 1
+		}
 	}
-	return ^uint64(0)
+	if l.removed {
+		lim = min(lim, l.cutSeq)
+	}
+	return lim
 }
 
 // retop recomputes the visible chain's end after a change at or below seq.
@@ -203,7 +209,9 @@ func (l *Log) cut(removed bool, seq uint64, head ID, gone *[]*Entry) {
 		l.retop(l.top + 1)
 		return
 	}
-	l.removed, l.cutSeq, l.cutHead, l.fork = true, seq, head, nil
+	// The fork proof stays: entries past the fork point show only once the
+	// head's anchored chain covers them (see limit).
+	l.removed, l.cutSeq, l.cutHead = true, seq, head
 	for s, e := range l.bySeq {
 		if s > seq || (s == seq && e.id != head) {
 			l.drop(s, gone)

@@ -494,3 +494,42 @@ func TestWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCutKeepsForkHidden: cutting a forked log doesn't reveal either branch
+// past the fork point until the remover's head anchors one.
+func TestCutKeepsForkHidden(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	a1, _ := Write(x.member, g, nil, ep, key, App, []byte("a1"))
+	a2, _ := Write(x.member, g, a1, ep, key, App, []byte("a2"))
+	b2, _ := Write(x.member, g, a1, ep, key, App, []byte("b2"))
+	b3, _ := Write(x.member, g, b2, ep, key, App, []byte("b3"))
+	s := NewSet(g)
+	f := x.fold(t)
+	for _, e := range []*Entry{a1, a2} {
+		if _, err := s.Add(e, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Add(b2, f); !errors.Is(err, ErrForked) {
+		t.Fatal(err)
+	}
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.member.Public(), 3, b3.ID()); err != nil {
+		t.Fatal(err)
+	}
+	f = x.fold(t)
+	s.Update(f)
+	l := s.Log(x.member.Public())
+	if n := len(l.Entries()); n != 1 {
+		t.Fatalf("cutting a forked log showed %d entries", n)
+	}
+	for _, e := range []*Entry{b3, b2} {
+		if _, err := s.Add(e, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := l.Entries(); len(got) != 3 || got[1].ID() != b2.ID() {
+		t.Fatalf("the head's chain didn't show past the fork point: %d", len(got))
+	}
+}
