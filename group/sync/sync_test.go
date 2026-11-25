@@ -446,8 +446,9 @@ func TestForkPastTheWindow(t *testing.T) {
 }
 
 // TestTamperedExchanges: a message duplicated either fails as a protocol
-// violation or changes nothing; one dropped never panics, and leaves a
-// side not done unless what was dropped needed no answer.
+// violation or changes nothing; one dropped never panics, and leaves the
+// exchange unfinished unless it was a fork proof, which needs no answer. A
+// dropped Bye leaves both sides done, but not finished.
 func TestTamperedExchanges(t *testing.T) {
 	g := newGroup(t)
 	base := func() (*peer, *peer) {
@@ -484,7 +485,7 @@ func TestTamperedExchanges(t *testing.T) {
 			t.Fatalf("message %d duplicated: %v", i, err)
 		}
 		if err == nil && (!sa.Finished() || !sb.Finished() || shape(a) != want || state(a) != state(b)) {
-			t.Fatalf("message %d duplicated: no error, but not converged: done %v %v\n%s\n%s\n%s", i, sa.Done(), sb.Done(), want, shape(a), shape(b))
+			t.Fatalf("message %d duplicated: no error, but not converged: finished %v %v\n%s\n%s\n%s", i, sa.Finished(), sb.Finished(), want, shape(a), shape(b))
 		}
 
 		a, b = base()
@@ -823,14 +824,11 @@ func TestByeOutOfTurn(t *testing.T) {
 	if _, err := s.Handle(Bye{}); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("bye before the roster: %v", err)
 	}
-	s = New(p.r, p.logs)
-	for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}, Logs{}, Bye{}} {
-		if _, err := s.Handle(m); err != nil {
-			t.Fatal(err)
-		}
-	}
 	es := p.chain(t, g.m1, nil, 2, 10)
-	for _, m := range []Message{Want{Author: g.m1.Public(), Seq: 1}, Logs{}, Ops{}, Fork{A: es[0], B: es[1]}} {
+	// A peer that said Bye only answers Wants. (Ops and Logs after Bye are
+	// also out of turn by their own checks; Want, Fork and Bye rely on
+	// this one.)
+	for _, m := range []Message{Want{Author: g.m1.Public(), Seq: 1}, Fork{A: es[0], B: es[1]}, Bye{}} {
 		s2 := New(p.r, p.logs)
 		for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{}, Logs{}, Bye{}} {
 			if _, err := s2.Handle(m); err != nil {
