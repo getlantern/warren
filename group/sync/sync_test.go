@@ -428,8 +428,8 @@ func TestOpsSplit(t *testing.T) {
 	}
 }
 
-// TestForkPastTheWindow: a fork proof too far past b's chain to take on
-// arrival is taken once the batches bring the chain up to it.
+// TestForkPastTheWindow: a fork proof far past b's chain is taken on
+// arrival, and b still fills the prefix below it.
 func TestForkPastTheWindow(t *testing.T) {
 	g := newGroup(t)
 	a, b := newPeer(t, g.r), newPeer(t, g.r)
@@ -439,9 +439,18 @@ func TestForkPastTheWindow(t *testing.T) {
 	if _, err := a.logs.Add(y[0]); !errors.Is(err, memberlog.ErrForked) {
 		t.Fatalf("setup: %v", err)
 	}
-	converge(t, a, b)
-	if b.logs.Log(g.m1.Public()).Fork() == nil {
-		t.Fatal("the fork proof past the window never reached b")
+	// The proof needs no room in the window: b takes it on arrival, before
+	// any entries come.
+	sa, sb, err := run(t, a, b, func(_ int, m Message) []Message {
+		if _, ok := m.(Entries); ok {
+			if l := b.logs.Log(g.m1.Public()); l == nil || l.Fork() == nil {
+				t.Fatal("entries arrived before b took the fork proof")
+			}
+		}
+		return []Message{m}
+	})
+	if err != nil || !sa.Finished() || !sb.Finished() || state(a) != state(b) {
+		t.Fatalf("not converged: %v", err)
 	}
 }
 
@@ -536,7 +545,7 @@ func TestMessageRoundTrip(t *testing.T) {
 	}
 	for name, b := range map[string][]byte{
 		"unknown kind":   []byte("d1:ti9ee"),
-		"extra field":    []byte("d1:hle1:xi1e1:ti1ee"),
+		"extra field":    []byte("d1:hle1:mi0e1:ti1e1:xi1ee"),
 		"want seq 0":     slices.Concat([]byte("d1:a32:"), make([]byte, 32), []byte("1:di0e1:si0e1:ti5ee")),
 		"flag of 2":      slices.Concat([]byte("d1:a32:"), make([]byte, 32), []byte("1:di2e1:si1e1:ti5ee")),
 		"trailing bytes": []byte("d1:hle1:mi0e1:ti1eex"),
@@ -806,14 +815,64 @@ func TestRemovedLogNeverWalks(t *testing.T) {
 	}
 }
 
-// TestByeComesLast: a side says Bye only after everything it found, so
-// a driver closing once both are finished loses nothing.
-func TestByeComesLast(t *testing.T) {
-	for _, n := range [][2]int{{5, 5}, {5, 7}, {7, 5}, {2 * MaxBatch, 3}} {
-		g := newGroup(t)
-		a, b := newPeer(t, g.r), newPeer(t, g.r)
-		branches(t, g, a, b, n[0], n[1])
-		converge(t, a, b) // run fails if both finish with messages queued
+// TestRemovedLogHalves: one member holds a removed author's entries from
+// before the removal, the other the recorded head's chain down to just
+// above them; each asks the other before either answers, and both end
+// with the whole log, closing with nothing queued.
+func TestRemovedLogHalves(t *testing.T) {
+	g := newGroup(t)
+	p, r := newPeer(t, g.r), newPeer(t, g.r)
+	x := p.chain(t, g.m1, nil, 5, 10)
+	p.add(t, x[:3]...)
+	rm, err := p.writer(g.admin).Remove(g.m1.Public(), 5, x[4].ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	p.update(t)
+	r.update(t)
+	r.add(t, x[4], x[3])
+	converge(t, p, r)
+	if shown(p, g.m1) != 5 || shown(r, g.m1) != 5 {
+		t.Fatalf("shown %d and %d, want 5 each", shown(p, g.m1), shown(r, g.m1))
+	}
+}
+
+func TestEncodeRefusesPointers(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("encoded a *Want")
+		}
+	}()
+	Encode(&Want{Seq: 1})
+}
+
+// TestOpsErrorKeepsLogsCurrent: a batch whose second operation fails
+// leaves the first in the roster, and the logs follow the roster as it
+// now stands, so a removal it carried still cuts.
+func TestOpsErrorKeepsLogsCurrent(t *testing.T) {
+	g := newGroup(t)
+	src, p := newPeer(t, g.r), newPeer(t, g.r)
+	rm, err := src.writer(g.admin).Remove(g.m1.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := newGroup(t)
+	foreign, err := (&roster.Writer{R: other.r, Me: other.owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(p.r, p.logs)
+	if _, err := s.Handle(Have{IDs: p.r.IDs()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Handle(Ops{Ops: []*roster.Op{rm, foreign}}); err == nil {
+		t.Fatal("a foreign operation was taken")
+	}
+	if _, down, _ := p.logs.Next(g.m1.Public()); !down {
+		t.Fatal("the logs didn't follow a removal the roster took")
 	}
 }
 

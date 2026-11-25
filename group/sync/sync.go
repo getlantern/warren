@@ -48,6 +48,7 @@ type Sync struct {
 	wants    map[keys.PublicKey]Want // asked and not yet answered
 	walking  map[keys.PublicKey]bool // walking down a peer's branch of a fork
 	stopped  map[keys.PublicKey]bool // nothing more from this peer
+	added    bool                    // operations went into r this exchange
 	sentBye  bool
 	gotBye   bool
 	err      error
@@ -138,19 +139,21 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		if !s.gotHave || s.opsDone {
 			return nil, violation("operations out of turn")
 		}
-		for _, o := range m.Ops {
+		for i, o := range m.Ops {
 			if _, err := s.r.Add(o); err != nil {
+				if i > 0 || s.added {
+					// What was added stays, so the logs follow it; the Add's
+					// error is the one to report.
+					_ = s.refold()
+				}
 				return nil, err
 			}
+			s.added = true
 		}
 		if m.More {
 			return nil, nil
 		}
-		f, err := s.r.Fold()
-		if err != nil {
-			return nil, err
-		}
-		if err := s.logs.Update(f); err != nil {
+		if err := s.refold(); err != nil {
 			return nil, err
 		}
 		s.opsDone = true
@@ -197,6 +200,16 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		return nil, nil
 	}
 	return nil, violation("unknown message")
+}
+
+// refold brings the logs up to the roster as it now stands, so they never
+// check entries against an older fold than r's, even after an error.
+func (s *Sync) refold() error {
+	f, err := s.r.Fold()
+	if err != nil {
+		return err
+	}
+	return s.logs.Update(f)
 }
 
 // missingOps returns every operation this side holds that the peer

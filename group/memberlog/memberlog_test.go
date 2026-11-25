@@ -1173,3 +1173,28 @@ func TestAddForkRefusesRemovedAuthors(t *testing.T) {
 		t.Fatalf("forked %v, %d shown", l.Fork() != nil, len(l.Entries()))
 	}
 }
+
+// TestAddForkAnyEpoch: a proof is taken whatever epoch its entries name,
+// so a member receiving it after the epoch stopped counting agrees with
+// one that held it from before.
+func TestAddForkAnyEpoch(t *testing.T) {
+	x := newFixture(t)
+	f := x.fold(t)
+	stale := x.stalePair(t, f)
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.mirror.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := stale.Keyring(x.owner).Epochs[rm.ID()]
+	g := x.r.Group()
+	e1, _ := Write(x.owner, g, nil, rm.ID(), key, App, []byte("1"))
+	e1b, _ := Write(x.owner, g, nil, rm.ID(), key, App, []byte("1b"))
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSet(g)
+	update(t, s, x.fold(t)) // rm's epoch no longer counts
+	if ok, err := s.AddFork(&ForkProof{A: e1, B: e1b}); !ok || err != nil {
+		t.Fatalf("a proof under an epoch that stopped counting: %v %v", ok, err)
+	}
+}

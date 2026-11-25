@@ -466,7 +466,11 @@ func (s *Set) AddFork(p *ForkProof) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if err := s.check(d); err != nil {
+		// Not check: two entries the author signed at one sequence number
+		// prove a fork whatever epoch they name, so a member receiving the
+		// proof after an epoch stopped counting agrees with one that held
+		// it before.
+		if err := s.admits(d); err != nil {
 			return false, err
 		}
 		es[i] = d
@@ -501,6 +505,22 @@ func (s *Set) AddFork(p *ForkProof) (bool, error) {
 
 // check is what any entry must pass to be taken, against the current fold.
 func (s *Set) check(e *Entry) error {
+	if err := s.admits(e); err != nil {
+		return err
+	}
+	// A removed author's log is filled top-down from the recorded head, so
+	// an entry whose epoch stopped counting must still be taken to anchor
+	// the eligible ones below it; it stays hidden (eligible), and anchoring
+	// bounds what is held.
+	if _, removed := s.cutoffs[e.Author]; !removed && !s.epochs[e.Epoch] {
+		return ErrUnknownEpoch
+	}
+	return nil
+}
+
+// admits is what any entry must pass, a fork proof's included: its group,
+// and an author the roster lets write.
+func (s *Set) admits(e *Entry) error {
 	if e.Group != s.group {
 		return ErrWrongGroup
 	}
@@ -509,13 +529,6 @@ func (s *Set) check(e *Entry) error {
 	}
 	if !s.writer(e.Author) {
 		return ErrNotWriter // never admitted, or a mirror
-	}
-	// A removed author's log is filled top-down from the recorded head, so
-	// an entry whose epoch stopped counting must still be taken to anchor
-	// the eligible ones below it; it stays hidden (eligible), and anchoring
-	// bounds what is held.
-	if _, removed := s.cutoffs[e.Author]; !removed && !s.epochs[e.Epoch] {
-		return ErrUnknownEpoch
 	}
 	return nil
 }
@@ -568,7 +581,7 @@ func (s *Set) Next(author keys.PublicKey) (seq uint64, down, done bool) {
 // seq can take, in the order it takes them, within budget box bytes:
 // along the visible chain, upward or downward (a peer finding where its
 // branch of a fork parts from this one walks down), or, for a removed
-// author, downward along the chain anchored to the recorded head; at most
+// author, downward through what it holds at or below the cutoff; at most
 // n of them.
 func (s *Set) Serve(author keys.PublicKey, seq uint64, down bool, budget, n int) []*Entry {
 	l := s.logs[author]
@@ -579,7 +592,10 @@ func (s *Set) Serve(author keys.PublicKey, seq uint64, down bool, budget, n int)
 	for {
 		var e *Entry
 		if down && l.removed {
-			if seq >= l.low && seq <= l.cutSeq {
+			// Anchored or not: what this side held from before the removal
+			// may be the very prefix the asker can anchor, and the asker's
+			// addRemoved checks each entry links to the one above it.
+			if seq <= l.cutSeq {
 				e = l.bySeq[seq]
 			}
 		} else if seq <= l.top {

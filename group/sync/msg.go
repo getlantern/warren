@@ -102,7 +102,8 @@ func flag(b bool) bencode.Value {
 	return num(0)
 }
 
-// Encode returns m's encoding.
+// Encode returns m's encoding. m is one of this package's message values;
+// anything else (a pointer to one, say) panics.
 func Encode(m Message) []byte {
 	d := []bencode.Pair{}
 	switch m := m.(type) {
@@ -135,6 +136,9 @@ func Encode(m Message) []byte {
 			es = append(es, str(e.Encode()))
 		}
 		d = append(d, pair("a", str(m.Author[:])), pair("e", list(es)))
+	case Bye:
+	default: // a pointer to a message, say: a programming error
+		panic(fmt.Sprintf("sync: can't encode a %T", m))
 	}
 	d = append(d, pair("t", num(m.kind())))
 	return bencode.Append(nil, bencode.Value{Kind: bencode.Dict, Dict: d})
