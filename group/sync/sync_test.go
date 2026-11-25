@@ -590,3 +590,25 @@ func TestStrangersCostNothing(t *testing.T) {
 		t.Fatalf("an empty batch nobody asked for: %v", err)
 	}
 }
+
+// TestRepeatedHeadsCostLittle: a peer listing one head many times costs a
+// single walk of the roster, not one per copy.
+func TestRepeatedHeadsCostLittle(t *testing.T) {
+	g := newGroup(t)
+	p := newPeer(t, g.r)
+	h := p.r.Heads()[0]
+	ids := make([]roster.ID, 30000)
+	for i := range ids {
+		ids[i] = h
+	}
+	s := New(p.r, p.logs)
+	visits := 0
+	walk = func() { visits++ }
+	defer func() { walk = func() {} }()
+	if _, err := s.Handle(Heads{IDs: ids}); err != nil {
+		t.Fatal(err)
+	}
+	if visits > 4*p.r.Len() {
+		t.Fatalf("%d visits for a roster of %d", visits, p.r.Len())
+	}
+}

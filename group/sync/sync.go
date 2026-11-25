@@ -25,6 +25,9 @@ const (
 	MaxBatch = 64
 )
 
+// walk is called per step of closure's walk; tests count with it.
+var walk = func() {}
+
 // opsChunk is the operation bytes one Ops message carries; tests lower it.
 var opsChunk = MaxMessage - 1024
 
@@ -158,27 +161,11 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 // knows or in their history, parents first, split to fit messages. A head
 // this side doesn't know means the peer is ahead there, and sends it.
 func (s *Sync) missingOps() []Message {
-	theirs := map[roster.ID]bool{}
-	for _, h := range s.peerHeads {
-		if s.r.Has(h) {
-			theirs[h] = true
-			for id := range s.r.History(h) {
-				theirs[id] = true
-			}
-		}
-	}
+	theirs := s.closure(s.peerHeads)
 	var send []*roster.Op
-	seen := map[roster.ID]bool{}
-	for _, h := range s.r.Heads() {
-		ids := s.r.History(h)
-		ids[h] = true
-		for id := range ids {
-			if !theirs[id] && !seen[id] {
-				seen[id] = true
-				if o := s.r.Op(id); o.Kind != roster.Genesis {
-					send = append(send, o)
-				}
-			}
+	for id := range s.closure(s.r.Heads()) {
+		if o := s.r.Op(id); !theirs[id] && o.Kind != roster.Genesis {
+			send = append(send, o)
 		}
 	}
 	// Clocks strictly increase along every edge, so this puts parents first.
@@ -202,6 +189,32 @@ func (s *Sync) missingOps() []Message {
 		size += n
 	}
 	return append(out, cur)
+}
+
+// closure returns the operations among ids this side holds, with their
+// history: one walk with one visited set, so a peer repeating heads costs
+// no more than the roster's size.
+func (s *Sync) closure(ids []roster.ID) map[roster.ID]bool {
+	seen := map[roster.ID]bool{}
+	var stack []roster.ID
+	push := func(id roster.ID) {
+		if !seen[id] && s.r.Has(id) {
+			walk()
+			seen[id] = true
+			stack = append(stack, id)
+		}
+	}
+	for _, id := range ids {
+		push(id)
+	}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, p := range s.r.Op(id).Parents {
+			push(p)
+		}
+	}
+	return seen
 }
 
 // logHeads returns this side's fork proofs and log heads, split to fit
