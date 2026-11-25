@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about 23 minutes)")
+var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about 23 minutes: add -timeout=1h)")
 
 const (
 	O Key = iota + 1 // owner
@@ -434,6 +434,53 @@ func TestRemovedReAdd(t *testing.T) {
 		}
 	}
 	if err := check(w.union(), Rules{}, docPredicate); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFourPassChain is a chain deeper than the explorer reaches, where the
+// view rule takes four passes: dropping a removed admin's branch makes the
+// owner's add of N count, which makes N's remove of M count, which drops
+// M's delivery.
+func TestFourPassChain(t *testing.T) {
+	w := setup(t, Rules{})
+	must := func(o *Op) {
+		t.Helper()
+		if o == nil {
+			t.Fatal("op not written")
+		}
+	}
+	firstRekey := Author(w[A], Rules{}, Rekey, A, 0, None)
+	must(firstRekey)
+	must(Author(w[A], Rules{}, Add, A, N, Member))
+	must(Author(w[A], Rules{}, Remove, A, N, None))
+	for range 3 {
+		must(Author(w[O], Rules{}, Rekey, O, 0, None))
+	}
+	must(Author(w[O], Rules{}, Add, O, N, Admin))
+	sawAdd := w[O].Clone()
+	must(Author(w[O], Rules{}, Remove, O, A, None))
+
+	n := sawAdd.Clone()
+	must(Author(n, Rules{}, Remove, N, M, None))
+	m := sawAdd.Clone()
+	m[firstRekey.ID] = firstRekey
+	must(Author(m, Rules{}, Deliver, M, N, None))
+
+	u := w.union()
+	for _, s := range []Store{n, m} {
+		for id, o := range s {
+			u[id] = o
+		}
+	}
+	f, err := Fold(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Passes != 4 || f.Roles[N] != Admin || f.Roles[M] != None {
+		t.Fatalf("passes %d, N %v, M %v; want 4, admin, none", f.Passes, f.Roles[N], f.Roles[M])
+	}
+	if err := check(u, Rules{}, docPredicate); err != nil {
 		t.Fatal(err)
 	}
 }

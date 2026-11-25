@@ -475,23 +475,25 @@ model-checked by `group/rostermodel`: an abstract model of this section's
 rules (keys as names, sealing as recipient sets) and an explorer that runs
 every interleaving of an owner, two admins and a member writing, syncing,
 and acting as compromised or removed authors (20 million states at depth 6,
-about 23 minutes; `go test` runs depth 4 in about five seconds). It checks
-that the owner keeps its role, only the owner makes admins, backdated
-operations by removed authors never count, the view rule settles (in at most
-three passes: owner operations, never dropped, fix who is an admin, so
-admins' drops settle on the second pass and members' on the third), and once
-the corrective rekey and deliveries run, no off-roster key holds the current
-group secret or epoch key, mirrors hold the current group secret but no
-current epoch key, and every member holds the current keys and every epoch
-key any other member holds. Admins and members also sign, as compromised
-devices would, the operations their role has no authority for, and none may
-count. Mutation tests break each admin and member authority rule, the
-role-change rule, the view rule, delivery's roster check and the corrective
-rekey in turn, and the explorer catches each. No explored replica is a
-mirror, so mirrors' authority (the same rule as members') isn't explored. It
-found two rules above that were wrong as first written (concurrent duplicate
-`add`s, and `deliver` withholding after any `remove`), and writing it pinned
-the total order down as an algorithm.
+about 23 minutes with `-roster.depth=6 -timeout=1h`; `go test` runs depth 4
+in about five seconds). It checks that the owner keeps its role, only the
+owner makes admins, backdated operations by removed authors never count, the
+view rule settles (in at most three passes in every explored state; a deeper
+chain, where dropping a removed admin's branch makes an owner's `add` count
+and so on down, takes four, and is a regression test; the fold detects a
+cycle rather than capping passes), and once the corrective rekey and
+deliveries run, no off-roster key holds the current group secret or epoch
+key, mirrors hold the current group secret but no current epoch key, and
+every member holds the current keys and every epoch key any other member
+holds. Admins and members also sign, as compromised devices would, the
+operations their role has no authority for, and none may count. Mutation
+tests break each admin and member authority rule, the role-change rule, the
+view rule, delivery's roster check and the corrective rekey in turn, and the
+explorer catches each. No explored replica is a mirror, so mirrors'
+authority (the same rule as members') isn't explored. It found two rules
+above that were wrong as first written (concurrent duplicate `add`s, and
+`deliver` withholding after any `remove`), and writing it pinned the total
+order down as an algorithm.
 
 Still open, and not modeled (the grace window, invites and log cutoffs are
 outside the model):
