@@ -2,6 +2,7 @@ package memberlog
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/getlantern/warren/group/keys"
@@ -101,9 +102,14 @@ func TestEntryRejects(t *testing.T) {
 	e := es[1]
 
 	// A box moved onto another entry's header doesn't open.
-	moved := *es[0]
-	moved.Box = e.Box
+	// Entry 2's box and nonce under entry 1's header: only the header
+	// differs, so this fails only because the header is authenticated.
 	_, key := x.epoch(t, x.member)
+	if _, _, err := e.Open(key); err != nil {
+		t.Fatalf("entry 2 doesn't open as written: %v", err)
+	}
+	moved := *es[0]
+	moved.Box, moved.Nonce = e.Box, e.Nonce
 	if _, _, err := moved.Open(key); !errors.Is(err, ErrOpen) {
 		t.Fatalf("a box opened under another header: %v", err)
 	}
@@ -575,7 +581,7 @@ func TestMaxAhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	prev := first
-	held := 0
+	held, heldBytes := 0, 0
 	for range 100 {
 		var err error
 		if prev, err = Write(x.member, x.r.Group(), prev, ep, key, App, make([]byte, MaxBody)); err != nil {
@@ -587,9 +593,10 @@ func TestMaxAhead(t *testing.T) {
 			t.Fatal(err)
 		}
 		held++
+		heldBytes += len(prev.Box)
 	}
-	if held*MaxBody > MaxAhead+MaxBody || held == 100 {
-		t.Fatalf("held %d full entries past a gap", held)
+	if heldBytes > MaxAhead || heldBytes+len(prev.Box) <= MaxAhead || held == 100 {
+		t.Fatalf("held %d entries (%d bytes) past a gap; the refused one would make %d", held, heldBytes, heldBytes+len(prev.Box))
 	}
 	// With the budget full, the entry that closes the gap is still taken,
 	// and what was held ahead shows.
@@ -678,5 +685,212 @@ func checkCounts(t *testing.T, l *Log) {
 	}
 	if held != l.held || shown != l.shown {
 		t.Fatalf("counts drifted: held %d (tracked %d), shown %d (tracked %d)", held, l.held, shown, l.shown)
+	}
+}
+
+// stalePair returns a roster copy as of fold f (where the admin is still an
+// admin) after demoting the admin in the real roster, so that a removal the
+// admin writes in the copy won't count once merged.
+func (x *fixture) stalePair(t *testing.T, f *roster.Result) *roster.Roster {
+	t.Helper()
+	stale, err := roster.New(x.r.Op(x.r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range f.Order[1:] {
+		if _, err := stale.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).SetRole(x.admin.Public(), roster.Member); err != nil {
+		t.Fatal(err)
+	}
+	return stale
+}
+
+func TestAddVerifiesWhatItStores(t *testing.T) {
+	x := newFixture(t)
+	s := NewSet(x.r.Group())
+	s.Update(x.fold(t))
+	e := x.chain(t, x.member, 1)[0]
+	mutated := *e
+	mutated.Seq = 7
+	if _, err := s.Add(&mutated); !errors.Is(err, ErrSignature) {
+		t.Fatalf("a mutated entry: %v", err)
+	}
+	ep, _ := x.epoch(t, x.member)
+	unsigned := &Entry{Group: x.r.Group(), Author: x.member.Public(), Seq: 1, Epoch: ep, Box: make([]byte, 40)}
+	if _, err := s.Add(unsigned); err == nil {
+		t.Fatal("an unsigned entry was accepted")
+	}
+}
+
+func TestReadsAreCopies(t *testing.T) {
+	x := newFixture(t)
+	s := NewSet(x.r.Group())
+	s.Update(x.fold(t))
+	es := x.chain(t, x.member, 2)
+	for _, e := range es {
+		if _, err := s.Add(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	es[1].Box[0] ^= 1 // the caller's own entry, after adding it
+	l := s.Log(x.member.Public())
+	h := l.Head()
+	h.Box[0] ^= 1
+	h.Seq = 99
+	l.Entries()[0].Box[0] ^= 1
+	_, key := x.epoch(t, x.member)
+	for _, e := range l.Entries() {
+		if _, _, err := e.Open(key); err != nil || e.Seq > 2 {
+			t.Fatal("a caller's change reached the log")
+		}
+	}
+	checkCounts(t, l)
+}
+
+func TestForkFoundAtCapacity(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	s := NewSet(g)
+	s.Update(x.fold(t))
+	first, _ := Write(x.member, g, nil, ep, key, App, nil)
+	prev := first
+	var second *Entry
+	for {
+		var err error
+		if prev, err = Write(x.member, g, prev, ep, key, App, make([]byte, MaxBody)); err != nil {
+			t.Fatal(err)
+		}
+		if second == nil {
+			second = prev
+		}
+		if _, err := s.Add(prev); errors.Is(err, ErrTooFar) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	other, _ := Write(x.member, g, first, ep, key, App, make([]byte, MaxBody))
+	if other.Seq != second.Seq {
+		t.Fatal("setup")
+	}
+	if _, err := s.Add(other); !errors.Is(err, ErrForked) {
+		t.Fatalf("a conflicting entry with the budget full: %v", err)
+	}
+	if s.Log(x.member.Public()).Fork() == nil {
+		t.Fatal("no fork proof")
+	}
+}
+
+// TestEpochThatStopsCountingHides: an entry under an epoch a later fold no
+// longer counts leaves view, with what follows it.
+func TestEpochThatStopsCountingHides(t *testing.T) {
+	x := newFixture(t)
+	f := x.fold(t)
+	stale := x.stalePair(t, f)
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.mirror.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf, err := stale.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The owner, seeing only the stale roster, writes under the removal's
+	// epoch.
+	key := stale.Keyring(x.owner).Epochs[rm.ID()]
+	e1, _ := Write(x.owner, x.r.Group(), nil, rm.ID(), key, App, []byte("1"))
+	e2, _ := Write(x.owner, x.r.Group(), e1, rm.ID(), key, App, []byte("2"))
+	s := NewSet(x.r.Group())
+	s.Update(sf)
+	for _, e := range []*Entry{e1, e2} {
+		if _, err := s.Add(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	s.Update(x.fold(t))
+	if n := len(s.Log(x.owner.Public()).Entries()); n != 0 {
+		t.Fatalf("%d entries under a no-longer-counting epoch still show", n)
+	}
+	if n := len(s.Withdrawn()); n != 2 {
+		t.Fatalf("withdrew %d", n)
+	}
+	// Back on the stale fold, where it counts, they show again.
+	s.Update(sf)
+	if n := len(s.Log(x.owner.Public()).Entries()); n != 2 {
+		t.Fatalf("%d entries after the epoch counts again", n)
+	}
+	checkCounts(t, s.Log(x.owner.Public()))
+}
+
+// TestLiftedCutTrims: a lifted removal leaves the log within a live log's
+// bounds, though the head's chain had filled more.
+func TestLiftedCutTrims(t *testing.T) {
+	x := newFixture(t)
+	f := x.fold(t)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	var es []*Entry
+	var prev *Entry
+	for range 80 {
+		e, err := Write(x.member, g, prev, ep, key, App, make([]byte, MaxBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		es, prev = append(es, e), e
+	}
+	stale := x.stalePair(t, f)
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.member.Public(), 80, es[79].ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf, err := stale.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSet(g)
+	s.Update(sf)
+	for i := 79; i >= 1; i-- { // top-down, entry 1 withheld
+		if _, err := s.Add(es[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l := s.Log(x.member.Public())
+	if l.ahead() <= MaxAhead {
+		t.Fatal("setup: the head's chain should hold more than a live log may")
+	}
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	s.Update(x.fold(t))
+	if l.removed || l.ahead() > MaxAhead {
+		t.Fatalf("after the lift: removed %v, %d bytes held ahead", l.removed, l.ahead())
+	}
+	checkCounts(t, l)
+}
+
+func TestWriteRefusesUnencodableSeq(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	last := &Entry{Group: x.r.Group(), Author: x.member.Public(), Seq: math.MaxInt64}
+	if _, err := Write(x.member, x.r.Group(), last, ep, key, App, nil); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a successor of the last encodable entry: %v", err)
+	}
+}
+
+func TestDecodeRefusesEmptyBox(t *testing.T) {
+	x := newFixture(t)
+	e := x.chain(t, x.member, 1)[0]
+	c := *e
+	c.Box = nil
+	c.Sig = x.member.Sign(c.signed())
+	if _, err := Decode(c.Encode()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("an empty box: %v", err)
 	}
 }

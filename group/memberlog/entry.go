@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"math"
 
 	"golang.org/x/crypto/chacha20poly1305"
 
@@ -62,6 +63,14 @@ type Entry struct {
 	Box   []byte // the sealed kind and body
 	Sig   []byte
 	id    ID
+}
+
+// clone is a deep copy.
+func (e *Entry) clone() *Entry {
+	c := *e
+	c.Box = bytes.Clone(e.Box)
+	c.Sig = bytes.Clone(e.Sig)
+	return &c
 }
 
 // ID returns the entry's ID, valid once it is signed or decoded.
@@ -120,6 +129,9 @@ func Write(author *keys.Identity, group roster.ID, prev *Entry, epoch roster.ID,
 		if prev.Author != e.Author || prev.Group != group {
 			return nil, ErrMalformed
 		}
+		if prev.Seq >= math.MaxInt64 {
+			return nil, ErrMalformed // its successor couldn't be encoded
+		}
 		e.Seq, e.Prev = prev.Seq+1, prev.id
 	}
 	if _, err := rand.Read(e.Nonce[:]); err != nil {
@@ -172,7 +184,8 @@ func Decode(b []byte) (*Entry, error) {
 		case "a":
 			ok = fixed(e.Author[:], val)
 		case "b":
-			ok = val.Kind == bencode.String && len(val.Str) <= MaxBody+1+chacha20poly1305.Overhead
+			ok = val.Kind == bencode.String && len(val.Str) >= 1+chacha20poly1305.Overhead &&
+				len(val.Str) <= MaxBody+1+chacha20poly1305.Overhead
 			e.Box = bytes.Clone(val.Str)
 		case "e":
 			ok = fixed(e.Epoch[:], val)
