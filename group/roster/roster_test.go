@@ -374,3 +374,33 @@ func TestWritersStayDecodable(t *testing.T) {
 		t.Fatal("History of an unknown op isn't nil")
 	}
 }
+
+// TestRosterIsolated: what callers get back, and what they passed in,
+// can't change the roster.
+func TestRosterIsolated(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	rk, err := (&Writer{R: r, Me: admin}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := r.Fold()
+	for id := range r.History(rk.ID()) {
+		delete(r.History(rk.ID()), id)
+	}
+	h := r.History(rk.ID())
+	for id := range h {
+		delete(h, id)
+	}
+	rk.Name = "changed after adding"
+	rk.Parents = nil
+	got := r.Op(rk.ID())
+	got.Name = "changed after reading"
+	after, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Counts[rk.ID()] || after.Current != before.Current || r.Op(rk.ID()).Name != "" {
+		t.Fatal("a caller's change reached the roster")
+	}
+	_ = owner
+}

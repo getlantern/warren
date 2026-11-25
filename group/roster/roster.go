@@ -30,7 +30,6 @@ var (
 type Roster struct {
 	group ID
 	ops   map[ID]*Op
-	hist  map[ID]map[ID]bool
 	// views caches each operation's author's view: the fold of its causal
 	// history. An ID commits to that history, and every op here has been
 	// verified against its ID, so the view never changes.
@@ -48,8 +47,12 @@ func New(genesis *Op) (*Roster, error) {
 	if genesis.Kind != Genesis || len(genesis.Parents) != 0 || genesis.Lamport != 1 {
 		return nil, ErrMalformed
 	}
-	r := &Roster{group: genesis.id, ops: map[ID]*Op{}, hist: map[ID]map[ID]bool{}, views: map[ID]*view{}}
-	r.ops[genesis.id] = genesis
+	g, err := Decode(genesis.Encode())
+	if err != nil {
+		return nil, err
+	}
+	r := &Roster{group: g.id, ops: map[ID]*Op{}, views: map[ID]*view{}}
+	r.ops[g.id] = g
 	return r, nil
 }
 
@@ -59,15 +62,34 @@ func (r *Roster) Group() ID { return r.group }
 // Len returns how many operations the roster holds.
 func (r *Roster) Len() int { return len(r.ops) }
 
-// Op returns the operation with id, or nil.
-func (r *Roster) Op(id ID) *Op { return r.ops[id] }
+// Op returns a copy of the operation with id, or nil.
+func (r *Roster) Op(id ID) *Op {
+	o := r.ops[id]
+	if o == nil {
+		return nil
+	}
+	c, err := Decode(o.Encode())
+	if err != nil {
+		panic(err) // every held op decoded once already
+	}
+	return c
+}
 
 // Has reports whether the roster holds id.
 func (r *Roster) Has(id ID) bool { return r.ops[id] != nil }
 
-// Add adds a verified operation (from Decode, or signed locally). It
-// reports whether the operation was new.
+// Add adds an operation (decoded, or signed locally). It keeps its own
+// copy, re-decoded from the operation's encoding, so what it holds is
+// exactly what peers would accept, and the caller's later changes to o
+// can't reach it. It reports whether the operation was new.
 func (r *Roster) Add(o *Op) (bool, error) {
+	if r.ops[o.id] != nil {
+		return false, nil
+	}
+	o, err := Decode(o.Encode())
+	if err != nil {
+		return false, err
+	}
 	if r.ops[o.id] != nil {
 		return false, nil
 	}
@@ -114,11 +136,9 @@ func (r *Roster) Heads() []ID {
 }
 
 // History returns id's strict causal ancestors, or nil if the roster
-// doesn't hold id.
+// doesn't hold id. It walks the whole history; authority checks ask the
+// narrower descends.
 func (r *Roster) History(id ID) map[ID]bool {
-	if h := r.hist[id]; h != nil {
-		return h
-	}
 	if r.ops[id] == nil {
 		return nil
 	}
@@ -133,15 +153,38 @@ func (r *Roster) History(id ID) map[ID]bool {
 		h[p] = true
 		stack = append(stack, r.ops[p].Parents...)
 	}
-	r.hist[id] = h
 	return h
+}
+
+// descends reports whether a is a strict ancestor of o. Clocks strictly
+// increase along every edge, so the walk stops below a's clock.
+func (r *Roster) descends(o, a ID) bool {
+	ao, oo := r.ops[a], r.ops[o]
+	if ao == nil || oo == nil {
+		return false
+	}
+	seen := map[ID]bool{}
+	stack := slices.Clone(oo.Parents)
+	for len(stack) > 0 {
+		p := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if p == a {
+			return true
+		}
+		if seen[p] || r.ops[p].Lamport <= ao.Lamport {
+			continue
+		}
+		seen[p] = true
+		stack = append(stack, r.ops[p].Parents...)
+	}
+	return false
 }
 
 // sub is the roster of only the given operations, which must be causally
 // closed, sharing r's caches: an operation's history and view are the same
 // in any roster that holds it.
 func (r *Roster) sub(ids map[ID]bool) *Roster {
-	s := &Roster{group: r.group, ops: make(map[ID]*Op, len(ids)), hist: r.hist, views: r.views}
+	s := &Roster{group: r.group, ops: make(map[ID]*Op, len(ids)), views: r.views}
 	for id := range ids {
 		s.ops[id] = r.ops[id]
 	}
@@ -231,7 +274,7 @@ func (r *Roster) Fold() (*Result, error) {
 		next := map[ID]bool{}
 		for k, rid := range res.Removed {
 			for _, o := range order {
-				if o.Author == k && o.id != rid && !r.History(rid)[o.id] {
+				if o.Author == k && o.id != rid && !r.descends(rid, o.id) {
 					next[o.id] = true
 				}
 			}
@@ -242,12 +285,12 @@ func (r *Roster) Fold() (*Result, error) {
 					continue
 				}
 				for _, o := range order {
-					if o.Author != k || !o.Kind.needsAdmin() || r.History(d.id)[o.id] {
+					if o.Author != k || !o.Kind.needsAdmin() || r.descends(d.id, o.id) {
 						continue
 					}
 					restored := false
 					for _, p := range grants[i+1:] {
-						if p.Role == Admin && r.History(p.id)[d.id] && r.History(o.id)[p.id] {
+						if p.Role == Admin && r.descends(p.id, d.id) && r.descends(o.id, p.id) {
 							restored = true
 						}
 					}
@@ -312,7 +355,7 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 			continue
 		}
 		author := res.Roles[o.Author]
-		if author == Admin && o.Kind.needsAdmin() && !r.History(o.id)[granted[o.Author]] {
+		if author == Admin && o.Kind.needsAdmin() && !r.descends(o.id, granted[o.Author]) {
 			author = Member // not yet an admin as far as its author knew
 		}
 		ok := false
