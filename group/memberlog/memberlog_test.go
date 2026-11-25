@@ -200,6 +200,9 @@ func TestForks(t *testing.T) {
 	if _, err := add(s2, c2, f); !errors.Is(err, ErrForked) {
 		t.Fatalf("an entry chained to another history: %v", err)
 	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
+	}
 }
 
 func TestRosterChecks(t *testing.T) {
@@ -274,6 +277,9 @@ func TestRemovalCutoff(t *testing.T) {
 	if got := l.Entries(); len(got) != 3 || got[1].ID() != es[1].ID() || l.Fork() != nil || len(l.bySeq) != 3 {
 		t.Fatalf("the forged history was kept: %d held", len(l.bySeq))
 	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
+	}
 }
 
 // TestRemovedLogFillsFromTheHead: a member that learns of a removal before
@@ -347,6 +353,9 @@ func TestLaggingMemberKeepsEntries(t *testing.T) {
 	if len(l.Entries()) != 3 || l.low != 1 {
 		t.Fatalf("the head didn't anchor the held chain: %d visible, low %d", len(l.Entries()), l.low)
 	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
+	}
 }
 
 // TestHeadEvictsContradictedEntry: when the head's chain names a different
@@ -383,6 +392,9 @@ func TestHeadEvictsContradictedEntry(t *testing.T) {
 	}
 	if got := s.Log(x.member.Public()).Entries(); len(got) != 3 || got[1].ID() != b2.ID() {
 		t.Fatalf("%d entries visible", len(got))
+	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
 	}
 }
 
@@ -441,6 +453,9 @@ func TestRemovalThatStopsCounting(t *testing.T) {
 	}
 	if len(s.Log(x.member.Public()).Entries()) != 3 {
 		t.Fatal("the log wasn't restored")
+	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
 	}
 }
 
@@ -538,6 +553,9 @@ func TestCutKeepsForkHidden(t *testing.T) {
 	if got := l.Entries(); len(got) != 3 || got[1].ID() != b2.ID() {
 		t.Fatalf("the head's chain didn't show past the fork point: %d", len(got))
 	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
+	}
 }
 
 // add gives s fold f (as a caller does when its roster changes) and adds e.
@@ -588,6 +606,9 @@ func TestMaxAhead(t *testing.T) {
 	if n := len(s.Log(x.member.Public()).Entries()); n != held+1 {
 		t.Fatalf("%d visible after closing the gap, want %d", n, held+1)
 	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
+	}
 }
 
 // TestForkSurvivesLiftedRemoval: a forked log stays forked when a removal
@@ -615,5 +636,23 @@ func TestForkSurvivesLiftedRemoval(t *testing.T) {
 	l.cut(false, 0, ID{}, &s.gone)
 	if l.Fork() == nil || len(l.Entries()) != 1 {
 		t.Fatalf("after a lifted removal: fork %v, %d visible", l.Fork() != nil, len(l.Entries()))
+	}
+	if l := s.Log(x.member.Public()); l != nil {
+		checkCounts(t, l)
+	}
+}
+
+// checkCounts recomputes the held and shown byte counts from scratch.
+func checkCounts(t *testing.T, l *Log) {
+	t.Helper()
+	held, shown := 0, 0
+	for seq, e := range l.bySeq {
+		held += len(e.Box)
+		if seq <= l.top {
+			shown += len(e.Box)
+		}
+	}
+	if held != l.held || shown != l.shown {
+		t.Fatalf("counts drifted: held %d (tracked %d), shown %d (tracked %d)", held, l.held, shown, l.shown)
 	}
 }

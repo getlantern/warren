@@ -56,6 +56,10 @@ type Log struct {
 	bySeq  map[uint64]*Entry
 	top    uint64 // the visible chain is 1..top
 	fork   *ForkProof
+	// held and shown are the box bytes of every held entry and of the
+	// visible ones, so what is held ahead of the chain costs nothing to
+	// read however far past the window it lies.
+	held, shown int
 
 	removed bool
 	cutSeq  uint64
@@ -112,7 +116,11 @@ func (l *Log) retop(seq uint64, gone *[]*Entry) {
 		for s := l.top + 1; s <= old; s++ {
 			if e := l.bySeq[s]; e != nil {
 				*gone = append(*gone, e)
+				l.shown -= len(e.Box)
 			}
+		}
+		for s := old + 1; s <= l.top; s++ {
+			l.shown += len(l.bySeq[s].Box)
 		}
 	}()
 	if seq <= l.top {
@@ -128,16 +136,13 @@ func (l *Log) retop(seq uint64, gone *[]*Entry) {
 	}
 }
 
-// ahead is the bytes of entries held past the visible chain. Only the
-// window above it can hold any, so that is all it scans.
-func (l *Log) ahead() int {
-	n := 0
-	for s := l.top + 1; s <= l.top+Window; s++ {
-		if e := l.bySeq[s]; e != nil {
-			n += len(e.Box)
-		}
-	}
-	return n
+// ahead is the bytes of entries held past the visible chain.
+func (l *Log) ahead() int { return l.held - l.shown }
+
+// put stores e.
+func (l *Log) put(e *Entry) {
+	l.bySeq[e.Seq] = e
+	l.held += len(e.Box)
 }
 
 // drop removes the entry at seq, reporting it in gone if it was visible.
@@ -145,7 +150,9 @@ func (l *Log) drop(seq uint64, gone *[]*Entry) {
 	if e := l.bySeq[seq]; e != nil {
 		if seq <= l.top {
 			*gone = append(*gone, e)
+			l.shown -= len(e.Box)
 		}
+		l.held -= len(e.Box)
 		delete(l.bySeq, seq)
 	}
 }
@@ -178,7 +185,7 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 		l.retop(l.top+1, gone)
 		return false, ErrForked
 	}
-	l.bySeq[e.Seq] = e
+	l.put(e)
 	l.retop(e.Seq, gone)
 	return true, nil
 }
@@ -198,7 +205,7 @@ func (l *Log) addRemoved(e *Entry, gone *[]*Entry) (bool, error) {
 		l.drop(e.Seq, gone) // held from before the removal, off the head's chain
 		l.retop(e.Seq, gone)
 	}
-	l.bySeq[e.Seq] = e
+	l.put(e)
 	l.low = e.Seq
 	l.anchorDown(gone)
 	l.retop(e.Seq, gone)
