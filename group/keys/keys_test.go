@@ -196,6 +196,20 @@ func TestSealOpen(t *testing.T) {
 	}
 }
 
+// sealedVector is a box Seal made to IdentityFromSeed({0xa1}) for context
+// "vector". Seal is randomized, so this fixture pins the sealing KDF (its
+// label and salt order) and the AEAD: a change that would leave existing
+// boxes unreadable fails to open it.
+const sealedVector = "e634a90f163a54dafe822ff859695d86b6c3c526c89ccd53651489e20254064b5745995a9656c23341c07cd2cd0acfd0bf725636a22da26fedecfff47489a9"
+
+func TestSealedVectorOpens(t *testing.T) {
+	box, _ := hex.DecodeString(sealedVector)
+	pt, err := IdentityFromSeed([32]byte{0xa1}).Open("vector", box)
+	if err != nil || string(pt) != "warren group v1" {
+		t.Fatalf("the pinned box doesn't open: %q, %v", pt, err)
+	}
+}
+
 func TestSealFreshEphemeral(t *testing.T) {
 	to := id(t, 1).Public()
 	a, err := Seal(to, "c", []byte("x"))
