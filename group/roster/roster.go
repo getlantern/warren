@@ -163,7 +163,11 @@ func (r *Roster) descends(o, a ID) bool {
 	if ao == nil || oo == nil {
 		return false
 	}
-	return r.desc(oo, ao) // only within a fold, which sets r.anc
+	if r.anc == nil { // outside a fold: a cache for this query alone
+		r.anc = map[[2]ID]bool{}
+		defer func() { r.anc = nil }()
+	}
+	return r.desc(oo, ao)
 }
 
 // desc is descends over parents, memoizing every node's answer for the
@@ -352,12 +356,12 @@ func (r *Roster) fold() (*Result, error) {
 			}
 		}
 		for k, grants := range res.Grants {
+			ops := byAuthor[k]
+			if !slices.ContainsFunc(ops, func(o *Op) bool { return o.Kind.needsAdmin() }) {
+				continue // nothing of k's needs the authority a demotion takes
+			}
 			for i, d := range grants {
 				if d.Role != Member {
-					continue
-				}
-				ops := byAuthor[k]
-				if !slices.ContainsFunc(ops, func(o *Op) bool { return o.Kind.needsAdmin() }) {
 					continue
 				}
 				h := r.History(d.id)

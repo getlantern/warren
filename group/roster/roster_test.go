@@ -539,7 +539,9 @@ func TestFoldScalesWithTurnover(t *testing.T) {
 	if _, err := fresh.Fold(); err != nil { // cold: no views cached
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 2*time.Second {
+	// About 40 ms with the skip; the walk of every removed key's history
+	// took about 700 ms.
+	if d := time.Since(start); d > 350*time.Millisecond {
 		t.Fatalf("a cold fold of %d ops took %v", fresh.Len(), d)
 	} else {
 		t.Logf("a cold fold of %d ops took %v", fresh.Len(), d)
