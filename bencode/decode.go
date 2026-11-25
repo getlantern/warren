@@ -82,6 +82,10 @@ func DecodeLimit(b []byte, maxElements int) (Value, error) {
 	return v, nil
 }
 
+// smallDict is how many keys a dictionary holds before the duplicate check
+// switches from a pairwise scan to a set.
+const smallDict = 16
+
 type decoder struct {
 	buf      []byte
 	pos      int
@@ -211,6 +215,7 @@ func (d *decoder) list(depth int) (Value, error) {
 func (d *decoder) dict(depth int) (Value, error) {
 	d.pos++ // 'd'
 	var pairs []Pair
+	var seen map[string]struct{}
 	for {
 		if d.pos >= len(d.buf) {
 			return Value{}, ErrSyntax
@@ -226,9 +231,25 @@ func (d *decoder) dict(depth int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		for _, p := range pairs {
-			if bytes.Equal(p.Key, key.Str) {
+		// A pairwise scan is cheapest for the small dictionaries KRPC
+		// carries; past that, a set keeps a large dictionary linear.
+		if seen != nil {
+			if _, dup := seen[string(key.Str)]; dup {
 				return Value{}, ErrDupKey
+			}
+			seen[string(key.Str)] = struct{}{}
+		} else {
+			for _, p := range pairs {
+				if bytes.Equal(p.Key, key.Str) {
+					return Value{}, ErrDupKey
+				}
+			}
+			if len(pairs) == smallDict {
+				seen = make(map[string]struct{}, 2*smallDict)
+				for _, p := range pairs {
+					seen[string(p.Key)] = struct{}{}
+				}
+				seen[string(key.Str)] = struct{}{}
 			}
 		}
 		val, err := d.value(depth + 1)
