@@ -186,32 +186,10 @@ func actions(w world, rules Rules) []action {
 	return as
 }
 
-// rogue writes an operation its author has no authority for, as a
-// compromised device could: a remove or rekey seals its new keys as an
-// honest one would, since only its authority is forged.
+// rogue is AuthorRogue as an explorer action.
 func rogue(r Key, kind Kind, target Key, role Role) action {
 	return action{fmt.Sprintf("%v %v %v as %v (rogue)", r, kind, target, role), func(w world) bool {
-		s := w[r]
-		o := newOp(s, kind, r, target, role, s.Heads(), 0)
-		o.Rogue = true
-		if kind == Remove || kind == Rekey {
-			f, err := Fold(s)
-			if err != nil {
-				return false
-			}
-			for _, k := range sortedKeys(f.Roles) {
-				if kind == Remove && k == target {
-					continue
-				}
-				sl := Seal{To: k, Gs: []ID{self}}
-				if f.Roles[k] != Mirror {
-					sl.Epochs = []ID{self}
-				}
-				o.Seals = append(o.Seals, sl)
-			}
-		}
-		finish(s, o)
-		return true
+		return AuthorRogue(w[r], kind, r, target, role) != nil
 	}}
 }
 

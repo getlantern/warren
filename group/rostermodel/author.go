@@ -227,6 +227,31 @@ func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
 	return finish(s, o)
 }
 
+// AuthorRogue writes an operation its author has no authority for, as a
+// compromised device could: a remove or rekey seals its new keys as an
+// honest one would, since only its authority is forged.
+func AuthorRogue(s Store, kind Kind, author, target Key, role Role) *Op {
+	o := newOp(s, kind, author, target, role, s.Heads(), 0)
+	o.Rogue = true
+	if kind == Remove || kind == Rekey {
+		f, err := Fold(s)
+		if err != nil {
+			return nil
+		}
+		for _, k := range sortedKeys(f.Roles) {
+			if kind == Remove && k == target {
+				continue
+			}
+			sl := Seal{To: k, Gs: []ID{self}}
+			if f.Roles[k] != Mirror {
+				sl.Epochs = []ID{self}
+			}
+			o.Seals = append(o.Seals, sl)
+		}
+	}
+	return finish(s, o)
+}
+
 func sortedIDs(m map[ID]bool) []ID {
 	out := make([]ID, 0, len(m))
 	for id := range m {

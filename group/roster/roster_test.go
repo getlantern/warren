@@ -1,0 +1,265 @@
+package roster
+
+import (
+	"bytes"
+	"errors"
+	"testing"
+
+	"filippo.io/edwards25519"
+	"github.com/getlantern/warren/bencode"
+	"github.com/getlantern/warren/group/keys"
+)
+
+func me(b byte) *keys.Identity { return keys.IdentityFromSeed([32]byte{b}) }
+
+// group founds a group by owner and adds admin as an admin and member as a
+// member, all in one roster.
+func group(t *testing.T) (*Roster, *keys.Identity, *keys.Identity, *keys.Identity) {
+	t.Helper()
+	owner, admin, member := me(1), me(2), me(3)
+	r, err := Found(owner, "family", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ow := &Writer{R: r, Me: owner}
+	if _, err := ow.Add(admin.Public(), "admin", Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Add(member.Public(), "member", Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	return r, owner, admin, member
+}
+
+func TestFlow(t *testing.T) {
+	r, owner, admin, member := group(t)
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Roles[owner.Public()] != Owner || f.Roles[admin.Public()] != Admin || f.Roles[member.Public()] != Member {
+		t.Fatalf("roles %v", f.Roles)
+	}
+	// Every member holds the current keys, checked against their commitments.
+	for _, id := range []*keys.Identity{owner, admin, member} {
+		k := r.Keyring(id)
+		if _, ok := k.Secrets[f.Current]; !ok {
+			t.Fatalf("%x lacks the current group secret", id.Public())
+		}
+		if _, ok := k.Epochs[f.Current]; !ok {
+			t.Fatalf("%x lacks the current epoch key", id.Public())
+		}
+	}
+
+	// A removal rekeys: everyone left gets the new keys, the removed member
+	// keeps only the old ones.
+	rm, err := (&Writer{R: r, Me: admin}).Remove(member.Public(), 7, [32]byte{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ = r.Fold()
+	if f.Current != rm.ID() || f.Roles[member.Public()] != None || f.Removed[member.Public()] != rm.ID() {
+		t.Fatalf("after removal: current %x, member %v", f.Current[:4], f.Roles[member.Public()])
+	}
+	if _, ok := r.Keyring(member).Epochs[rm.ID()]; ok {
+		t.Fatal("the removed member got the new epoch key")
+	}
+	if _, ok := r.Keyring(owner).Epochs[rm.ID()]; !ok {
+		t.Fatal("the owner didn't get the new epoch key")
+	}
+
+	// Removed keys never come back; admins can't add admins; only the
+	// owner promotes.
+	if _, err := (&Writer{R: r, Me: admin}).Add(member.Public(), "again", Member, keys.PublicKey{}); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("re-adding a removed key: %v", err)
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Add(me(4).Public(), "x", Admin, keys.PublicKey{}); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("an admin adding an admin: %v", err)
+	}
+	if _, err := (&Writer{R: r, Me: admin}).SetRole(admin.Public(), Member); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("an admin changing a role: %v", err)
+	}
+	if _, err := (&Writer{R: r, Me: owner}).SetRole(admin.Public(), Member); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ = r.Fold(); f.Roles[admin.Public()] != Member {
+		t.Fatal("the demotion didn't take")
+	}
+}
+
+func TestMirrorGetsNoEpochKeys(t *testing.T) {
+	r, owner, _, _ := group(t)
+	mirror := me(9)
+	if _, err := (&Writer{R: r, Me: owner}).Add(mirror.Public(), "mirror", Mirror, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := r.Fold()
+	k := r.Keyring(mirror)
+	if len(k.Epochs) != 0 {
+		t.Fatal("a mirror holds epoch keys")
+	}
+	if _, ok := k.Secrets[f.Current]; !ok {
+		t.Fatal("a mirror lacks the current group secret")
+	}
+	// Nothing left to deliver it.
+	if _, err := (&Writer{R: r, Me: owner}).Deliver(mirror.Public(), keys.PublicKey{}); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("delivering to a mirror that holds everything it may: %v", err)
+	}
+}
+
+func TestDeliverFillsGaps(t *testing.T) {
+	r, owner, admin, member := group(t)
+	// The owner rekeys in a copy that hasn't seen the member's add, so the
+	// member misses the new keys; the admin, seeing both, delivers them.
+	stale, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var adminAdd *Op
+	for _, o := range r.ops {
+		if o.Kind == Add && o.Target == admin.Public() {
+			adminAdd = o
+		}
+	}
+	if _, err := stale.Add(adminAdd); err != nil {
+		t.Fatal(err)
+	}
+	rk, err := (&Writer{R: stale, Me: owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Keyring(member).Epochs[rk.ID()]; ok {
+		t.Fatal("the member got a rekey made without it")
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Deliver(member.Public(), keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Keyring(member).Epochs[rk.ID()]; !ok {
+		t.Fatal("the deliver didn't fill the gap")
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Deliver(member.Public(), keys.PublicKey{}); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("a second deliver with nothing new: %v", err)
+	}
+}
+
+func TestDecodeRoundTrip(t *testing.T) {
+	r, _, _, _ := group(t)
+	for _, o := range r.ops {
+		d, err := Decode(o.Encode())
+		if err != nil {
+			t.Fatalf("%v: %v", o, err)
+		}
+		if d.ID() != o.ID() || !bytes.Equal(d.Encode(), o.Encode()) {
+			t.Fatalf("%v didn't round-trip", o)
+		}
+	}
+}
+
+func anyAdd(t *testing.T) *Op {
+	r, _, _, _ := group(t)
+	for _, o := range r.ops {
+		if o.Kind == Add {
+			return o
+		}
+	}
+	t.Fatal("no add")
+	return nil
+}
+
+func TestDecodeRejects(t *testing.T) {
+	o := anyAdd(t)
+	enc := o.Encode()
+
+	bad := bytes.Clone(enc)
+	bad[len(bad)-3] ^= 1 // inside the signature
+	if _, err := Decode(bad); !errors.Is(err, ErrSignature) {
+		t.Fatalf("a flipped signature byte: %v", err)
+	}
+
+	v, err := bencode.Decode(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reencode := func(f func(d []bencode.Pair) []bencode.Pair) []byte {
+		d := f(append([]bencode.Pair{}, v.Dict...))
+		var b []byte
+		b = append(b, 'd')
+		for _, p := range d { // in the given order, not sorted
+			b = bencode.AppendBytes(b, p.Key)
+			b = bencode.Append(b, p.Value)
+		}
+		return append(b, 'e')
+	}
+	for name, b := range map[string][]byte{
+		"unsorted keys": reencode(func(d []bencode.Pair) []bencode.Pair { d[0], d[1] = d[1], d[0]; return d }),
+		"an unknown key": reencode(func(d []bencode.Pair) []bencode.Pair {
+			return append(d, bencode.Pair{Key: []byte("zz"), Value: num(1)})
+		}),
+		"an explicit zero shard count": reencode(func(d []bencode.Pair) []bencode.Pair {
+			return append(d[:len(d)-1:len(d)-1], bencode.Pair{Key: []byte("s"), Value: num(0)}, d[len(d)-1])
+		}),
+		"a trailing byte": append(bytes.Clone(enc), 'x'),
+	} {
+		if _, err := Decode(b); !errors.Is(err, ErrMalformed) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestDecodeRejectsSmallOrderKeys(t *testing.T) {
+	o := anyAdd(t)
+	c := *o
+	c.Target = keys.PublicKey(edwards25519.NewIdentityPoint().Bytes())
+	c.Sign(me(2))
+	if _, err := Decode(c.Encode()); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a small-order target: %v", err)
+	}
+}
+
+func TestAddRefuses(t *testing.T) {
+	r, owner, _, _ := group(t)
+	other, err := Found(me(5), "other", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, err := (&Writer{R: other, Me: me(5)}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(o); !errors.Is(err, ErrWrongGroup) {
+		t.Fatalf("another group's op: %v", err)
+	}
+	orphan := &Op{Group: r.group, Kind: Rekey, Lamport: 9, Parents: []ID{{1}}}
+	orphan.Sign(owner)
+	if _, err := r.Add(orphan); !errors.Is(err, ErrMissingParent) {
+		t.Fatalf("an op with a missing parent: %v", err)
+	}
+	if fresh, err := r.Add(r.Op(r.Heads()[0])); fresh || err != nil {
+		t.Fatalf("re-adding a held op: %v, %v", fresh, err)
+	}
+}
+
+// TestKeyringChecksCommitments: a key that doesn't match its maker's
+// commitment is ignored, whoever sealed it.
+func TestKeyringChecksCommitments(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	f, _ := r.Fold()
+	o := (&Writer{R: r, Me: owner}).base(Deliver)
+	o.Target = admin.Public()
+	if err := seal(o, admin.Public(), []entry{{made: f.Current, key: [32]byte{0xbb}}}); err != nil {
+		t.Fatal(err)
+	}
+	o.Sign(owner)
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if k := r.Keyring(admin).Epochs[f.Current]; k == (keys.EpochKey{0xbb}) {
+		t.Fatal("a key not matching its commitment was accepted")
+	}
+}

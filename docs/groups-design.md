@@ -136,10 +136,11 @@ The roster is a set of operations signed by member keys, kept by members
   admitted the key, and both have sealed their keys, so the key takes the
   role holding more (admin over member over mirror) rather than leaving a
   mirror with epoch keys;
-- `remove` (member key; the remover's view of that member: the hashes of its
-  latest roster operations and the head of its log the remover has seen,
-  sequence number and entry hash; and the rekey, see *Removal*) by an admin,
-  or by the owner when the removed key is an admin, as one operation;
+- `remove` (member key; the head of its log the remover has seen, sequence
+  number and entry hash; and the rekey, see *Removal*) by an admin, or by
+  the owner when the removed key is an admin, as one operation. The
+  remover's view of the member's roster operations is the `remove`'s own
+  causal history, fixed by its parents, so it isn't listed separately;
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
 - `role` (member key, and `admin` or `member`) by the owner: promotes a
@@ -149,8 +150,11 @@ The roster is a set of operations signed by member keys, kept by members
   mirror must lose the epoch keys anyway;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
 - `deliver` (the current `G`, and for a member but not a mirror any epoch
-  keys it lacks, sealed to one member already added) by any member: it
-  grants no rights, and only fills in keys a member missed (*Removal*). The
+  keys it lacks, sealed to one member already added) by any member. Every
+  seal also lists, in the clear, which keys its box carries (each by the
+  operation that made it), so a sender can tell what a member lacks. A
+  `deliver` grants no rights, and only fills in keys a member missed
+  (*Removal*). The
   recipient checks each key against the commitment of the operation that
   made it (*Keys*), so a forged key is ignored. A sender delivers only to
   a recipient on its own folded roster, which a counting `remove` takes it
