@@ -238,7 +238,7 @@ type Result struct {
 	Removed map[keys.PublicKey]ID // each removed key's counting remove
 	// Grants lists, per key, the counting role operations that promoted or
 	// demoted it, in total order.
-	Grants  map[keys.PublicKey][]*Op
+	Grants map[keys.PublicKey][]*Op
 	// As is each counting op's author's role when it counted, as far as the
 	// author knew: an admin not yet aware of its grant counts as a member.
 	As      map[ID]Role

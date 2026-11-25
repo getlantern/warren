@@ -480,7 +480,7 @@ func TestFoldScales(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 5*time.Second {
+	if d := time.Since(start); d > 5*time.Second && !raceEnabled {
 		t.Fatalf("folding %d ops took %v", n, d)
 	} else {
 		t.Logf("folded %d ops in %v", len(f.Order), d)
@@ -523,7 +523,7 @@ func TestFoldScalesAfterRemoval(t *testing.T) {
 		}
 		d := time.Since(start)
 		runtime.ReadMemStats(&after)
-		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 200<<20 || d > 5*time.Second {
+		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 200<<20 || (d > 5*time.Second && !raceEnabled) {
 			t.Fatalf("demote=%v: folding %d ops allocated %d MB in %v", demote, n, alloc>>20, d)
 		} else {
 			t.Logf("demote=%v: folded in %v, allocating %d MB", demote, d, alloc>>20)
@@ -560,7 +560,7 @@ func TestFoldScalesWithTurnover(t *testing.T) {
 	}
 	// About 40 ms with the skip; the walk of every removed key's history
 	// took about 700 ms.
-	if d := time.Since(start); d > 350*time.Millisecond {
+	if d := time.Since(start); d > 350*time.Millisecond && !raceEnabled {
 		t.Fatalf("a cold fold of %d ops took %v", fresh.Len(), d)
 	} else {
 		t.Logf("a cold fold of %d ops took %v", fresh.Len(), d)
@@ -651,7 +651,7 @@ func TestFoldScalesWithAdmissions(t *testing.T) {
 	}
 	// About 50 ms: each admission's view folds its prefix, quadratic in
 	// principle but small at group sizes.
-	if d := time.Since(start); d > time.Second {
+	if d := time.Since(start); d > time.Second && !raceEnabled {
 		t.Fatalf("a cold fold of %d admissions took %v", n, d)
 	}
 }
@@ -729,5 +729,68 @@ func TestLargeGroupOpsDecode(t *testing.T) {
 	big := make([]byte, MaxOpBytes+1)
 	if _, err := Decode(big); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("an oversized encoding: %v", err)
+	}
+}
+
+// TestRemovedAdminListsUntrusted: a removed admin's seal key lists stop
+// counting, so its lie can't keep a member from getting a key.
+func TestRemovedAdminListsUntrusted(t *testing.T) {
+	r, owner, admin, member := group(t)
+	stale, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.ops {
+		if o.Kind == Add && o.Target == admin.Public() {
+			if _, err := stale.Add(o); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rk, err := (&Writer{R: stale, Me: owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	lie := (&Writer{R: r, Me: admin}).base(Deliver)
+	lie.Target = member.Public()
+	if err := seal(lie, member.Public(), nil); err != nil {
+		t.Fatal(err)
+	}
+	lie.Seals[0].Holds = []KeyRef{{Made: rk.ID()}, {Made: rk.ID(), Secret: true}}
+	lie.Sign(admin)
+	if _, err := r.Add(lie); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: owner}).Remove(admin.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	// The owner's removal rekeyed; the member still lacks rk's keys, and
+	// the removed admin's lie no longer hides that.
+	if _, err := (&Writer{R: r, Me: owner}).Deliver(member.Public(), keys.PublicKey{}); err != nil {
+		t.Fatalf("the removed admin's lie stopped the deliver: %v", err)
+	}
+	if _, ok := r.Keyring(member).Epochs[rk.ID()]; !ok {
+		t.Fatal("the member still lacks the rekey's epoch key")
+	}
+}
+
+func TestDecodeBoundsValues(t *testing.T) {
+	// A list of empty lists within the byte bound but past the value bound.
+	b := []byte("d1:al")
+	for len(b) < MaxOpBytes-4 {
+		b = append(b, 'l', 'e')
+	}
+	b = append(b, 'e', 'e')
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := Decode(b); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a document of half a million values: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<20 {
+		t.Fatalf("decoding it allocated %d MB", alloc>>20)
 	}
 }

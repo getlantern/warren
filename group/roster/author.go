@@ -14,6 +14,10 @@ import (
 // operation, or there is nothing for it to do.
 var ErrNotAllowed = errors.New("roster: operation not allowed")
 
+// ErrTooLarge means the operation would encode past MaxOpBytes (a rekey to
+// thousands of members, say), which peers would refuse.
+var ErrTooLarge = errors.New("roster: operation too large")
+
 // Found starts a group founded by founder, its owner.
 func Found(founder *keys.Identity, name string, shards uint32) (*Roster, error) {
 	if len(name) > MaxName || shards == 0 || shards > MaxShards {
@@ -46,6 +50,9 @@ func (w *Writer) base(kind Kind) *Op {
 
 func (w *Writer) finish(o *Op) (*Op, error) {
 	o.Sign(w.Me)
+	if len(o.Encode()) > MaxOpBytes {
+		return nil, ErrTooLarge
+	}
 	if _, err := w.R.Add(o); err != nil {
 		return nil, err
 	}
@@ -230,9 +237,12 @@ type held struct{ secret, epoch bool }
 func (w *Writer) holdings(f *Result, target keys.PublicKey) map[ID]held {
 	h := map[ID]held{}
 	for _, o := range w.R.ops {
-		// The author's role when the op counted, not now: a member's list
-		// doesn't become trusted when it's promoted later.
-		trusted := o.Author == w.Me.Public() || f.As[o.id] == Owner || f.As[o.id] == Admin
+		// Trusted only if the author was an admin both when the op counted
+		// and now: a member's list doesn't become trusted when it's
+		// promoted later, and a removed or demoted admin's stops counting.
+		then, now := f.As[o.id], f.Roles[o.Author]
+		trusted := o.Author == w.Me.Public() ||
+			((then == Owner || then == Admin) && (now == Owner || now == Admin))
 		if !trusted {
 			continue
 		}

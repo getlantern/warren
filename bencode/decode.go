@@ -69,8 +69,12 @@ func (v Value) Get(key string) (Value, bool) {
 func Decode(b []byte) (Value, error) { return DecodeLimit(b, MaxElements) }
 
 // DecodeLimit is Decode with a caller's bound on the number of values, for
-// documents larger than a datagram.
+// documents larger than a datagram. A bound of zero or less means
+// MaxElements.
 func DecodeLimit(b []byte, maxElements int) (Value, error) {
+	if maxElements <= 0 {
+		maxElements = MaxElements
+	}
 	d := decoder{buf: b, limit: maxElements}
 	v, err := d.value(0)
 	if err != nil {

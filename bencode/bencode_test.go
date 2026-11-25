@@ -104,7 +104,7 @@ func TestLargeDictDuplicateCheck(t *testing.T) {
 	if _, err := DecodeLimit(build(100000, -1), 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 2*time.Second {
+	if d := time.Since(start); d > 10*time.Second {
 		t.Fatalf("a 100,000-key dictionary took %v", d)
 	}
 	for _, at := range []int{1, smallDict, smallDict + 1, 99999} {

@@ -22,9 +22,11 @@ const (
 	// MaxOpBytes bounds an operation's encoding: room for a rekey sealed to
 	// thousands of members, or an add carrying thousands of epoch keys.
 	MaxOpBytes = 1 << 20
-	// maxOpValues bounds its bencode values: every value takes at least
-	// two bytes, so this never binds before MaxOpBytes does.
-	maxOpValues = MaxOpBytes / 2
+	// maxOpValues bounds its bencode values, which cost far more in memory
+	// than on the wire: enough for a rekey sealed to about 4,000 members
+	// (about seven values a seal) or an add carrying 30,000 epoch keys,
+	// while one hostile op can't make a decoder allocate hundreds of MB.
+	maxOpValues = MaxOpBytes / 32
 )
 
 // ID names an operation: the SHA-256 of its signed encoding. Since the
