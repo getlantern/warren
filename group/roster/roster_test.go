@@ -655,3 +655,52 @@ func TestFoldScalesWithAdmissions(t *testing.T) {
 		t.Fatalf("a cold fold of %d admissions took %v", n, d)
 	}
 }
+
+// TestUnseenPromotionDoesntTrustLists: a member's deliver written before it
+// saw its promotion (which sorts first) isn't recorded as an admin's.
+func TestUnseenPromotionDoesntTrustLists(t *testing.T) {
+	r, owner, _, member := group(t)
+	stale, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.order()[1:] {
+		if _, err := stale.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	promo, err := (&Writer{R: r, Me: owner}).SetRole(member.Public(), Admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// In the copy without the promotion the member writes twice, so its
+	// second deliver's clock is above the promotion's.
+	sw := &Writer{R: stale, Me: member}
+	var lie *Op
+	for range 2 {
+		lie = sw.base(Deliver)
+		lie.Target = owner.Public()
+		if err := seal(lie, owner.Public(), nil); err != nil {
+			t.Fatal(err)
+		}
+		lie.Sign(member)
+		if _, err := stale.Add(lie); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, o := range stale.order() {
+		if _, err := r.Add(o); err != nil && !errors.Is(err, ErrWrongGroup) {
+			t.Fatal(err)
+		}
+	}
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.Counts[promo.ID()] || !f.Counts[lie.ID()] || lie.Lamport <= promo.Lamport {
+		t.Fatal("setup: the promotion should count and sort before the deliver")
+	}
+	if f.As[lie.ID()] != Member {
+		t.Fatalf("a deliver written before its author saw its promotion is recorded as %v", f.As[lie.ID()])
+	}
+}

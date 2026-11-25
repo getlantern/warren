@@ -239,8 +239,8 @@ type Result struct {
 	// Grants lists, per key, the counting role operations that promoted or
 	// demoted it, in total order.
 	Grants  map[keys.PublicKey][]*Op
-	// As is each counting op's author's role when it counted (an admin not
-	// yet aware of its grant counts as a member).
+	// As is each counting op's author's role when it counted, as far as the
+	// author knew: an admin not yet aware of its grant counts as a member.
 	As      map[ID]Role
 	Owner   keys.PublicKey
 	Current ID // the key-making operation whose keys are current
@@ -442,8 +442,10 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 			continue
 		}
 		author := res.Roles[o.Author]
-		if author == Admin && o.Kind.needsAdmin() && !r.descends(o.id, granted[o.Author]) {
-			author = Member // not yet an admin as far as its author knew
+		// An admin that hadn't seen its own grant writes as a member: for
+		// authority, and for the role recorded in As, whatever the kind.
+		if author == Admin && !r.descends(o.id, granted[o.Author]) {
+			author = Member
 		}
 		ok := false
 		switch o.Kind {
