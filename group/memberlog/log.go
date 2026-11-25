@@ -128,11 +128,12 @@ func (l *Log) retop(seq uint64, gone *[]*Entry) {
 	}
 }
 
-// ahead is the bytes of entries held past the visible chain.
+// ahead is the bytes of entries held past the visible chain. Only the
+// window above it can hold any, so that is all it scans.
 func (l *Log) ahead() int {
 	n := 0
-	for s, e := range l.bySeq {
-		if s > l.top {
+	for s := l.top + 1; s <= l.top+Window; s++ {
+		if e := l.bySeq[s]; e != nil {
 			n += len(e.Box)
 		}
 	}
@@ -229,7 +230,8 @@ func (l *Log) cut(removed bool, seq uint64, head ID, gone *[]*Entry) {
 	}
 	if !removed {
 		// The author is a member again; what past the cutoff was dropped,
-		// sync fills in again.
+		// sync fills in again, unless the log is forked: a fork proof is
+		// evidence the author signed two histories, whoever removed it.
 		l.removed, l.cutSeq, l.cutHead, l.low = false, 0, ID{}, 0
 		l.retop(l.top+1, gone)
 		return

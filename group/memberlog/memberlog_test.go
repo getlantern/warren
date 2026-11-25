@@ -371,7 +371,7 @@ func TestHeadEvictsContradictedEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	f = x.fold(t)
-	if _, err := add(s, b3, f); err != nil { // Add applies the removal itself
+	if _, err := add(s, b3, f); err != nil { // add's Update applies the removal
 		t.Fatal(err)
 	}
 	gone := s.Withdrawn()
@@ -587,5 +587,33 @@ func TestMaxAhead(t *testing.T) {
 	}
 	if n := len(s.Log(x.member.Public()).Entries()); n != held+1 {
 		t.Fatalf("%d visible after closing the gap, want %d", n, held+1)
+	}
+}
+
+// TestForkSurvivesLiftedRemoval: a forked log stays forked when a removal
+// that had cut it stops counting.
+func TestForkSurvivesLiftedRemoval(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	a1, _ := Write(x.member, g, nil, ep, key, App, []byte("a1"))
+	a2, _ := Write(x.member, g, a1, ep, key, App, []byte("a2"))
+	b2, _ := Write(x.member, g, a1, ep, key, App, []byte("b2"))
+	s := NewSet(g)
+	f := x.fold(t)
+	s.Update(f)
+	for _, e := range []*Entry{a1, a2} {
+		if _, err := s.Add(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Add(b2); !errors.Is(err, ErrForked) {
+		t.Fatal(err)
+	}
+	l := s.Log(x.member.Public())
+	l.cut(true, 2, b2.ID(), &s.gone)
+	l.cut(false, 0, ID{}, &s.gone)
+	if l.Fork() == nil || len(l.Entries()) != 1 {
+		t.Fatalf("after a lifted removal: fork %v, %d visible", l.Fork() != nil, len(l.Entries()))
 	}
 }
