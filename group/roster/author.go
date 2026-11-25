@@ -52,7 +52,11 @@ func (w *Writer) finish(o *Op) (*Op, error) {
 	return o, nil
 }
 
-func (w *Writer) fold() (*Result, *Keyring, error) {
+func (w *Writer) fold() (*Result, error) { return w.R.Fold() }
+
+// foldWithKeys also opens the writer's keyring, for the operations that
+// seal keys it holds.
+func (w *Writer) foldWithKeys() (*Result, *Keyring, error) {
 	f, err := w.R.Fold()
 	if err != nil {
 		return nil, nil, err
@@ -114,12 +118,15 @@ func sortedIDs[V any](m map[ID]V) []ID {
 // a member or admin, every epoch key the author holds. invite names the
 // invite the add answers, if any.
 func (w *Writer) Add(target keys.PublicKey, name string, role Role, invite keys.PublicKey) (*Op, error) {
-	f, k, err := w.fold()
+	f, k, err := w.foldWithKeys()
 	if err != nil {
 		return nil, err
 	}
 	a := f.Roles[w.Me.Public()]
 	can := a == Owner || (a == Admin && role != Admin)
+	if invite != (keys.PublicKey{}) && invite.Valid() != nil {
+		return nil, ErrNotAllowed
+	}
 	_, haveG := k.Secrets[f.Current]
 	if !can || (role != Member && role != Mirror && role != Admin) || target.Valid() != nil || len(name) > MaxName ||
 		f.Roles[target] != None || f.Removed[target] != (ID{}) || !haveG {
@@ -143,7 +150,7 @@ func (w *Writer) Add(target keys.PublicKey, name string, role Role, invite keys.
 // on the author's roster. logSeq and logHead are the head of target's log
 // the author has seen.
 func (w *Writer) Remove(target keys.PublicKey, logSeq uint64, logHead [32]byte) (*Op, error) {
-	f, _, err := w.fold()
+	f, err := w.fold()
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +170,7 @@ func (w *Writer) Remove(target keys.PublicKey, logSeq uint64, logHead [32]byte) 
 // Rekey replaces the group secret and epoch key, sealing them to everyone
 // on the author's roster: the corrective rekey, among others.
 func (w *Writer) Rekey() (*Op, error) {
-	f, _, err := w.fold()
+	f, err := w.fold()
 	if err != nil {
 		return nil, err
 	}
@@ -181,12 +188,13 @@ func (w *Writer) Rekey() (*Op, error) {
 // mirror, every epoch key the author holds that target lacks. invite names
 // the invite a rejoin answers, if any.
 func (w *Writer) Deliver(target keys.PublicKey, invite keys.PublicKey) (*Op, error) {
-	f, k, err := w.fold()
+	f, k, err := w.foldWithKeys()
 	if err != nil {
 		return nil, err
 	}
 	t := f.Roles[target]
-	if f.Roles[w.Me.Public()] == None || t == None || target == w.Me.Public() {
+	if f.Roles[w.Me.Public()] == None || t == None || target == w.Me.Public() ||
+		(invite != (keys.PublicKey{}) && invite.Valid() != nil) {
 		return nil, ErrNotAllowed
 	}
 	has := w.holdings(f, target)
@@ -251,7 +259,7 @@ func (w *Writer) holdings(f *Result, target keys.PublicKey) map[ID]held {
 
 // SetRole promotes a member to admin or demotes an admin to member.
 func (w *Writer) SetRole(target keys.PublicKey, role Role) (*Op, error) {
-	f, _, err := w.fold()
+	f, err := w.fold()
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +275,7 @@ func (w *Writer) SetRole(target keys.PublicKey, role Role) (*Op, error) {
 
 // Invite records an invite's public key and expiry.
 func (w *Writer) Invite(invite keys.PublicKey, expires int64) (*Op, error) {
-	f, _, err := w.fold()
+	f, err := w.fold()
 	if err != nil {
 		return nil, err
 	}

@@ -95,7 +95,13 @@ func translate(t *testing.T, u m.Store) *translation {
 	}
 	tr := &translation{real: map[m.ID]ID{}, model: map[ID]m.ID{}, secrets: map[ID]keys.Secret{}, epochs: map[ID]keys.EpochKey{}}
 	for _, mo := range f.Order {
-		o := &Op{Kind: kindOf[mo.Kind], Lamport: mo.Lamport, Role: roleOf[mo.Role]}
+		o := &Op{Kind: kindOf[mo.Kind], Lamport: mo.Lamport}
+		switch mo.Kind {
+		case m.Add, m.SetRole:
+			o.Role = roleOf[mo.Role] // other kinds carry no role
+		case m.Genesis:
+			o.Shards = 1
+		}
 		if mo.Target != 0 && mo.Kind != m.Rekey && mo.Kind != m.Genesis {
 			o.Target = ident(mo.Target).Public() // a rekey takes no target
 		}
@@ -308,4 +314,3 @@ func cmpModel(a, b m.ID) int {
 	}
 	return 0
 }
-

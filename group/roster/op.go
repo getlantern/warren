@@ -187,7 +187,7 @@ func (o *Op) encode(withSig bool) []byte {
 	if o.Shards != 0 {
 		d = append(d, pair("s", num(int64(o.Shards))))
 	}
-	if o.LogSeq != 0 {
+	if o.LogSeq != 0 || o.LogHead != [32]byte{} {
 		d = append(d, pair("hs", num(int64(o.LogSeq))), pair("hh", str(o.LogHead[:])))
 	}
 	if o.Invite != zero {
@@ -216,6 +216,32 @@ func (o *Op) encode(withSig bool) []byte {
 		d = append(d, pair("z", str(o.Sig)))
 	}
 	return bencode.Append(nil, bencode.Value{Kind: bencode.Dict, Dict: d})
+}
+
+// fieldsFitKind reports whether the operation carries only the fields its
+// kind uses (the target is checked separately).
+func (o *Op) fieldsFitKind() bool {
+	var zero keys.PublicKey
+	has := func(set bool, allowed ...Kind) bool { return !set || slices.Contains(allowed, o.Kind) }
+	switch {
+	case !has(o.Role != None, Add, SetRole),
+		!has(o.Name != "", Genesis, Add),
+		!has(o.Shards != 0, Genesis),
+		!has(o.LogSeq != 0 || o.LogHead != [32]byte{}, Remove),
+		!has(o.Invite != zero, Invite, Add, Deliver),
+		!has(o.Expires != 0, Invite),
+		!has(len(o.Seals) != 0, Genesis, Add, Remove, Rekey, Deliver):
+		return false
+	}
+	switch o.Kind {
+	case Genesis:
+		return o.Shards != 0
+	case Add, SetRole:
+		return o.Role != None
+	case Invite:
+		return o.Invite != zero && o.Expires > 0
+	}
+	return true
 }
 
 // signed is the message an operation's signature covers.
@@ -351,6 +377,9 @@ func Decode(b []byte) (*Op, error) {
 		}
 	}
 	if err := o.Author.Valid(); err != nil {
+		return nil, ErrMalformed
+	}
+	if !o.fieldsFitKind() {
 		return nil, ErrMalformed
 	}
 	// A kind with a target must carry a usable one, and others none: a

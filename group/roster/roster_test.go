@@ -404,3 +404,35 @@ func TestRosterIsolated(t *testing.T) {
 	}
 	_ = owner
 }
+
+func TestLogHeadAtSeqZero(t *testing.T) {
+	r, _, admin, member := group(t)
+	rm, err := (&Writer{R: r, Me: admin}).Remove(member.Public(), 0, [32]byte{9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Op(rm.ID()); got.LogSeq != 0 || got.LogHead != [32]byte{9} {
+		t.Fatalf("the log head at sequence 0 was lost: %d %x", got.LogSeq, got.LogHead[:2])
+	}
+}
+
+func TestDecodeRejectsFieldsOutsideKind(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	w := &Writer{R: r, Me: owner}
+	for name, set := range map[string]func(o *Op){
+		"a role on a rekey":     func(o *Op) { o.Role = Member },
+		"a name on a rekey":     func(o *Op) { o.Name = "x" },
+		"a log head on a rekey": func(o *Op) { o.LogSeq = 3 },
+		"an expiry on a rekey":  func(o *Op) { o.Expires = 5 },
+		"an invite with no expiry": func(o *Op) {
+			o.Kind, o.Invite, o.CommitSecret, o.CommitEpoch = Invite, admin.Public(), [32]byte{}, [32]byte{}
+		},
+	} {
+		o := w.base(Rekey)
+		set(o)
+		o.Sign(owner)
+		if _, err := Decode(o.Encode()); !errors.Is(err, ErrMalformed) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
