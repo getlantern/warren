@@ -24,10 +24,12 @@ const (
 	MaxOpBytes = 1 << 20
 	// maxOpValues bounds its bencode values, which cost far more in memory
 	// than on the wire, so one hostile op can't make a decoder allocate
-	// hundreds of MB. A member's seal in a rekey is nine values and a
-	// mirror's eight, so a rekey reaches it at about 3,400 recipients; an
-	// add carries about 10,000 epoch keys before MaxOpBytes binds. Writers
-	// refuse what would exceed either (ErrTooLarge).
+	// hundreds of MB. A member's seal in a rekey is about 300 bytes and
+	// nine values, so the byte bound limits a rekey to members at about
+	// 3,460; a mirror's is about 200 bytes and eight values, so the value
+	// budget limits a mirror-heavy rekey at about 4,100. An add carries
+	// about 10,000 epoch keys before the byte bound. Decode reports either
+	// as ErrTooLarge, and so writers do too.
 	maxOpValues = MaxOpBytes / 32
 )
 
@@ -167,6 +169,9 @@ func (o *Op) String() string { return fmt.Sprintf("%v %x by %x", o.Kind, o.id[:4
 var (
 	// ErrMalformed means an encoding isn't a well-formed, canonical operation.
 	ErrMalformed = errors.New("roster: malformed operation")
+	// ErrTooLarge means an operation exceeds the byte bound (MaxOpBytes) or
+	// the value budget peers enforce: a rekey to thousands of members, say.
+	ErrTooLarge = errors.New("roster: operation too large")
 	// ErrSignature means an operation's signature doesn't verify.
 	ErrSignature = errors.New("roster: bad signature")
 )
@@ -292,9 +297,12 @@ func (o *Op) Encode() []byte { return o.encode(true) }
 // re-encodes to exactly b), with usable keys, signed by its author.
 func Decode(b []byte) (*Op, error) {
 	if len(b) > MaxOpBytes {
-		return nil, ErrMalformed
+		return nil, ErrTooLarge
 	}
 	v, err := bencode.DecodeLimit(b, maxOpValues)
+	if errors.Is(err, bencode.ErrTooLarge) {
+		return nil, ErrTooLarge
+	}
 	if err != nil || v.Kind != bencode.Dict {
 		return nil, ErrMalformed
 	}

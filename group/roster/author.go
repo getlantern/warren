@@ -7,17 +7,12 @@ import (
 	"math"
 	"slices"
 
-	"github.com/getlantern/warren/bencode"
 	"github.com/getlantern/warren/group/keys"
 )
 
 // ErrNotAllowed means the author's own view of the roster doesn't allow the
 // operation, or there is nothing for it to do.
 var ErrNotAllowed = errors.New("roster: operation not allowed")
-
-// ErrTooLarge means the operation would encode past MaxOpBytes (a rekey to
-// thousands of members, say), which peers would refuse.
-var ErrTooLarge = errors.New("roster: operation too large")
 
 // Found starts a group founded by founder, its owner.
 func Found(founder *keys.Identity, name string, shards uint32) (*Roster, error) {
@@ -50,14 +45,7 @@ func (w *Writer) base(kind Kind) *Op {
 }
 
 func (w *Writer) finish(o *Op) (*Op, error) {
-	o.Sign(w.Me)
-	enc := o.Encode()
-	if len(enc) > MaxOpBytes {
-		return nil, ErrTooLarge
-	}
-	if _, err := bencode.DecodeLimit(enc, maxOpValues); errors.Is(err, bencode.ErrTooLarge) {
-		return nil, ErrTooLarge
-	}
+	o.Sign(w.Me) // Add decodes it as a peer would: ErrTooLarge if over budget
 	if _, err := w.R.Add(o); err != nil {
 		return nil, err
 	}

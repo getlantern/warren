@@ -590,7 +590,10 @@ so an app chooses where data lives and how much.
 
 ## Scale and cost
 
-- **v1 target:** groups of up to about 50 members (decided). Rekey is one
+- **v1 target:** groups of up to about 50 members (decided). A roster
+  operation is bounded (1 MiB, and a budget of decoded values), so one
+  rekey reaches about 3,400 members; splitting a rekey's seals across
+  operations is the path past that. Rekey is one
   sealed copy per member; the directory three shards of at most 20.
 - **Idle cost** for a member: one directory write a period, often made for
   it by a member it's in session with; directory reads only on a cold start;

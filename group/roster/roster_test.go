@@ -727,7 +727,7 @@ func TestLargeGroupOpsDecode(t *testing.T) {
 		t.Fatal(err)
 	}
 	big := make([]byte, MaxOpBytes+1)
-	if _, err := Decode(big); !errors.Is(err, ErrMalformed) {
+	if _, err := Decode(big); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("an oversized encoding: %v", err)
 	}
 }
@@ -786,7 +786,7 @@ func TestDecodeBoundsValues(t *testing.T) {
 	b = append(b, 'e', 'e')
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	if _, err := Decode(b); !errors.Is(err, ErrMalformed) {
+	if _, err := Decode(b); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("a document of half a million values: %v", err)
 	}
 	runtime.ReadMemStats(&after)

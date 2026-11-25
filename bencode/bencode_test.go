@@ -100,11 +100,16 @@ func TestLargeDictDuplicateCheck(t *testing.T) {
 		}
 		return append(b, 'e')
 	}
+	doc := build(100000, -1)
 	start := time.Now()
-	if _, err := DecodeLimit(build(100000, -1), 1<<20); err != nil {
+	if _, err := DecodeLimit(doc, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 2*time.Second && !raceEnabled {
+	bound := 2 * time.Second
+	if raceEnabled {
+		bound = 30 * time.Second // still far below a pairwise scan's
+	}
+	if d := time.Since(start); d > bound {
 		t.Fatalf("a 100,000-key dictionary took %v", d)
 	}
 	for _, at := range []int{1, smallDict, smallDict + 1, 99999} {
