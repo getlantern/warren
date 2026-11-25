@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about six minutes)")
+var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about 23 minutes)")
 
 const (
 	O Key = iota + 1 // owner

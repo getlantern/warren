@@ -474,8 +474,8 @@ The fold, the authority rules, key delivery and the corrective rekey are
 model-checked by `group/rostermodel`: an abstract model of this section's
 rules (keys as names, sealing as recipient sets) and an explorer that runs
 every interleaving of an owner, two admins and a member writing, syncing,
-and acting as compromised or removed authors (5.1 million states at depth
-6, about six minutes; `go test` runs depth 4 in seconds). It checks that the owner keeps its role, only the owner makes admins,
+and acting as compromised or removed authors (20 million states at depth
+6, about 23 minutes; `go test` runs depth 4 in about five seconds). It checks that the owner keeps its role, only the owner makes admins,
 backdated operations by removed authors never count, the view rule settles
 (in at most three passes), and once the corrective rekey and deliveries run,
 no off-roster key holds the current group secret or epoch key, mirrors hold
