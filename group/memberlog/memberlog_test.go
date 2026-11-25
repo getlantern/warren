@@ -1002,3 +1002,62 @@ func TestHidingKeepsBounds(t *testing.T) {
 	}
 	checkCounts(t, l)
 }
+
+// TestForkKeepsBounds: what a fork hides is held within a live log's bounds.
+func TestForkKeepsBounds(t *testing.T) {
+	x := newFixture(t)
+	ep, key := x.epoch(t, x.member)
+	s := NewSet(x.r.Group())
+	update(t, s, x.fold(t))
+	var first, prev *Entry
+	for i := range 80 {
+		var err error
+		if prev, err = Write(x.member, x.r.Group(), prev, ep, key, App, make([]byte, MaxBody)); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = prev
+		}
+		if _, err := s.Add(prev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other, err := Write(x.member, x.r.Group(), first, ep, key, App, []byte("other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add(other); !errors.Is(err, ErrForked) {
+		t.Fatalf("a second entry 2: %v", err)
+	}
+	l := s.Log(x.member.Public())
+	if l.Fork() == nil || l.top != 1 || l.ahead() > MaxAhead {
+		t.Fatalf("after the fork: proof %v, top %d, %d bytes held ahead", l.Fork() != nil, l.top, l.ahead())
+	}
+	checkCounts(t, l)
+}
+
+// TestLiftReportsOnlyWhatShowed: a fold that lifts a removal and changes
+// what is eligible withdraws only entries the app actually saw.
+func TestLiftReportsOnlyWhatShowed(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 3)
+	allowed := map[uint64]bool{1: true}
+	l := newLog(x.member.Public(), func(e *Entry) bool { return allowed[e.Seq] })
+	var gone []*Entry
+	for _, e := range es {
+		if _, err := l.add(e, &gone); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.cut(true, 3, es[2].ID(), &gone)
+	if l.top != 1 || len(gone) != 0 {
+		t.Fatalf("setup: top %d, %d withdrawn", l.top, len(gone))
+	}
+	allowed = map[uint64]bool{2: true, 3: true} // entry 1's epoch stops counting
+	l.cut(false, 0, ID{}, &gone)
+	l.retop(1, &gone) // as Update does
+	if len(gone) != 1 || gone[0].Seq != 1 || l.top != 0 {
+		t.Fatalf("withdrew %d entries (top %d), want only entry 1", len(gone), l.top)
+	}
+	checkCounts(t, l)
+}

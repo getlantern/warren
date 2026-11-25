@@ -195,6 +195,7 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 	}
 	if l.fork != nil {
 		l.retop(l.top+1, gone)
+		l.trim() // what the fork hid is held ahead; the proof keeps its own
 		return false, ErrForked
 	}
 	// The entry that closes the gap is always taken: it only ever shrinks
@@ -209,7 +210,7 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 
 // trim drops what a live log holds past its bounds, highest first: after a
 // lifted removal, a head's chain may have filled more than a live log
-// holds ahead. Sync fetches what it drops again as the gap closes.
+// holds ahead, and a fork or a fold can hide a long visible chain. Sync fetches what it drops again as the gap closes.
 func (l *Log) trim() {
 	var none []*Entry // nothing dropped here is visible
 	for s := range l.bySeq {
@@ -272,7 +273,7 @@ func (l *Log) cut(removed bool, seq uint64, head ID, gone *[]*Entry) {
 		// sync fills in again, unless the log is forked: a fork proof is
 		// evidence the author signed two histories, whoever removed it.
 		l.removed, l.cutSeq, l.cutHead, l.low = false, 0, ID{}, 0
-		l.retop(l.top+1, gone)
+		l.retop(1, gone) // the same fold may change what is eligible below top
 		l.trim()
 		return
 	}
