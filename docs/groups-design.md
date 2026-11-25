@@ -593,9 +593,12 @@ so an app chooses where data lives and how much.
    socket, plus invite listeners), and `Authorize` given the listener key
    that was called.
 2. **Ed25519 key blinding** for rendezvous keys (scalar multiplication on
-   the curve, as in Tor's rend-spec-v3). A blinded key is a bare scalar, not
-   an `ed25519.PrivateKey`, so every API that takes or keeps a signing key
-   moves to a signer interface that can sign with one: listening
+   the curve, as in Tor's rend-spec-v3), built in `group/keys`: the blinding
+   scalar hashes the factor with the member key, and a blinded key signs
+   standard Ed25519 signatures from its expanded scalar. A blinded key is a
+   bare scalar, not an `ed25519.PrivateKey`, so every API that takes or
+   keeps a signing key moves to a signer interface (`keys.Signer`) that can
+   sign with one: listening
    (`endpoint.Listen`, `driver.Node.Listen`, `dht.Node.Listen`/`ListenKey`),
    calling (`endpoint.Connect`, `driver.Node.Signal`, `dht.Node.Signal`),
    and the identity a `Conn` keeps to sign migration and resume offers.
