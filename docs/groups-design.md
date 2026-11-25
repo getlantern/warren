@@ -526,10 +526,11 @@ compromised devices would, the operations their role has no authority for,
 and none may count. Mutation tests break each authority rule, the
 role-change rule, the grant rule, the remover's-view rule, both view rules,
 restoring a demoted admin by promotion and the corrective rekey in turn, and
-the explorer catches each. (Delivery's roster check is now defence in depth:
-without it, the corrective rekey still catches a stray delivery, at the cost
-of a rekey.) No explored replica is a mirror, so mirrors' authority (the
-same rule as members') isn't explored. Its findings, all reflected above:
+the explorer catches each. (Delivery's roster check guards the past epoch
+keys: a stray delivery hands them to a key never admitted, and no rekey
+takes them back; the corrective rekey covers only the current ones. A test
+pins this.) No explored replica is a mirror, so mirrors' authority (the same
+rule as members') isn't explored. Its findings, all reflected above:
 concurrent duplicate `add`s, `deliver` withholding after any `remove`, an
 admin acting before seeing its own promotion (the grant rule), an admin
 removing another by racing its unseen demotion, and the demotion case the

@@ -456,8 +456,8 @@ func TestRosterModel(t *testing.T) {
 func TestMutations(t *testing.T) {
 	for _, m := range []string{
 		"no view rule", "admins add admins", "admins remove admins", "owner removable",
-		// Not "deliver off the roster": the corrective rekey now catches a
-		// stray delivery, so delivery's roster check only spares a rekey.
+		// "deliver off the roster" leaks past epoch keys, which the leak
+		// check (current keys only) doesn't see: TestDeliverOffRosterLeaksHistory.
 		"members add", "members remove", "members rekey", "role changes count",
 		"admins set roles", "no demotion view rule", "unseen grants count",
 		"removers need not see demotions", "restores need not be seen",
@@ -604,20 +604,36 @@ func TestFourPassChain(t *testing.T) {
 // while nobody removed holds it.
 func TestRemovedOnlyCondition(t *testing.T) {
 	_, failure := explore(t, Rules{}, removedPredicate, *depth)
-	if !strings.Contains(failure, "off the roster") || !strings.Contains(failure, "as member;") {
+	demotion := strings.Contains(failure, "role A as member") || strings.Contains(failure, "role B as member")
+	if !strings.Contains(failure, "off the roster") || !demotion {
 		t.Fatalf("want the demotion counterexample, got: %q", failure)
 	}
 	t.Logf("counterexample: %s", failure)
 }
 
-// TestDeliverOffRosterHealed checks delivery's roster check is defence in
-// depth: with senders delivering off the roster, the corrective rekey still
-// leaves no off-roster key holding the current keys.
-func TestDeliverOffRosterHealed(t *testing.T) {
+// TestDeliverOffRosterLeaksHistory pins delivery's roster check: without
+// it, a deliver hands a key that was never admitted every past epoch key
+// its sender holds, which no rekey can take back. The corrective rekey
+// covers only the current keys.
+func TestDeliverOffRosterLeaksHistory(t *testing.T) {
+	try := func() (*Op, map[ID]bool) {
+		w := setup(t, Rules{})
+		Author(w[O], Rules{}, Rekey, O, 0, None)
+		for id, o := range w[O] {
+			w[M][id] = o
+		}
+		d := Author(w[M], Rules{}, Deliver, M, N, None)
+		epochs, _ := w.union().Holdings()
+		return d, epochs[N]
+	}
+	if d, _ := try(); d != nil {
+		t.Fatal("a deliver to a key never on the roster was written")
+	}
 	mutation = "deliver off the roster"
 	defer func() { mutation = "" }()
-	if _, failure := explore(t, Rules{}, docPredicate, min(*depth, 3)); failure != "" {
-		t.Fatal(failure)
+	d, held := try()
+	if d == nil || len(held) < 2 {
+		t.Fatalf("without the roster check, N should get the old and current epoch keys, got %d", len(held))
 	}
 }
 
