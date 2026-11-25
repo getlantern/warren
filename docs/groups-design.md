@@ -363,8 +363,9 @@ removal: it is never stored. A member accepts a removed author's entries
 only as the chain from the recorded head down, each once the one above it
 names it, so sync sends them top-down; entries it held from before the
 removal stay visible until the head's chain confirms or contradicts them.
-A removed author whose log had forked shows nothing past the fork point
-until the head's chain reaches below it, and from then on the head's branch;
+A removed author whose log had forked shows nothing from the fork point on
+until the head's chain reaches the fork point, and from then on the head's
+branch;
 the fork proof stays, so if the removal stops counting the log is forked
 again. Only the removal that
 counts sets the cutoff: if two admins remove the same member concurrently,

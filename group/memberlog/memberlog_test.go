@@ -580,7 +580,10 @@ func TestMaxAhead(t *testing.T) {
 	s.Update(f)
 	// A full-size entry 1, so with the budget full it can't fit except
 	// through the gap-closing exemption.
-	first, _ := Write(x.member, x.r.Group(), nil, ep, key, App, make([]byte, MaxBody))
+	first, err := Write(x.member, x.r.Group(), nil, ep, key, App, make([]byte, MaxBody))
+	if err != nil {
+		t.Fatal(err)
+	}
 	prev := first
 	held := 0
 	for range 100 {
@@ -611,15 +614,21 @@ func TestMaxAhead(t *testing.T) {
 	}
 }
 
-// TestForkSurvivesLiftedRemoval: a forked log stays forked when a removal
-// that had cut it stops counting.
+// TestForkSurvivesLiftedRemoval: a forked log stays forked, through the
+// real fold path, when a removal that had cut it stops counting.
 func TestForkSurvivesLiftedRemoval(t *testing.T) {
 	x := newFixture(t)
 	ep, key := x.epoch(t, x.member)
 	g := x.r.Group()
-	a1, _ := Write(x.member, g, nil, ep, key, App, []byte("a1"))
-	a2, _ := Write(x.member, g, a1, ep, key, App, []byte("a2"))
-	b2, _ := Write(x.member, g, a1, ep, key, App, []byte("b2"))
+	w := func(prev *Entry, body string) *Entry {
+		e, err := Write(x.member, g, prev, ep, key, App, []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	a1 := w(nil, "a1")
+	a2, b2 := w(a1, "a2"), w(a1, "b2")
 	s := NewSet(g)
 	f := x.fold(t)
 	s.Update(f)
@@ -631,15 +640,39 @@ func TestForkSurvivesLiftedRemoval(t *testing.T) {
 	if _, err := s.Add(b2); !errors.Is(err, ErrForked) {
 		t.Fatal(err)
 	}
+	s.Withdrawn()
+	// A removal written where the admin hasn't seen its own demotion, which
+	// sorts first in the merged roster, so the removal stops counting.
+	stale, err := roster.New(x.r.Op(x.r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range f.Order[1:] {
+		if _, err := stale.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).SetRole(x.admin.Public(), roster.Member); err != nil {
+		t.Fatal(err)
+	}
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.member.Public(), 2, b2.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf, err := stale.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Update(sf)
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	s.Update(x.fold(t))
 	l := s.Log(x.member.Public())
-	l.cut(true, 2, b2.ID(), &s.gone)
-	l.cut(false, 0, ID{}, &s.gone)
-	if l.Fork() == nil || len(l.Entries()) != 1 {
-		t.Fatalf("after a lifted removal: fork %v, %d visible", l.Fork() != nil, len(l.Entries()))
+	if l.removed || l.Fork() == nil || len(l.Entries()) != 1 || len(s.Withdrawn()) != 0 {
+		t.Fatalf("after a lifted removal: removed %v, fork %v, %d visible", l.removed, l.Fork() != nil, len(l.Entries()))
 	}
-	if l := s.Log(x.member.Public()); l != nil {
-		checkCounts(t, l)
-	}
+	checkCounts(t, l)
 }
 
 // checkCounts recomputes the held and shown byte counts from scratch.
