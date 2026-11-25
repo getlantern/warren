@@ -97,8 +97,17 @@ func (l *Log) limit() uint64 {
 	return lim
 }
 
-// retop recomputes the visible chain's end after a change at or below seq.
-func (l *Log) retop(seq uint64) {
+// retop recomputes the visible chain's end after a change at or below seq,
+// appending to gone every still-held entry that leaves the app's view.
+func (l *Log) retop(seq uint64, gone *[]*Entry) {
+	old := l.top
+	defer func() {
+		for s := l.top + 1; s <= old; s++ {
+			if e := l.bySeq[s]; e != nil {
+				*gone = append(*gone, e)
+			}
+		}
+	}()
 	if seq <= l.top {
 		l.top = seq - 1
 	}
@@ -145,15 +154,11 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 		l.fork = &ForkProof{A: e, B: next}
 	}
 	if l.fork != nil {
-		old := l.top
-		l.retop(l.top + 1)
-		for seq := l.top + 1; seq <= old; seq++ {
-			*gone = append(*gone, l.bySeq[seq])
-		}
+		l.retop(l.top+1, gone)
 		return false, ErrForked
 	}
 	l.bySeq[e.Seq] = e
-	l.retop(e.Seq)
+	l.retop(e.Seq, gone)
 	return true, nil
 }
 
@@ -170,12 +175,12 @@ func (l *Log) addRemoved(e *Entry, gone *[]*Entry) (bool, error) {
 	}
 	if old := l.bySeq[e.Seq]; old != nil {
 		l.drop(e.Seq, gone) // held from before the removal, off the head's chain
-		l.retop(e.Seq)
+		l.retop(e.Seq, gone)
 	}
 	l.bySeq[e.Seq] = e
 	l.low = e.Seq
 	l.anchorDown(gone)
-	l.retop(e.Seq)
+	l.retop(e.Seq, gone)
 	return true, nil
 }
 
@@ -189,7 +194,7 @@ func (l *Log) anchorDown(gone *[]*Entry) {
 		}
 		if below.id != l.bySeq[l.low].Prev {
 			l.drop(l.low-1, gone)
-			l.retop(l.low - 1)
+			l.retop(l.low-1, gone)
 			return
 		}
 		l.low--
@@ -206,7 +211,7 @@ func (l *Log) cut(removed bool, seq uint64, head ID, gone *[]*Entry) {
 		// The author is a member again; what past the cutoff was dropped,
 		// sync fills in again.
 		l.removed, l.cutSeq, l.cutHead, l.low = false, 0, ID{}, 0
-		l.retop(l.top + 1)
+		l.retop(l.top+1, gone)
 		return
 	}
 	// The fork proof stays: entries past the fork point show only once the
@@ -222,7 +227,7 @@ func (l *Log) cut(removed bool, seq uint64, head ID, gone *[]*Entry) {
 		l.low = seq
 		l.anchorDown(gone)
 	}
-	l.retop(1) // after low: what shows past a fork point depends on it
+	l.retop(1, gone) // after low: what shows past a fork point depends on it
 }
 
 // Set is every author's log in one group, checked against the roster.

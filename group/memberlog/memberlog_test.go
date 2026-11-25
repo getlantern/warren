@@ -515,6 +515,9 @@ func TestCutKeepsForkHidden(t *testing.T) {
 	if _, err := s.Add(b2, f); !errors.Is(err, ErrForked) {
 		t.Fatal(err)
 	}
+	if gone := s.Withdrawn(); len(gone) != 1 || gone[0].ID() != a2.ID() {
+		t.Fatalf("the fork withdrew %d entries", len(gone))
+	}
 	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.member.Public(), 3, b3.ID()); err != nil {
 		t.Fatal(err)
 	}
@@ -523,6 +526,9 @@ func TestCutKeepsForkHidden(t *testing.T) {
 	l := s.Log(x.member.Public())
 	if n := len(l.Entries()); n != 1 {
 		t.Fatalf("cutting a forked log showed %d entries", n)
+	}
+	if gone := s.Withdrawn(); len(gone) != 0 {
+		t.Fatalf("the cut withdrew %d entries already withdrawn", len(gone))
 	}
 	for _, e := range []*Entry{b3, b2} {
 		if _, err := s.Add(e, f); err != nil {
