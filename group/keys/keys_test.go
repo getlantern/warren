@@ -3,7 +3,6 @@ package keys
 import (
 	"bytes"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/hex"
 	"testing"
 	"time"
@@ -153,7 +152,7 @@ func TestBlindRejectsSmallOrderKeys(t *testing.T) {
 
 func TestSealOpen(t *testing.T) {
 	alice, bob := id(t, 1), id(t, 2)
-	box, err := Seal(rand.Reader, alice.Public(), "op 1", []byte("G and epoch key"))
+	box, err := Seal(alice.Public(), "op 1", []byte("G and epoch key"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,15 +186,19 @@ func TestSealOpen(t *testing.T) {
 	}
 }
 
-func TestSealUsesRand(t *testing.T) {
-	to := id(t, 1).Public()
-	a, err := Seal(bytes.NewReader(make([]byte, 32)), to, "c", []byte("x"))
-	if err != nil {
-		t.Fatal(err)
+func TestVerifyRejectsSmallOrderKeys(t *testing.T) {
+	// Under the identity point A, R = r·B and S = r verify for any message,
+	// since the challenge term c·A vanishes.
+	identity := PublicKey(edwards25519.NewIdentityPoint().Bytes())
+	sig := append(edwards25519.NewGeneratorPoint().Bytes(), append([]byte{1}, make([]byte, 31)...)...)
+	if !ed25519.Verify(identity[:], []byte("anything"), sig) {
+		t.Fatal("the forgery doesn't fool crypto/ed25519; the test is stale")
 	}
-	b, _ := Seal(bytes.NewReader(make([]byte, 32)), to, "c", []byte("x"))
-	if !bytes.Equal(a, b) {
-		t.Fatal("Seal ignored its reader")
+	if identity.Verify([]byte("anything"), sig) {
+		t.Fatal("Verify accepted a forged signature under a small-order key")
+	}
+	if identity.Valid() != ErrBadKey {
+		t.Fatal("Valid accepted the identity point")
 	}
 }
 
@@ -240,7 +243,7 @@ func TestDerivationsSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Equal(g.SyncKey(0, callee), g.SyncKey(1, callee)) {
+	if g.SyncKey(0, callee).Public() == g.SyncKey(1, callee).Public() {
 		t.Fatal("the sync key doesn't change with the period")
 	}
 	if CommitSecret(g) == CommitEpoch(EpochKey(g)) {
@@ -253,33 +256,58 @@ func TestPeriodOf(t *testing.T) {
 	if PeriodOf(t0) != 10 || PeriodOf(t0.Add(Period-time.Second)) != 10 || PeriodOf(t0.Add(Period)) != 11 {
 		t.Fatal("periods aren't hour-aligned")
 	}
+	if PeriodOf(time.Time{}) != 0 || PeriodOf(time.Unix(-1, 0)) != 0 {
+		t.Fatal("a time before 1970 isn't period 0")
+	}
 }
 
-// TestVectors pins the derivations, so a change to any of them, which would
-// split groups across versions, fails here first.
+// TestVectors pins every derivation and a blinded signature, so a change to
+// any of them, which would split groups across versions, fails here first.
 func TestVectors(t *testing.T) {
 	var g Secret
 	for i := range g {
 		g[i] = byte(i)
 	}
+	const p = 480000
 	alice := IdentityFromSeed([32]byte{0xa1})
-	rk, err := Rendezvous(g, 480000, alice.Public())
+	rk, err := Rendezvous(g, p, alice.Public())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, v := range []struct{ name, got, want string }{
-		{"blind", hex.EncodeToString(func() []byte { b := g.Blind(480000); return b[:] }()), vecBlind},
-		{"rendezvous", hex.EncodeToString(rk[:]), vecRendezvous},
-		{"commit", hex.EncodeToString(func() []byte { c := CommitSecret(g); return c[:] }()), vecCommit},
-	} {
-		if v.got != v.want {
-			t.Errorf("%s: got %s, want %s", v.name, v.got, v.want)
+	h := func(b []byte) string { return hex.EncodeToString(b) }
+	dk, ds, bl, ib := g.DirKey(), g.DirSeal(), g.Blind(p), InviteBlind([32]byte(g), p)
+	cs, ce := CommitSecret(g), CommitEpoch(EpochKey(g))
+	sk := g.SyncKey(p, rk).Public()
+	got := map[string]string{
+		"dirKey":        h(dk[:]),
+		"dirSeal":       h(ds[:]),
+		"blind":         h(bl[:]),
+		"inviteBlind":   h(ib[:]),
+		"directoryKey":  h(g.DirectoryKey(p).Public().(ed25519.PublicKey)),
+		"directorySalt": h(g.DirectorySalt(p, 2)),
+		"syncKey":       h(sk[:]),
+		"commitSecret":  h(cs[:]),
+		"commitEpoch":   h(ce[:]),
+		"rendezvous":    h(rk[:]),
+		"blindedSig":    h(alice.Rendezvous(g, p).Sign([]byte("offer"))),
+	}
+	for name, v := range got {
+		if v != vectors[name] {
+			t.Errorf("%s: got %s, want %s", name, v, vectors[name])
 		}
 	}
 }
 
-const (
-	vecBlind      = "bfe08ce5e4ae646682b168e172aab5e16b5c3a3b8e06c3a3ab098f49941256cf"
-	vecRendezvous = "50cbbb712d4836024b79035eae267e03a8afc0458bd9935e07f19bda7c62470d"
-	vecCommit     = "b43337f890d5f0432cd455847c8d74b6c161c8aa12af64943f5a300672c643d1"
-)
+var vectors = map[string]string{
+	"blind":         "bfe08ce5e4ae646682b168e172aab5e16b5c3a3b8e06c3a3ab098f49941256cf",
+	"blindedSig":    "45130509cc9f98390a4369aae32c388005d3f0b675b342616c476565c747653d7616b6349fa58f9042db2ec1529d4ca01a77ebea0219148c117838b8db2d6402",
+	"commitEpoch":   "b2acfd01c93871d0bda777ae0dbf38e8d446e43ef8d1606c747666f21f679618",
+	"commitSecret":  "b43337f890d5f0432cd455847c8d74b6c161c8aa12af64943f5a300672c643d1",
+	"dirKey":        "fe24261c48e9010943ccab872c994acf29b10f0d621f75d9e736d32a3832ba6d",
+	"directoryKey":  "108c23109b45690ffe685641d9be326b996116e18e4419952a5d697d0d453610",
+	"directorySalt": "20e9f81331a3c0f510cf237556ed8febc35e936b058855d8de37192d9e85fb27",
+	"inviteBlind":   "2ea2e387e7862c70d005d3ff14189ed7fe6b27e108136efaed66501c0a2b5fb6",
+	"rendezvous":    "50cbbb712d4836024b79035eae267e03a8afc0458bd9935e07f19bda7c62470d",
+	"syncKey":       "62a33e1c5af2ea4eb1a7a900776614f9413f5638f5e66e0c5aed75f49fd9a0b6",
+	"dirSeal":       "9dfd19a3317a929dc2bb2f763e5f14ef53ab663ecad3635134db608f4fc20fd2",
+}

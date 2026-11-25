@@ -21,9 +21,21 @@ type Signer interface {
 	Sign(msg []byte) []byte
 }
 
-// Verify reports whether sig is pk's signature of msg.
+// Verify reports whether sig is pk's signature of msg, and pk is a usable
+// key: under a small-order key anyone can forge signatures that
+// ed25519.Verify accepts.
 func (pk PublicKey) Verify(msg, sig []byte) bool {
+	if _, err := pk.point(); err != nil {
+		return false
+	}
 	return ed25519.Verify(pk[:], msg, sig)
+}
+
+// Valid reports whether pk is a usable key (see ErrBadKey). A roster checks
+// it before admitting a member key.
+func (pk PublicKey) Valid() error {
+	_, err := pk.point()
+	return err
 }
 
 // ErrBadKey means a public key isn't a usable point: not on the curve,

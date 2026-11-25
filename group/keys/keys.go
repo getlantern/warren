@@ -18,7 +18,10 @@ import (
 const Period = time.Hour
 
 // PeriodOf returns the period t falls in.
-func PeriodOf(t time.Time) uint64 { return uint64(t.Unix()) / uint64(Period/time.Second) }
+// Times before 1970 (an unset time.Time, say) are period 0.
+func PeriodOf(t time.Time) uint64 {
+	return uint64(max(t.Unix(), 0)) / uint64(Period/time.Second)
+}
 
 const label = "warren/group/v1 "
 
@@ -73,9 +76,9 @@ func (g Secret) DirectorySalt(p uint64, shard uint32) []byte {
 // rendezvous key (not its member key), when the callee may not know the
 // caller yet: only a holder of G can compute it, and signaling offers are
 // signed by it, so it proves G before any session exists.
-func (g Secret) SyncKey(p uint64, rendezvous PublicKey) ed25519.PrivateKey {
+func (g Secret) SyncKey(p uint64, rendezvous PublicKey) *Identity {
 	info := "sync" + string(periodBytes(p)) + string(rendezvous[:])
-	return ed25519.NewKeyFromSeed(derive(g[:], info, ed25519.SeedSize))
+	return IdentityFromSeed([32]byte(derive(g[:], info, 32)))
 }
 
 // InviteBlind derives the factor that blinds an invite key in period p,
