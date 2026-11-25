@@ -359,7 +359,9 @@ only entries on the chain ending at that head: nothing past it, and nothing
 below it that the head's hash chain doesn't lead to, so the removed member
 can't sign a different history below the cutoff. Such a history isn't
 treated as a fork, which would hide the entries the member wrote before its
-removal: it is simply never shown. Only the removal that
+removal: it is never stored. A member holds a removed author's log only as
+the chain from the recorded head down, accepting each entry once the one
+above it names it, so sync sends a removed author's entries top-down. Only the removal that
 counts sets the cutoff: if two admins remove the same member concurrently,
 the one first in the total order counts and the other doesn't (*Roster*),
 so entries only the second remover had seen are dropped too. Entries a member had

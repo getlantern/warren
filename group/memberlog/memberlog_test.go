@@ -257,18 +257,48 @@ func TestRemovalCutoff(t *testing.T) {
 	}
 
 	// A different history the removed member signs below the cutoff is
-	// kept out of view, and doesn't count as a fork that would hide the
+	// refused, not stored, and doesn't count as a fork that would hide the
 	// entries it wrote before removal.
 	ep := es[0].Epoch
-	forged, err := Write(x.member, g, es[0], ep, x.r.Keyring(x.member).Epochs[ep], App, []byte("forged"))
-	if err != nil {
+	key := x.r.Keyring(x.member).Epochs[ep]
+	for i := range 100 {
+		forged, err := Write(x.member, g, es[0], ep, key, App, []byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Add(forged, x.r, f); !errors.Is(err, ErrOffChain) {
+			t.Fatalf("a removed author's other history below the cutoff: %v", err)
+		}
+	}
+	if got := l.Entries(); len(got) != 3 || got[1].ID() != es[1].ID() || l.Fork() != nil || len(l.entries) != 3 {
+		t.Fatalf("the forged history was kept: %d held", len(l.entries))
+	}
+}
+
+// TestRemovedLogFillsFromTheHead: a member that learns of a removal before
+// any of the removed author's entries accepts them from the head down, and
+// refuses ones not yet anchored.
+func TestRemovedLogFillsFromTheHead(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 4)
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.member.Public(), 3, es[2].ID()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Add(forged, x.r, f); err != nil {
-		t.Fatalf("a removed author's other history below the cutoff: %v", err)
+	f := x.fold(t)
+	s := NewSet(x.r.Group())
+	if _, err := s.Add(es[0], x.r, f); !errors.Is(err, ErrOffChain) {
+		t.Fatalf("entry 1 before the head: %v", err)
 	}
-	if got := l.Entries(); len(got) != 3 || got[1].ID() != es[1].ID() || l.Fork() != nil {
-		t.Fatal("the forged history reached the visible chain")
+	if _, err := s.Add(es[3], x.r, f); !errors.Is(err, ErrPastCutoff) {
+		t.Fatalf("entry 4, past the head: %v", err)
+	}
+	for _, i := range []int{2, 1, 0} {
+		if _, err := s.Add(es[i], x.r, f); err != nil {
+			t.Fatalf("entry %d, top-down: %v", i+1, err)
+		}
+	}
+	if got := s.Log(x.member.Public()).Entries(); len(got) != 3 {
+		t.Fatalf("%d entries", len(got))
 	}
 }
 

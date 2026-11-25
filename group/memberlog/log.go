@@ -15,6 +15,12 @@ var (
 	// ErrPastCutoff means the author was removed and the entry isn't on the
 	// chain ending at the head its remover recorded.
 	ErrPastCutoff = errors.New("memberlog: entry past the removal cutoff")
+	// ErrOffChain means the author was removed and the entry isn't (yet)
+	// anchored to the chain from the recorded head: the head itself, or
+	// the entry the lowest anchored one names as its previous. Sync sends a
+	// removed author's log from the head down, so an entry refused this way
+	// can be sent again once its successor has arrived.
+	ErrOffChain = errors.New("memberlog: entry not anchored to the removal's head")
 	// ErrNotWriter means the roster doesn't let the author write a log: it
 	// was never admitted, or it is a mirror.
 	ErrNotWriter = errors.New("memberlog: author may not write a log")
@@ -37,6 +43,9 @@ type Log struct {
 	removed bool
 	cutSeq  uint64
 	cutHead ID
+	// low is, for a removed author, the lowest sequence number anchored to
+	// the head (cutSeq+1 while the head itself is missing).
+	low uint64
 }
 
 func newLog(author keys.PublicKey) *Log {
@@ -53,14 +62,25 @@ func (l *Log) add(e *Entry) (bool, error) {
 		return false, nil
 	}
 	if l.removed {
-		// Only the chain ending at the recorded head will be shown; other
-		// entries at or below the cutoff are kept but never shown, and a
-		// removed author's conflicting history isn't a fork that would
-		// hide the entries it wrote before removal.
+		// Only the chain ending at the recorded head is kept, filled from
+		// the head down one link at a time: a removed author's other
+		// histories are neither stored (it could sign any number) nor a
+		// fork that would hide the entries it wrote before removal.
 		if e.Seq > l.cutSeq || (e.Seq == l.cutSeq && e.id != l.cutHead) {
 			return false, ErrPastCutoff
 		}
+		if e.Seq+1 != l.low {
+			return false, ErrOffChain
+		}
+		if e.Seq < l.cutSeq && l.one(l.low).Prev != e.id {
+			return false, ErrOffChain
+		}
+		for _, id := range l.bySeq[e.Seq] { // a pre-removal entry off the chain
+			delete(l.entries, id)
+		}
+		l.bySeq[e.Seq] = nil
 		l.store(e)
+		l.low = e.Seq
 		return true, nil
 	}
 	if l.fork != nil {
@@ -149,8 +169,19 @@ func (l *Log) cut(seq uint64, head ID) []*Entry {
 	}
 	before := l.Entries()
 	l.removed, l.cutSeq, l.cutHead, l.fork = true, seq, head, nil
+	// Keep only what is anchored to the head: the chain from it down, as
+	// far as held entries link.
+	keep := map[ID]bool{}
+	l.low = seq + 1
+	for e := l.entries[head]; e != nil && seq > 0; e = l.entries[e.Prev] {
+		keep[e.id] = true
+		l.low = e.Seq
+		if e.Seq == 1 {
+			break
+		}
+	}
 	for id, e := range l.entries {
-		if e.Seq > seq || (e.Seq == seq && id != head) {
+		if !keep[id] {
 			delete(l.entries, id)
 			l.bySeq[e.Seq] = slices.DeleteFunc(l.bySeq[e.Seq], func(x ID) bool { return x == id })
 		}
