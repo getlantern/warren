@@ -907,11 +907,11 @@ line, B runs alongside it, C waits on device time, D is maintenance.
 
 **A. Private groups** (`docs/groups-design.md`, *Phasing*)
 
-1. **Logs** (`group/log`): per-member append-only logs, entries signed
-   and hash-chained, encrypted under the epoch key current when written;
-   fork detection (two signed entries at one sequence number); a removal's
-   cutoff (only entries on the chain ending at the head the remover saw).
-   Pure Go.
+1. **Logs** (`group/memberlog`, built): per-member append-only logs,
+   entries signed and hash-chained, encrypted under the epoch key current
+   when written; fork detection; a removal's cutoff (only entries on the
+   chain ending at the head the remover saw), with withdrawn entries
+   reported; only authors the roster admits, never mirrors.
 2. **Sync, as a state machine** (`group/sync`): what two members exchange
    on connect (roster heads and missing operations, liveness, log heads
    and missing entries), with no networking, so phase 2 only has to carry

@@ -345,8 +345,10 @@ epoch key current when written. Two kinds:
 Members replicate each other's logs over sessions: on connect each sends the
 head of every log it holds (sequence number and entry hash), and the other
 sends what's missing. Two different entries at the same sequence number,
-both signed by the author, are proof the author forked its log: members keep
-the proof, stop accepting that log, and tell the app. Any member can serve
+both signed by the author, are proof the author forked its log (so is an
+entry whose previous-hash contradicts the held chain): members keep the
+proof, stop accepting that log, show only its entries before the fork point
+(nobody can tell which branch is the author's), and tell the app. Any member can serve
 another's log, so a member offline for a week catches up from whoever is
 around (unless a rekey happened meanwhile, see *Removal*).
 
@@ -355,7 +357,9 @@ before removal. The `remove` operation records the head of that log the
 removing admin had seen (sequence number and entry hash), and members accept
 only entries on the chain ending at that head: nothing past it, and nothing
 below it that the head's hash chain doesn't lead to, so the removed member
-can't sign a different history below the cutoff. Only the removal that
+can't sign a different history below the cutoff. Such a history isn't
+treated as a fork, which would hide the entries the member wrote before its
+removal: it is simply never shown. Only the removal that
 counts sets the cutoff: if two admins remove the same member concurrently,
 the one first in the total order counts and the other doesn't (*Roster*),
 so entries only the second remover had seen are dropped too. Entries a member had
@@ -626,10 +630,10 @@ so an app chooses where data lives and how much.
 
 ## Phasing
 
-1. Keys, identity, roster, logs, sync. Unit-tested. **Keys** (`group/keys`)
-   and the **roster** (`group/roster`, conformance-tested against
-   `group/rostermodel`) are built; logs and the sync state machine are
-   next.
+1. Keys, identity, roster, logs, sync. Unit-tested. **Keys** (`group/keys`),
+   the **roster** (`group/roster`, conformance-tested against
+   `group/rostermodel`) and **logs** (`group/memberlog`) are built; the
+   sync state machine is next.
 2. Warren: a signer interface, multiple listeners, listener-aware
    `Authorize`, mutable puts and replica-aware reads. Then discovery,
    sessions and invites between members in the simulator.
