@@ -99,6 +99,12 @@ func (s *Sync) Handle(m Message) ([]Message, error) {
 	}
 	out, err := s.handle(m)
 	if err != nil {
+		if s.added && !s.opsDone {
+			// Operations taken this exchange stay in r, whatever ended it,
+			// so the logs follow them; the error that ended it is the one
+			// to report.
+			_ = s.refold()
+		}
 		s.err = err
 		return nil, err
 	}
@@ -139,13 +145,8 @@ func (s *Sync) handle(m Message) ([]Message, error) {
 		if !s.gotHave || s.opsDone {
 			return nil, violation("operations out of turn")
 		}
-		for i, o := range m.Ops {
+		for _, o := range m.Ops {
 			if _, err := s.r.Add(o); err != nil {
-				if i > 0 || s.added {
-					// What was added stays, so the logs follow it; the Add's
-					// error is the one to report.
-					_ = s.refold()
-				}
 				return nil, err
 			}
 			s.added = true

@@ -874,6 +874,21 @@ func TestOpsErrorKeepsLogsCurrent(t *testing.T) {
 	if _, down, _ := p.logs.Next(g.m1.Public()); !down {
 		t.Fatal("the logs didn't follow a removal the roster took")
 	}
+
+	// The same when a batch with More is followed by a message out of turn.
+	p = newPeer(t, g.r)
+	s = New(p.r, p.logs)
+	for _, m := range []Message{Have{IDs: p.r.IDs()}, Ops{Ops: []*roster.Op{rm}, More: true}} {
+		if _, err := s.Handle(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Handle(Logs{}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("log heads before the operations ended: %v", err)
+	}
+	if _, down, _ := p.logs.Next(g.m1.Public()); !down {
+		t.Fatal("the logs didn't follow a removal taken before an out-of-turn message")
+	}
 }
 
 func TestByeOutOfTurn(t *testing.T) {
