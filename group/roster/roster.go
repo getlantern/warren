@@ -34,8 +34,9 @@ type Roster struct {
 	// history. An ID commits to that history, and every op here has been
 	// verified against its ID, so the view never changes.
 	views map[ID]*view
-	// anc caches descends: whether the second op is an ancestor of the
-	// first, which never changes once both are held.
+	// anc caches descends within one top-level fold (whether the second op
+	// is an ancestor of the first), and is dropped after it, so it never
+	// outgrows a fold's own work.
 	anc map[[2]ID]bool
 }
 
@@ -54,7 +55,7 @@ func New(genesis *Op) (*Roster, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Roster{group: g.id, ops: map[ID]*Op{}, views: map[ID]*view{}, anc: map[[2]ID]bool{}}
+	r := &Roster{group: g.id, ops: map[ID]*Op{}, views: map[ID]*view{}}
 	r.ops[g.id] = g
 	return r, nil
 }
@@ -158,29 +159,58 @@ func (r *Roster) descends(o, a ID) bool {
 	if ao == nil || oo == nil {
 		return false
 	}
+	if r.anc == nil { // outside a fold: a cache for this query alone
+		r.anc = map[[2]ID]bool{}
+		defer func() { r.anc = nil }()
+	}
 	return r.desc(oo, ao)
 }
 
-// desc is descends over parents, memoizing every intermediate answer, so
-// one ancestor's queries cost O(ops) together however many are asked.
+// desc is descends over parents, memoizing every node's answer for the
+// current fold, so one ancestor's queries cost O(ops) together however many
+// are asked. It walks with an explicit stack, not recursion, so its depth
+// doesn't grow with the chain.
 func (r *Roster) desc(oo, ao *Op) bool {
-	key := [2]ID{oo.id, ao.id}
-	if v, ok := r.anc[key]; ok {
+	a := ao.id
+	if v, ok := r.anc[[2]ID{oo.id, a}]; ok {
 		return v
 	}
-	v := false
-	for _, p := range oo.Parents {
-		if p == ao.id {
-			v = true
-			break
-		}
-		if po := r.ops[p]; po.Lamport > ao.Lamport && r.desc(po, ao) {
-			v = true
-			break
-		}
+	type frame struct {
+		o *Op
+		i int
 	}
-	r.anc[key] = v
-	return v
+	stack := []frame{{o: oo}}
+	found := func() bool {
+		for _, f := range stack {
+			r.anc[[2]ID{f.o.id, a}] = true // every op on the stack descends from a
+		}
+		return true
+	}
+	for len(stack) > 0 {
+		top := &stack[len(stack)-1]
+		if top.i == len(top.o.Parents) {
+			r.anc[[2]ID{top.o.id, a}] = false // no parent leads to a
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		p := top.o.Parents[top.i]
+		top.i++
+		if p == a {
+			return found()
+		}
+		po := r.ops[p]
+		if po.Lamport <= ao.Lamport {
+			continue // clocks rise along edges, so a is not above p
+		}
+		if v, ok := r.anc[[2]ID{p, a}]; ok {
+			if v {
+				return found()
+			}
+			continue
+		}
+		stack = append(stack, frame{o: po})
+	}
+	return false
 }
 
 // sub is the roster of only the given operations, which must be causally
@@ -290,6 +320,10 @@ func (r *Roster) Fold() (*Result, error) {
 }
 
 func (r *Roster) fold() (*Result, error) {
+	if r.anc == nil {
+		r.anc = map[[2]ID]bool{}
+		defer func() { r.anc = nil }()
+	}
 	order := r.order()
 	dropped := map[ID]bool{}
 	var tried []map[ID]bool
