@@ -1061,3 +1061,46 @@ func TestLiftReportsOnlyWhatShowed(t *testing.T) {
 	}
 	checkCounts(t, l)
 }
+
+// TestForkedLogFillsItsPrefix: a member that learns of a fork before it
+// holds the log still takes what lies below the fork point, and a fork
+// found lower down replaces the proof.
+func TestForkedLogFillsItsPrefix(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 4)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	other4, _ := Write(x.member, g, es[2], ep, key, App, []byte("other"))
+	s := NewSet(g)
+	update(t, s, x.fold(t))
+	if _, err := s.Add(es[3]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add(other4); !errors.Is(err, ErrForked) {
+		t.Fatalf("setup: %v", err)
+	}
+	if seq, _, done := s.Next(x.member.Public()); done || seq != 1 {
+		t.Fatalf("next %d, done %v: the prefix is still wanted", seq, done)
+	}
+	for _, e := range es[:3] {
+		if _, err := s.Add(e); err != nil {
+			t.Fatalf("entry %d below the fork point: %v", e.Seq, err)
+		}
+	}
+	l := s.Log(x.member.Public())
+	if n := len(l.Entries()); n != 3 {
+		t.Fatalf("%d shown, want the 3 below the fork point", n)
+	}
+	if _, _, done := s.Next(x.member.Public()); !done {
+		t.Fatal("still wanting past the fork point")
+	}
+	// A conflict at entry 2 is an earlier fork: the proof moves down.
+	other2, _ := Write(x.member, g, es[0], ep, key, App, []byte("other2"))
+	if _, err := s.Add(other2); !errors.Is(err, ErrForked) {
+		t.Fatalf("a lower fork: %v", err)
+	}
+	if p := l.Fork(); p.A.Seq != 2 || len(l.Entries()) != 1 {
+		t.Fatalf("proof at %d, %d shown", p.A.Seq, len(l.Entries()))
+	}
+	checkCounts(t, l)
+}
