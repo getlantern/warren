@@ -526,16 +526,17 @@ compromised devices would, the operations their role has no authority for,
 and none may count. Mutation tests break each authority rule, the
 role-change rule, the grant rule, the remover's-view rule, both view rules,
 restoring a demoted admin by promotion and the corrective rekey in turn, and
-the explorer catches each. (Delivery's roster check guards the past epoch
-keys: a stray delivery hands them to a key never admitted, and no rekey
-takes them back; the corrective rekey covers only the current ones. A test
-pins this.) No explored replica is a mirror, so mirrors' authority (the same
-rule as members') isn't explored. Its findings, all reflected above:
-concurrent duplicate `add`s, `deliver` withholding after any `remove`, an
-admin acting before seeing its own promotion (the grant rule), an admin
-removing another by racing its unseen demotion, and the demotion case the
-corrective rekey's first condition missed; writing it also pinned the total
-order down as an algorithm.
+the explorer catches each. (Delivery's roster check keeps a member from
+handing past epoch keys to a key outside its own roster, which no rekey
+takes back; the corrective rekey covers only the current ones. A test pins
+this. Past epoch keys can still reach a key whose `add` the fold drops, the
+window *Swarming* states for mirrors.) No explored replica is a mirror, so
+mirrors' authority (the same rule as members') isn't explored. Its findings,
+all reflected above: concurrent duplicate `add`s, `deliver` withholding
+after any `remove`, an admin acting before seeing its own promotion (the
+grant rule), an admin removing another by racing its unseen demotion, and
+the demotion case the corrective rekey's first condition missed; writing it
+also pinned the total order down as an algorithm.
 
 Still open, and not modeled (the grace window, invites, rejoining and log
 cutoffs are outside the model):

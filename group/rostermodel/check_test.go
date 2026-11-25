@@ -604,7 +604,7 @@ func TestFourPassChain(t *testing.T) {
 // while nobody removed holds it.
 func TestRemovedOnlyCondition(t *testing.T) {
 	_, failure := explore(t, Rules{}, removedPredicate, *depth)
-	demotion := strings.Contains(failure, "role A as member") || strings.Contains(failure, "role B as member")
+	demotion := strings.Contains(failure, "O role A as member") || strings.Contains(failure, "O role B as member")
 	if !strings.Contains(failure, "off the roster") || !demotion {
 		t.Fatalf("want the demotion counterexample, got: %q", failure)
 	}
@@ -612,28 +612,44 @@ func TestRemovedOnlyCondition(t *testing.T) {
 }
 
 // TestDeliverOffRosterLeaksHistory pins delivery's roster check: without
-// it, a deliver hands a key that was never admitted every past epoch key
-// its sender holds, which no rekey can take back. The corrective rekey
-// covers only the current keys.
+// it, a deliver hands a key outside the sender's roster every past epoch
+// key its sender holds, which no rekey takes back. The corrective rekey
+// still takes back the current keys.
 func TestDeliverOffRosterLeaksHistory(t *testing.T) {
-	try := func() (*Op, map[ID]bool) {
+	try := func() (u Store, d, rekey *Op) {
 		w := setup(t, Rules{})
-		Author(w[O], Rules{}, Rekey, O, 0, None)
+		if rekey = Author(w[O], Rules{}, Rekey, O, 0, None); rekey == nil {
+			t.Fatal("setup: O can't rekey")
+		}
 		for id, o := range w[O] {
 			w[M][id] = o
 		}
-		d := Author(w[M], Rules{}, Deliver, M, N, None)
-		epochs, _ := w.union().Holdings()
-		return d, epochs[N]
+		d = Author(w[M], Rules{}, Deliver, M, N, None)
+		return w.union(), d, rekey
 	}
-	if d, _ := try(); d != nil {
+	if _, d, _ := try(); d != nil {
 		t.Fatal("a deliver to a key never on the roster was written")
 	}
 	mutation = "deliver off the roster"
 	defer func() { mutation = "" }()
-	d, held := try()
-	if d == nil || len(held) < 2 {
-		t.Fatalf("without the roster check, N should get the old and current epoch keys, got %d", len(held))
+	u, d, rekey := try()
+	if d == nil {
+		t.Fatal("with the roster check off, the deliver to N was not written")
+	}
+	var genesis ID
+	for id, o := range u {
+		if o.Kind == Genesis {
+			genesis = id
+		}
+	}
+	epochs, _ := u.Holdings()
+	if !epochs[N][genesis] || !epochs[N][rekey.ID] {
+		t.Fatalf("N should hold the genesis and current epoch keys, holds %v", epochs[N])
+	}
+	// The corrective rekey takes back the current keys; the genesis epoch
+	// key stays with N.
+	if err := check(u, Rules{}, docPredicate); err != nil {
+		t.Fatalf("recovery left the current keys off the roster: %v", err)
 	}
 }
 
