@@ -45,10 +45,13 @@ const (
 	Remove
 	Rekey
 	Deliver
+	// SetRole promotes a member to admin or demotes an admin to member. It
+	// is owner-only and changes no keys: admins and members hold the same.
+	SetRole
 )
 
 func (k Kind) String() string {
-	return [...]string{"genesis", "add", "remove", "rekey", "deliver"}[k]
+	return [...]string{"genesis", "add", "remove", "rekey", "deliver", "role"}[k]
 }
 
 // ID names an operation; for key-making operations it also names the
@@ -169,8 +172,16 @@ func (s Store) History(id ID) map[ID]bool {
 // by any operation, counting or not: a seal hands over its keys whether or
 // not the fold accepts the operation that carried it.
 func (s Store) Holdings() (epochs, gs map[Key]map[ID]bool) {
+	return s.HoldingsExcept(func(*Op) bool { return false })
+}
+
+// HoldingsExcept is Holdings without the seals of operations skip selects.
+func (s Store) HoldingsExcept(skip func(*Op) bool) (epochs, gs map[Key]map[ID]bool) {
 	epochs, gs = map[Key]map[ID]bool{}, map[Key]map[ID]bool{}
 	for _, o := range s {
+		if skip(o) {
+			continue
+		}
 		for _, sl := range o.Seals {
 			if epochs[sl.To] == nil {
 				epochs[sl.To], gs[sl.To] = map[ID]bool{}, map[ID]bool{}
@@ -192,6 +203,9 @@ type Result struct {
 	Counts  map[ID]bool
 	Roles   map[Key]Role
 	Removed map[Key]ID // the counting remove of each removed key
+	// Grants lists, per key, the counting role operations that promoted
+	// (Role Admin) or demoted (Role Member) it, in total order.
+	Grants  map[Key][]*Op
 	Owner   Key
 	Current ID // the key-making operation whose keys are current
 	Passes  int
@@ -234,6 +248,37 @@ func Fold(s Store) (*Result, error) {
 				}
 			}
 		}
+		// A demoted admin's operations that need admin authority count
+		// only if the demotion has them in its history, unless a later
+		// promotion the operation has seen restored that authority: the
+		// same reasoning as for a removed author.
+		for k, grants := range r.Grants {
+			if mutation == "no demotion view rule" {
+				break
+			}
+			for i, d := range grants {
+				if d.Role != Member {
+					continue
+				}
+				if hist[d.ID] == nil {
+					hist[d.ID] = s.History(d.ID)
+				}
+				for _, o := range order {
+					if o.Author != k || !needsAdmin(o) || hist[d.ID][o.ID] {
+						continue
+					}
+					restored := false
+					for _, p := range grants[i+1:] {
+						if p.Role == Admin && s.History(p.ID)[d.ID] && s.History(o.ID)[p.ID] {
+							restored = true
+						}
+					}
+					if !restored {
+						next[o.ID] = true
+					}
+				}
+			}
+		}
 		if equalSets(next, dropped) {
 			return r, nil
 		}
@@ -259,7 +304,7 @@ type admittedKey struct {
 
 // apply folds order once, skipping dropped.
 func apply(order []*Op, dropped map[ID]bool) *Result {
-	r := &Result{Order: order, Counts: map[ID]bool{}, Roles: map[Key]Role{}, Removed: map[Key]ID{}}
+	r := &Result{Order: order, Counts: map[ID]bool{}, Roles: map[Key]Role{}, Removed: map[Key]ID{}, Grants: map[Key][]*Op{}}
 	ever := map[Key]bool{}
 	byID := Store{}
 	for _, o := range order {
@@ -292,11 +337,29 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 		}
 		return v
 	}
+	// granted is the operation that gave each admin its role: its counting
+	// add as admin, or its latest promotion. An operation needing admin
+	// authority counts only if its author had seen that grant.
+	granted := map[Key]ID{}
+	hists := map[ID]map[ID]bool{}
+	knows := func(o *Op, id ID) bool {
+		if mutation == "unseen grants count" {
+			return true
+		}
+		if hists[o.ID] == nil {
+			hists[o.ID] = byID.History(o.ID)
+		}
+		return hists[o.ID][id]
+	}
 	for i, o := range order {
 		if dropped[o.ID] {
 			continue
 		}
 		author := r.Roles[o.Author]
+		if author == Admin && needsAdmin(o) && !knows(o, granted[o.Author]) {
+			// Not yet an admin as far as this operation's author knew.
+			author = Member
+		}
 		ok := false
 		switch o.Kind {
 		case Genesis:
@@ -325,6 +388,9 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			if ok {
 				r.Roles[o.Target] = o.Role
 				ever[o.Target] = true
+				if o.Role == Admin {
+					granted[o.Target] = o.ID
+				}
 			}
 		case Remove:
 			t := r.Roles[o.Target]
@@ -342,6 +408,17 @@ func apply(order []*Op, dropped map[ID]bool) *Result {
 			}
 		case Deliver:
 			ok = author != None && r.Roles[o.Target] != None
+		case SetRole:
+			t := r.Roles[o.Target]
+			can := author == Owner || (author == Admin && mutation == "admins set roles")
+			if can && ((t == Member && o.Role == Admin) || (t == Admin && o.Role == Member)) {
+				r.Roles[o.Target] = o.Role
+				r.Grants[o.Target] = append(r.Grants[o.Target], o)
+				if o.Role == Admin {
+					granted[o.Target] = o.ID
+				}
+				ok = true
+			}
 		}
 		r.Counts[o.ID] = ok
 	}
@@ -399,6 +476,11 @@ func totalOrder(s Store) []*Op {
 		}
 	}
 	return order
+}
+
+// needsAdmin reports whether an operation needs admin authority.
+func needsAdmin(o *Op) bool {
+	return o.Kind == Add || o.Kind == Remove || o.Kind == Rekey || o.Kind == SetRole
 }
 
 func equalSets(a, b map[ID]bool) bool {

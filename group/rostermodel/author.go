@@ -117,6 +117,12 @@ func Author(s Store, rules Rules, kind Kind, author, target Key, role Role) *Op 
 			}
 			o.Seals = append(o.Seals, sl)
 		}
+	case SetRole:
+		t := f.Roles[target]
+		valid := (t == Member && role == Admin) || (t == Admin && role == Member)
+		if a != Owner || !valid {
+			return nil
+		}
 	case Deliver:
 		t := f.Roles[target]
 		if a == None || (t == None && mutation != "deliver off the roster") {
@@ -172,20 +178,23 @@ func withheldFrom(s Store, rules Rules, target Key) map[ID]bool {
 	return out
 }
 
-// AuthorBackdated writes an operation by a removed author with parents from
-// before it saw its removal, so it looks concurrent with that removal, and
-// a low Lamport clock, so it sorts early. It seals whatever the author
-// holds. It returns nil unless s holds a remove of author.
+// AuthorBackdated writes an operation by a removed or demoted author with
+// parents from before it saw that, so it looks concurrent with it, and a
+// low Lamport clock, so it sorts early. It seals whatever the author holds.
+// It returns nil unless s holds a remove or demotion of author.
 func AuthorBackdated(s Store, kind Kind, author, target Key, role Role) *Op {
+	lost := func(o *Op) bool {
+		return o.Target == author && (o.Kind == Remove || (o.Kind == SetRole && o.Role == Member))
+	}
 	pre := Store{}
 	for id, o := range s {
-		removedBefore := o.Kind == Remove && o.Target == author
+		before := lost(o)
 		for p := range s.History(id) {
-			if q := s[p]; q.Kind == Remove && q.Target == author {
-				removedBefore = true
+			if lost(s[p]) {
+				before = true
 			}
 		}
-		if !removedBefore {
+		if !before {
 			pre[id] = o
 		}
 	}

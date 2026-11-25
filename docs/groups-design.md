@@ -129,21 +129,24 @@ The roster is a set of operations signed by member keys, kept by members
   `epochKey[0]` sealed to the founder);
 - `add` (member key, display name, role, and the current `G` and every
   epoch key so far sealed to the new member; a mirror gets `G` only) by an
-  admin, or by the owner when the role is `admin`. A role is fixed when the
-  key is added: v1 has no role changes, and an `add` of a key its author
-  had already admitted (on its roster or removed since, in the fold of the
-  `add`'s causal history) never counts. An `add` whose author hadn't is
-  concurrent with the one that admitted the key, and both have sealed their
-  keys, so the key takes the role holding more (admin over member over
-  mirror) rather than leaving a mirror with epoch keys. To change a device's
-  role, it is removed and added again under a fresh member key (a full
-  removal, see *Open problems*);
+  admin, or by the owner when the role is `admin`. An `add` of a key its
+  author had already admitted (on its roster or removed since, in the fold
+  of the `add`'s causal history) never counts: roles change only through
+  `role`. An `add` whose author hadn't is concurrent with the one that
+  admitted the key, and both have sealed their keys, so the key takes the
+  role holding more (admin over member over mirror) rather than leaving a
+  mirror with epoch keys;
 - `remove` (member key; the remover's view of that member: the hashes of its
   latest roster operations and the head of its log the remover has seen,
   sequence number and entry hash; and the rekey, see *Removal*) by an admin,
   or by the owner when the removed key is an admin, as one operation;
 - `rekey` (a fresh `G` and epoch key on their own, see *Removal*) by an
   admin;
+- `role` (member key, and `admin` or `member`) by the owner: promotes a
+  member to admin or demotes an admin to member. Admins and members hold
+  the same keys, so it seals nothing and needs no rekey. A move between
+  member and mirror is a removal and a re-add under a fresh key, since a
+  mirror must lose the epoch keys anyway;
 - `invite` (an invite's public key and expiry, see *Invites*) by an admin;
 - `deliver` (the current `G`, and for a member but not a mirror any epoch
   keys it lacks, sealed to one member already added) by any member: it
@@ -152,11 +155,11 @@ The roster is a set of operations signed by member keys, kept by members
   made it (*Keys*), so a forged key is ignored. A sender delivers only to
   a recipient on its own folded roster, which a counting `remove` takes it
   off, and withholds nothing else: withholding after a `remove` that doesn't
-  count would starve a member still on the roster.
-  A `deliver` to a recipient removed concurrently doesn't count but has
-  still handed over its keys, so it is treated like a key sealed to a
-  removed member (*Removal*, step 3). One whose author was removed
-  concurrently leaks nothing: the author already held those keys.
+  count would starve a member still on the roster. A `deliver` to a
+  recipient removed concurrently doesn't count but has still handed over
+  its keys, which the corrective rekey covers (*Removal*, step 3). One whose
+  author was removed concurrently leaks nothing: the author already held
+  those keys.
 
 Every operation names the genesis's hash, which is the group's ID, and
 carries a Lamport clock and its causal parents (the hashes of the latest
@@ -172,24 +175,34 @@ operations the author had seen). Folding is deterministic:
 - each other operation is checked **when applied**, against the roster the
   fold has built up to that point: `add`, `remove`, `rekey` and `invite`
   count only if the author is an admin or the owner then, and adding or
-  removing an admin only if the author is the owner; a `remove` of the
-  owner key never counts, whoever signs it; `deliver` counts only if its
-  author and recipient are members then. An operation whose author's
-  own `add` didn't count therefore never counts;
+  removing an admin, or any `role`, only if the author is the owner; a
+  `remove` of the owner key never counts, whoever signs it; `deliver`
+  counts only if its author and recipient are members then. An operation
+  whose author's own `add` didn't count therefore never counts;
+- an operation that needs admin authority counts only if the grant that
+  made its author an admin (its `add` as admin, or its latest promotion) is
+  in the operation's causal history. An honest admin always knows it was
+  made one; a member that writes admin operations before seeing a
+  promotion, or backdates them to before it, gains nothing;
 - the **current keys** are those made by the last key-making operation that
   counts in the total order. Two concurrent rekeys by different admins
   therefore resolve the same way on every member, and the losing rekey's
   epoch key stays readable (*Keys*);
 - **a removed key never returns**: an `add` of a key that a counting
-  `remove` earlier in the total order removed doesn't count, and a `remove` of a key that is no longer on the roster
-  when applied doesn't count either (members keep any keys it sealed to
-  them, so content written under them stays readable);
+  `remove` earlier in the total order removed doesn't count, and a
+  `remove` of a key that is no longer on the roster when applied doesn't
+  count either (members keep any keys it sealed to them, so content written
+  under them stays readable);
 - operations by a removed author count only if the `remove` names them, or
   their descendants, in its view of that author. That depends only on the
   `remove`'s content, not on when anything arrives, so every member folds
   the same roster, and a removed admin can't backdate operations into the
   past. A legitimate operation by that author the remover hadn't seen yet is
-  dropped too: the price of a rule everyone applies alike.
+  dropped too: the price of a rule everyone applies alike;
+- the same rule holds for a **demoted** admin, for operations that need
+  admin authority: they count only if the demotion has them in its history,
+  unless a later promotion that the operation has seen restored the
+  authority. Its member-level operations (`deliver`) still count.
 
 **Why one owner.** Only the owner changes who is an admin, and the owner is
 never removed, so no two operations can remove each other's authors. Without
@@ -199,17 +212,18 @@ unremovable, or grant itself authority through an admin it adds; a single
 owner rules that out. The owner's operations fold like any others; its
 authority is absolute, so its operations can't conflict with each other's
 authority. v1 can't detect a stolen owner key: the app shows every roster
-change as an event, so people can notice and recreate the group. The cost: a lost or compromised owner key
-can't be replaced in v1. The group keeps working but its admins are fixed,
-and if the owner key is compromised, the members recreate the group.
+change as an event, so people can notice and recreate the group. The cost:
+a lost or compromised owner key can't be replaced in v1. The group keeps
+working but its admins are fixed, and if the owner key is compromised, the
+members recreate the group.
 
 Members exchange operations they lack at the start of every session
 (*Sessions*), so the roster converges by gossip.
 
 Roles in v1: the `owner` (the founder: everything an admin does, plus
-adding and removing admins), `admin` (add and remove members and mirrors,
-rekey, invite), `member` (post, fetch) and `mirror` (store and serve
-ciphertext only).
+adding, removing, promoting and demoting admins), `admin` (add and remove
+members and mirrors, rekey, invite), `member` (post, fetch) and `mirror`
+(store and serve ciphertext only).
 
 ## Discovery
 
@@ -384,31 +398,35 @@ Removing a member:
    `G'`. Applying it also closes every session with the removed member's
    key, abandoning requests in flight, since admission was checked only when
    those sessions opened.
-3. **Concurrent changes.** If, after folding, the current keys turn out to
-   have been sealed or delivered to a member the fold removed (two admins
-   removing two members at once, or a `deliver` to a member being removed),
-   they are superseded: an admin issues a `rekey` sealed
-   only to the members the fold keeps. Until that `rekey` arrives, a member
-   **publishes nothing**: the app's posts and blobs wait in a queue. Anything
-   published before a member learned of the concurrent removal was readable
-   by the removed member; that window is as short as gossip and can't be
-   closed. The condition also covers the other ways honest concurrency puts
-   the current keys where they don't belong (on a key whose `add` didn't
-   count, or on a mirror): each comes from a key-maker that hadn't seen a
-   removal, which therefore also sealed them to the removed member. The
-   roster model checks this (*Open problems*). A member added concurrently with any key-making operation (a `remove`
-   or a `rekey` whose author didn't know of the `add`) gets the new `G` and
-   any epoch keys it lacks from any member that notices, in a `deliver`
-   operation.
+3. **Concurrent changes.** If, after folding, the current keys have
+   reached a key the fold doesn't keep as a member (one removed, or one
+   whose `add` didn't count), or the current epoch key has reached a mirror,
+   they are superseded: an admin issues a `rekey` sealed only to the
+   members the fold keeps. Members see this from the roster's operations,
+   since every seal and `deliver` is one. Until that `rekey` arrives, a
+   member **publishes nothing**: the app's posts and blobs wait in a queue.
+   Anything published before a member learned of the concurrent change was
+   readable by that key; that window is as short as gossip and can't be
+   closed. The cases: two admins removing two members at once; a `deliver`
+   to a member being removed; and an admin that hadn't seen its own
+   demotion adding a key, whose `add` the demotion's view rule then drops
+   after it has sealed the current keys. (The first wording only covered
+   keys reaching a *removed* member; the roster model found the demotion
+   case, where nobody removed holds them.) A member added concurrently with
+   any key-making operation (a `remove` or a `rekey` whose author didn't
+   know of the `add`) gets the new `G` and any epoch keys it lacks from any
+   member that notices, in a `deliver` operation.
 4. **Members offline during a key change.** For 24 hours after any
    operation that replaces `G` (a `remove` or a `rekey`, including a
    corrective one), the remaining members also listen under their
    rendezvous keys from each `G` superseded in that window. A member that
    missed the change reaches them there, and gets it by roster gossip. A
-   member offline longer is out until an admin removes its old key and
-   re-invites it under a new one (the owner does both if it was an admin;
-   see *Invites*): it holds only secrets the removed member also holds, so
-   nothing else can tell them apart.
+   member offline longer can't reach anyone (it holds only secrets the
+   removed member also holds), so it **rejoins** through an invite
+   (*Invites*): it proves its existing member key, which the removed member
+   doesn't have, and an admin answers with a `deliver`. No removal, rekey or
+   new grace window; its log carries on uncut. The owner rejoins the same
+   way, keeping its authority, since its key is never removed.
 
 What the removed member keeps: everything from before its removal. What it
 loses: anything published under the new epoch key, the new directory, and
@@ -439,9 +457,8 @@ carries neither `G` nor any member key.
   `HKDF(I, "invite blind" ‖ p)` instead of from `G`. The invitee computes
   that key from the invite's public half and `I`, and calls it with a fresh
   key of its own. Without `I`, the blinded key can't be linked to the invite
-  key. Only the admin holds
-  the invite's private key, so only the admin can listen there, and one
-  listener means no clash at holders.
+  key. Only the admin holds the invite's private key, so only the admin can
+  listen there, and one listener means no clash at holders.
 - That **join session** carries the invitee's new member key, display name,
   and a proof that it knows `I` (a MAC over the session's secret), and
   nothing else. The admin approves with an `add`, which delivers `G` and the
@@ -451,14 +468,27 @@ carries neither `G` nor any member key.
   invitee then leaves the join session for normal ones.
 - Single-use invites are spent at the first `add` against them; all are
   refused after expiry, and invites issued before a removal are refused
-  after it (*Removal*). An admin re-invites a
-  member that was offline through a removal the same way: it removes the
-  old key first, then issues the invite; for a former admin, the owner does
-  both.
+  after it (*Removal*).
+
+**Rejoining.** A member offline past the grace window (*Removal*, step 4)
+comes back through an invite too, issued after it was last online and
+handed to its user out of band. In the join session it presents its
+**existing** member key instead of a new one, and signs the session's secret
+with it as well as proving it knows `I`. The admin checks that key is on its
+roster and not removed, and answers with a `deliver` of the current `G` and
+every epoch key it lacks (mirrors get `G` only), plus the genesis and the
+roster's operations, as for a new member. Nothing else changes: no `add`, no
+removal, no rekey, and its log carries on. A removed member can't do this:
+its key is off the roster. A stolen device can, as it could use any member
+key; the admin sees which member is rejoining, and the answer to a stolen
+device is to remove it. The owner rejoins the same way and keeps its
+authority. (If the owner was the only admin, no key changed while it was
+away: only admins rekey or remove.)
 
 A leaked invite lets its holder ask to join, nothing more: it can't
 impersonate the admin, read the directory or content, find members, or
-join without an admin's `add`.
+join without an admin's `add` (or, to rejoin, without a member key on the
+roster).
 
 ## Device restore
 
@@ -470,45 +500,39 @@ signing.
 
 ## Open problems
 
-The fold, the authority rules, key delivery and the corrective rekey are
-model-checked by `group/rostermodel`: an abstract model of this section's
-rules (keys as names, sealing as recipient sets) and an explorer that runs
-every interleaving of an owner, two admins and a member writing, syncing,
-and acting as compromised or removed authors (20 million states at depth 6,
-about 23 minutes with `-roster.depth=6 -timeout=1h`; `go test` runs depth 4
-in about five seconds). It checks that the owner keeps its role, only the
-owner makes admins, backdated operations by removed authors never count, the
-view rule settles (in at most three passes in every explored state; a deeper
-chain, where dropping a removed admin's branch makes an owner's `add` count
-and so on down, takes four, and is a regression test; the fold detects a
-cycle rather than capping passes), and once the corrective rekey and
-deliveries run, no off-roster key holds the current group secret or epoch
-key, mirrors hold the current group secret but no current epoch key, and
-every member holds the current keys and every epoch key any other member
-holds. Admins and members also sign, as compromised devices would, the
-operations their role has no authority for, and none may count. Mutation
-tests break each admin and member authority rule, the role-change rule, the
-view rule, delivery's roster check and the corrective rekey in turn, and the
-explorer catches each. No explored replica is a mirror, so mirrors'
-authority (the same rule as members') isn't explored. It found two rules
-above that were wrong as first written (concurrent duplicate `add`s, and
-`deliver` withholding after any `remove`), and writing it pinned the total
-order down as an algorithm.
+The fold, the authority rules, role changes, key delivery and the corrective
+rekey are model-checked by `group/rostermodel`: an abstract model of this
+section's rules (keys as names, sealing as recipient sets) and an explorer
+that runs every interleaving of an owner, two admins and a member writing,
+syncing, promoting and demoting, and acting as compromised, removed or
+demoted authors (4.5 million states at depth 5, about nine minutes with
+`-roster.depth=5 -timeout=1h`; `go test` runs depth 4 in about twenty
+seconds). It checks that the owner keeps its role, only the owner makes or
+unmakes admins, backdated operations by removed or demoted authors never
+count, the view rule settles (in at most three passes in every explored
+state; a deeper chain, where dropping a removed admin's branch makes an
+owner's `add` count and so on down, takes four, and is a regression test;
+the fold detects a cycle rather than capping passes), and once the
+corrective rekey and deliveries run, no off-roster key holds the current
+group secret or epoch key, mirrors hold the current group secret but no
+current epoch key, and every member holds the current keys and every epoch
+key any other member holds. Admins and members also sign, as compromised
+devices would, the operations their role has no authority for, and none may
+count. Mutation tests break each authority rule, the role-change rule, the
+grant rule, both view rules and the corrective rekey in turn, and the
+explorer catches each. (Delivery's roster check is now defence in depth:
+without it, the corrective rekey still catches a stray delivery, at the cost
+of a rekey.) No explored replica is a mirror, so mirrors' authority (the
+same rule as members') isn't explored. Its findings, all reflected above:
+concurrent duplicate `add`s, `deliver` withholding after any `remove`, an
+admin acting before seeing its own promotion (the grant rule), and the
+demotion case the corrective rekey's first condition missed; writing it also
+pinned the total order down as an algorithm.
 
-Still open, and not modeled (the grace window, invites and log cutoffs are
-outside the model):
+Still open, and not modeled (the grace window, invites, rejoining and log
+cutoffs are outside the model):
 
-- **Re-invites and role changes are full removals.** Each rekeys the group,
-  cuts the device's log at the remover's view (dropping what it wrote
-  offline), refuses earlier invites, and starts a new 24-hour window that
-  can push other long-offline members out in turn. A lighter **replace key**
-  operation, with no rekey, for a device that holds only secrets the group
-  already gave it, is the likely fix.
 - **Owner compromise** is detectable only by people watching roster events.
-- **An owner offline past the grace window** can't come back the way other
-  members do, since its key can't be removed and re-invited. It needs a
-  path that keeps its authority: for example, a join-style session it opens
-  under its own key, through which an admin delivers the current keys.
 - **Concurrent removals of the same member** keep only the first remover's
   log cutoff, dropping entries only the second had seen.
 
@@ -517,10 +541,12 @@ outside the model):
 ```go
 g, err := group.Create(ep, store, group.Policy{Name: "family"})
 g, err := group.Join(ctx, ep, store, invite)
+g, err := group.Rejoin(ctx, ep, store, invite) // back after the grace window, same member key
 
 invite, err := g.Invite(group.InviteOptions{Uses: 1, Expires: 24 * time.Hour})
 err = g.Add(ctx, memberKey, "Alice", group.RoleMember) // admin only; owner only for RoleAdmin
 err = g.Remove(ctx, memberKey)                         // admin only; owner only for an admin; rekeys
+err = g.SetRole(ctx, memberKey, group.RoleAdmin)       // owner only: promote or demote, no rekey
 
 id, err := g.Publish(ctx, file, meta)  // a blob, announced in our log; meta encrypted
 r, err := g.Open(ctx, id)              // io.ReadSeeker; fetches as read
@@ -581,9 +607,9 @@ so an app chooses where data lives and how much.
 1. **Group size:** up to about 50 members in v1, so pairwise rekey and three
    directory shards. A tree scheme (MLS/TreeKEM) is the path past
    that.
-2. **Roles:** owner (the founder, who alone adds and removes admins), admin
-   (add and remove members, rekey, invite), member (post, fetch), and mirror
-   (stores and serves ciphertext only).
+2. **Roles:** owner (the founder, who alone adds, removes, promotes and
+   demotes admins), admin (add and remove members, rekey, invite), member
+   (post, fetch), and mirror (stores and serves ciphertext only).
 3. **Serving:** every member serves what it holds by default; the app can
    turn serving off or cap it per device.
 4. **Logs:** the library includes a signed per-member log. Blob

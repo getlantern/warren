@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about 23 minutes: add -timeout=1h)")
+var depth = flag.Int("roster.depth", 4, "actions explored past the setup (5 for a full run, about nine minutes: add -timeout=1h)")
 
 const (
 	O Key = iota + 1 // owner
@@ -91,7 +91,7 @@ func actions(w world, rules Rules) []action {
 	var as []action
 	op := func(r Key, kind Kind, target Key, role Role, malicious bool) {
 		desc := fmt.Sprintf("%v %v %v", r, kind, target)
-		if kind == Add {
+		if kind == Add || kind == SetRole {
 			desc += " as " + role.String()
 		}
 		if malicious {
@@ -117,6 +117,9 @@ func actions(w world, rules Rules) []action {
 			}
 			if f.Roles[r] == Owner {
 				op(r, Add, N, Admin, false)
+				op(r, SetRole, M, Admin, false)
+				op(r, SetRole, A, Member, false)
+				op(r, SetRole, B, Member, false)
 			} else {
 				op(r, Add, N, Member, false)
 				op(r, Add, N, Mirror, false)
@@ -141,14 +144,15 @@ func actions(w world, rules Rules) []action {
 			}
 			// Re-adding N as a member is a role change once N is a mirror,
 			// and a re-add once it's removed: neither may count.
-			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin))
+			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin),
+				rogue(r, SetRole, M, Admin), rogue(r, SetRole, other, Member))
 			if f.Roles[N] != None || f.Removed[N] != 0 {
 				as = append(as, rogue(r, Add, N, Member))
 			}
 		case Member:
 			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None))
 		}
-		if f.Removed[r] != 0 {
+		if f.Removed[r] != 0 || demoted(f, r) {
 			op(r, Add, N, Member, true)
 			op(r, Rekey, 0, None, true)
 			op(r, Deliver, N, None, true)
@@ -173,16 +177,62 @@ func actions(w world, rules Rules) []action {
 	return as
 }
 
-// rogue writes an operation its author has no authority for, sealing
-// nothing, as a compromised device could.
+// rogue writes an operation its author has no authority for, as a
+// compromised device could: a remove or rekey seals its new keys as an
+// honest one would, since only its authority is forged.
 func rogue(r Key, kind Kind, target Key, role Role) action {
 	return action{fmt.Sprintf("%v %v %v as %v (rogue)", r, kind, target, role), func(w world) bool {
 		s := w[r]
 		o := newOp(s, kind, r, target, role, s.Heads(), 0)
 		o.Rogue = true
+		if kind == Remove || kind == Rekey {
+			f, err := Fold(s)
+			if err != nil {
+				return false
+			}
+			for _, k := range sortedKeys(f.Roles) {
+				if kind == Remove && k == target {
+					continue
+				}
+				sl := Seal{To: k, Gs: []ID{self}}
+				if f.Roles[k] != Mirror {
+					sl.Epochs = []ID{self}
+				}
+				o.Seals = append(o.Seals, sl)
+			}
+		}
 		finish(s, o)
 		return true
 	}}
+}
+
+// memberLeak selects the seals of malicious operations that don't count,
+// by authors still on the roster: a member can hand the keys it holds to
+// anyone, which no protocol prevents, so they don't count as the protocol
+// leaking. A malicious operation that counts seals what the protocol
+// sanctions.
+func memberLeak(f *Result) func(*Op) bool {
+	return func(o *Op) bool {
+		return (o.Backdated || o.Rogue) && !f.Counts[o.ID] && f.Roles[o.Author] != None
+	}
+}
+
+// demotedBefore reports whether o's target had been demoted before o in the
+// total order.
+func demotedBefore(f *Result, o *Op) bool {
+	pos := slices.IndexFunc(f.Order, func(x *Op) bool { return x.ID == o.ID })
+	for _, g := range f.Grants[o.Target] {
+		if g.Role == Member && slices.IndexFunc(f.Order, func(x *Op) bool { return x.ID == g.ID }) < pos {
+			return true
+		}
+	}
+	return false
+}
+
+// demoted reports whether k's last counting role change demoted it.
+func demoted(f *Result, k Key) bool {
+	g := f.Grants[k]
+	return len(g) > 0 && g[len(g)-1].Role == Member
 }
 
 func opDesc(o *Op) string {
@@ -207,12 +257,15 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 		return fmt.Errorf("owner lost its role: %v", f.Roles[O])
 	}
 	for _, o := range f.Order {
-		if o.Rogue && f.Counts[o.ID] {
+		// An admin may remove a member, including one the fold had
+		// demoted from admin before the remove, even if the remover
+		// hadn't seen the demotion.
+		if o.Rogue && f.Counts[o.ID] && (o.Kind != Remove || !demotedBefore(f, o)) {
 			return fmt.Errorf("rogue %v by %v counts", opDesc(o), o.Author)
 		}
 	}
 	for _, o := range f.Order {
-		if o.Backdated && f.Counts[o.ID] && f.Removed[o.Author] != 0 {
+		if o.Backdated && f.Counts[o.ID] && (f.Removed[o.Author] != 0 || (demoted(f, o.Author) && needsAdmin(o))) {
 			return fmt.Errorf("backdated %v by removed %v counts", o.Kind, o.Author)
 		}
 	}
@@ -220,7 +273,7 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 	// or off the roster: an honest author seals to the roster as it sees
 	// it, and concurrency can change that. The design states this window;
 	// the current keys are what a corrective rekey protects.
-	epochs, gs := u.Holdings()
+	epochs, gs := u.HoldingsExcept(memberLeak(f))
 	leak := leaked(f, epochs, gs)
 	if leak != "" && !pred(u, f) {
 		return fmt.Errorf("no corrective rekey is called for, yet %s", leak)
@@ -252,10 +305,13 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 	if f, err = Fold(r); err != nil {
 		return fmt.Errorf("after recovery: %w", err)
 	}
-	epochs, gs = r.Holdings()
-	if leak := leaked(f, epochs, gs); leak != "" {
+	if le, lg := r.HoldingsExcept(memberLeak(f)); leaked(f, le, lg) != "" {
+		leak := leaked(f, le, lg)
 		return fmt.Errorf("after recovery, %s", leak)
 	}
+	// What members actually hold, including keys a malicious member handed
+	// them, which the leak check above leaves out.
+	epochs, gs = r.Holdings()
 	// Every epoch key a member holds stays readable to every other member,
 	// including those made by a rekey that lost the total order.
 	for k, role := range f.Roles {
@@ -267,6 +323,11 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 				continue
 			}
 			for e := range epochs[j] {
+				// A key a malicious operation that doesn't count made is
+				// the attacker's.
+				if mk := r[e]; mk != nil && (mk.Backdated || mk.Rogue) && !f.Counts[mk.ID] {
+					continue
+				}
 				if !epochs[k][e] {
 					return fmt.Errorf("after recovery, %v %v lacks an epoch key %v holds", role, k, j)
 				}
@@ -310,9 +371,17 @@ func sortedKeysOf(m map[Key]map[ID]bool) []Key {
 	return out
 }
 
-// docPredicate is Removal step 3 as written: the current keys were sealed
-// or delivered to a member the fold removed.
+// docPredicate is Removal step 3: the current keys reached a key the fold
+// doesn't keep as a member (removed, or whose add didn't count), or the
+// current epoch key reached a mirror.
 func docPredicate(u Store, f *Result) bool {
+	epochs, gs := u.Holdings()
+	return leaked(f, epochs, gs) != ""
+}
+
+// removedPredicate is Removal step 3 as first written: the current keys were
+// sealed or delivered to a member the fold removed. Demotion breaks it.
+func removedPredicate(u Store, f *Result) bool {
 	epochs, gs := u.Holdings()
 	for k := range f.Removed {
 		if epochs[k][f.Current] || gs[k][f.Current] {
@@ -392,7 +461,10 @@ func TestRosterModel(t *testing.T) {
 func TestMutations(t *testing.T) {
 	for _, m := range []string{
 		"no view rule", "admins add admins", "admins remove admins", "owner removable",
-		"members add", "members remove", "members rekey", "deliver off the roster", "role changes count",
+		// Not "deliver off the roster": the corrective rekey now catches a
+		// stray delivery, so delivery's roster check only spares a rekey.
+		"members add", "members remove", "members rekey", "role changes count",
+		"admins set roles", "no demotion view rule", "unseen grants count",
 	} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m
@@ -483,6 +555,19 @@ func TestFourPassChain(t *testing.T) {
 	if err := check(u, Rules{}, docPredicate); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestRemovedOnlyCondition shows the corrective rekey's first condition,
+// keys reaching a removed member, misses a leak demotion makes possible: an
+// admin that hadn't seen its demotion adds a key, the demotion's view rule
+// drops the add, and the key holds the current epoch key off the roster
+// while nobody removed holds it.
+func TestRemovedOnlyCondition(t *testing.T) {
+	_, failure := explore(t, Rules{}, removedPredicate, *depth)
+	if failure == "" {
+		t.Fatal("no counterexample found")
+	}
+	t.Logf("counterexample: %s", failure)
 }
 
 // TestNoCorrectiveRekey checks the corrective rekey is needed: without it,
