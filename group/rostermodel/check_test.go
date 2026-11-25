@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var depth = flag.Int("roster.depth", 4, "actions explored past the setup (5 for a full run, about nine minutes: add -timeout=1h)")
+var depth = flag.Int("roster.depth", 4, "actions explored past the setup (5 for a full run, about eight minutes: add -timeout=1h)")
 
 const (
 	O Key = iota + 1 // owner
@@ -646,10 +646,12 @@ func TestDeliverOffRosterLeaksHistory(t *testing.T) {
 	if !epochs[N][genesis] || !epochs[N][rekey.ID] {
 		t.Fatalf("N should hold the genesis and current epoch keys, holds %v", epochs[N])
 	}
-	// The corrective rekey takes back the current keys; the genesis epoch
-	// key stays with N.
+	// The corrective rekey, run under the real rules, takes back the
+	// current keys. Nothing un-seals a key, so the genesis epoch key stays
+	// with N.
+	mutation = ""
 	if err := check(u, Rules{}, docPredicate); err != nil {
-		t.Fatalf("recovery left the current keys off the roster: %v", err)
+		t.Fatalf("check failed: %v", err)
 	}
 }
 

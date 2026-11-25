@@ -416,7 +416,9 @@ Removing a member:
    after it has sealed the current keys. A compromised member can trigger
    it on purpose, by delivering the current keys to a key of its own, and
    so pause publishing until the rekey lands; the answer is to remove it,
-   which the rekey that follows does. (The first wording only covered
+   which the rekey that follows does. The rekey protects only what comes
+   next: past epoch keys that reached such a key (a removed one, or one
+   whose `add` the fold dropped) stay readable to it. (The first wording only covered
    keys reaching a *removed* member; the roster model found the demotion
    case, where nobody removed holds them.) A member added concurrently with
    any key-making operation (a `remove` or a `rekey` whose author didn't
@@ -511,32 +513,33 @@ rekey are model-checked by `group/rostermodel`: an abstract model of this
 section's rules (keys as names, sealing as recipient sets) and an explorer
 that runs every interleaving of an owner, two admins and a member writing,
 syncing, promoting and demoting, and acting as compromised, removed or
-demoted authors (RUNSTATS with `-roster.depth=5 -timeout=1h`; `go test` runs
-depth 4 in about twenty seconds). It checks that the owner keeps its role,
-only the owner makes or unmakes admins, backdated operations by removed or
-demoted authors never count, the view rule settles (in at most three passes
-in every explored state; a deeper chain, where dropping a removed admin's
-branch makes an owner's `add` count and so on down, takes four, and is a
-regression test; the fold detects a cycle rather than capping passes), and
-once the corrective rekey and deliveries run, no off-roster key holds the
-current group secret or epoch key, mirrors hold the current group secret but
-no current epoch key, and every member holds the current keys and every
-epoch key any other member holds. Admins and members also sign, as
-compromised devices would, the operations their role has no authority for,
-and none may count. Mutation tests break each authority rule, the
-role-change rule, the grant rule, the remover's-view rule, both view rules,
-restoring a demoted admin by promotion and the corrective rekey in turn, and
-the explorer catches each. (Delivery's roster check keeps a member from
-handing past epoch keys to a key outside its own roster, which no rekey
-takes back; the corrective rekey covers only the current ones. A test pins
-this. Past epoch keys can still reach a key whose `add` the fold drops, the
-window *Swarming* states for mirrors.) No explored replica is a mirror, so
-mirrors' authority (the same rule as members') isn't explored. Its findings,
-all reflected above: concurrent duplicate `add`s, `deliver` withholding
-after any `remove`, an admin acting before seeing its own promotion (the
-grant rule), an admin removing another by racing its unseen demotion, and
-the demotion case the corrective rekey's first condition missed; writing it
-also pinned the total order down as an algorithm.
+demoted authors (4.7 million states at depth 5, about eight minutes with
+`-roster.depth=5 -timeout=1h`; `go test` runs depth 4 in about half a
+minute). It checks that the owner keeps its role, only the owner makes or
+unmakes admins, backdated operations by removed or demoted authors never
+count, the view rule settles (in at most three passes in every explored
+state; a deeper chain, where dropping a removed admin's branch makes an
+owner's `add` count and so on down, takes four, and is a regression test;
+the fold detects a cycle rather than capping passes), and once the
+corrective rekey and deliveries run, no off-roster key holds the current
+group secret or epoch key, mirrors hold the current group secret but no
+current epoch key, and every member holds the current keys and every epoch
+key any other member holds. Admins and members also sign, as compromised
+devices would, the operations their role has no authority for, and none may
+count. Mutation tests break each authority rule, the role-change rule, the
+grant rule, the remover's-view rule, both view rules, restoring a demoted
+admin by promotion and the corrective rekey in turn, and the explorer
+catches each. (Delivery's roster check keeps a member from handing past
+epoch keys to a key outside its own roster, which no rekey takes back; the
+corrective rekey covers only the current ones. A test pins this. Past epoch
+keys can still reach a key that ends off the roster through concurrency, as
+*Removal* step 3 states.) No explored replica is a mirror, so mirrors'
+authority (the same rule as members') isn't explored. Its findings, all
+reflected above: concurrent duplicate `add`s, `deliver` withholding after
+any `remove`, an admin acting before seeing its own promotion (the grant
+rule), an admin removing another by racing its unseen demotion, and the
+demotion case the corrective rekey's first condition missed; writing it also
+pinned the total order down as an algorithm.
 
 Still open, and not modeled (the grace window, invites, rejoining and log
 cutoffs are outside the model):
