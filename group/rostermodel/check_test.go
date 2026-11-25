@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-var depth = flag.Int("roster.depth", 4, "actions explored past the setup (6 for a full run, about 23 minutes: add -timeout=1h)")
+var depth = flag.Int("roster.depth", 4, "actions explored past the setup (5 for a full run, about eight minutes: add -timeout=1h)")
 
 const (
 	O Key = iota + 1 // owner
@@ -91,7 +91,7 @@ func actions(w world, rules Rules) []action {
 	var as []action
 	op := func(r Key, kind Kind, target Key, role Role, malicious bool) {
 		desc := fmt.Sprintf("%v %v %v", r, kind, target)
-		if kind == Add {
+		if kind == Add || kind == SetRole {
 			desc += " as " + role.String()
 		}
 		if malicious {
@@ -117,6 +117,16 @@ func actions(w world, rules Rules) []action {
 			}
 			if f.Roles[r] == Owner {
 				op(r, Add, N, Admin, false)
+				// Promote or demote each, whichever its role allows, so
+				// demote-then-promote chains get explored.
+				for _, k := range []Key{A, B, M, N} {
+					switch f.Roles[k] {
+					case Admin:
+						op(r, SetRole, k, Member, false)
+					case Member:
+						op(r, SetRole, k, Admin, false)
+					}
+				}
 			} else {
 				op(r, Add, N, Member, false)
 				op(r, Add, N, Mirror, false)
@@ -132,7 +142,7 @@ func actions(w world, rules Rules) []action {
 		// A compromised device signing what its role has no authority for.
 		switch f.Roles[r] {
 		case Owner:
-			// v1 has no role changes, not even by the owner.
+			// Roles change only through role operations, not by re-adding.
 			as = append(as, rogue(r, Add, M, Admin))
 		case Admin:
 			other := A
@@ -141,14 +151,17 @@ func actions(w world, rules Rules) []action {
 			}
 			// Re-adding N as a member is a role change once N is a mirror,
 			// and a re-add once it's removed: neither may count.
-			as = append(as, rogue(r, Remove, O, None), rogue(r, Remove, other, None), rogue(r, Add, N, Admin))
+			as = append(as, rogue(r, Remove, O, None), rogue(r, Add, N, Admin), rogue(r, SetRole, M, Admin))
+			if f.Roles[other] == Admin {
+				as = append(as, rogue(r, Remove, other, None), rogue(r, SetRole, other, Member))
+			}
 			if f.Roles[N] != None || f.Removed[N] != 0 {
 				as = append(as, rogue(r, Add, N, Member))
 			}
 		case Member:
 			as = append(as, rogue(r, Rekey, 0, None), rogue(r, Add, N, Member), rogue(r, Remove, A, None))
 		}
-		if f.Removed[r] != 0 {
+		if f.Removed[r] != 0 || demoted(f, r) {
 			op(r, Add, N, Member, true)
 			op(r, Rekey, 0, None, true)
 			op(r, Deliver, N, None, true)
@@ -173,16 +186,50 @@ func actions(w world, rules Rules) []action {
 	return as
 }
 
-// rogue writes an operation its author has no authority for, sealing
-// nothing, as a compromised device could.
+// rogue writes an operation its author has no authority for, as a
+// compromised device could: a remove or rekey seals its new keys as an
+// honest one would, since only its authority is forged.
 func rogue(r Key, kind Kind, target Key, role Role) action {
 	return action{fmt.Sprintf("%v %v %v as %v (rogue)", r, kind, target, role), func(w world) bool {
 		s := w[r]
 		o := newOp(s, kind, r, target, role, s.Heads(), 0)
 		o.Rogue = true
+		if kind == Remove || kind == Rekey {
+			f, err := Fold(s)
+			if err != nil {
+				return false
+			}
+			for _, k := range sortedKeys(f.Roles) {
+				if kind == Remove && k == target {
+					continue
+				}
+				sl := Seal{To: k, Gs: []ID{self}}
+				if f.Roles[k] != Mirror {
+					sl.Epochs = []ID{self}
+				}
+				o.Seals = append(o.Seals, sl)
+			}
+		}
 		finish(s, o)
 		return true
 	}}
+}
+
+// memberLeak selects the seals of malicious operations that don't count,
+// by authors still on the roster: a member can hand the keys it holds to
+// anyone, which no protocol prevents, so they don't count as the protocol
+// leaking. A malicious operation that counts seals what the protocol
+// sanctions.
+func memberLeak(f *Result) func(*Op) bool {
+	return func(o *Op) bool {
+		return (o.Backdated || o.Rogue) && !f.Counts[o.ID] && f.Roles[o.Author] != None
+	}
+}
+
+// demoted reports whether k's last counting role change demoted it.
+func demoted(f *Result, k Key) bool {
+	g := f.Grants[k]
+	return len(g) > 0 && g[len(g)-1].Role == Member
 }
 
 func opDesc(o *Op) string {
@@ -212,15 +259,18 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 		}
 	}
 	for _, o := range f.Order {
-		if o.Backdated && f.Counts[o.ID] && f.Removed[o.Author] != 0 {
-			return fmt.Errorf("backdated %v by removed %v counts", o.Kind, o.Author)
+		// A backdated op was written after its author lost its authority,
+		// so it may count only at member level (a deliver by a demoted
+		// admin), even if the author has been promoted again since.
+		if o.Backdated && f.Counts[o.ID] && (f.Removed[o.Author] != 0 || needsAdmin(o)) {
+			return fmt.Errorf("backdated %v by removed or demoted %v counts", o.Kind, o.Author)
 		}
 	}
 	// Past (not current) epoch keys can reach a key that ends up a mirror
 	// or off the roster: an honest author seals to the roster as it sees
 	// it, and concurrency can change that. The design states this window;
 	// the current keys are what a corrective rekey protects.
-	epochs, gs := u.Holdings()
+	epochs, gs := u.HoldingsExcept(memberLeak(f))
 	leak := leaked(f, epochs, gs)
 	if leak != "" && !pred(u, f) {
 		return fmt.Errorf("no corrective rekey is called for, yet %s", leak)
@@ -252,10 +302,13 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 	if f, err = Fold(r); err != nil {
 		return fmt.Errorf("after recovery: %w", err)
 	}
-	epochs, gs = r.Holdings()
-	if leak := leaked(f, epochs, gs); leak != "" {
+	le, lg := r.HoldingsExcept(memberLeak(f))
+	if leak := leaked(f, le, lg); leak != "" {
 		return fmt.Errorf("after recovery, %s", leak)
 	}
+	// What members actually hold, including keys a malicious member handed
+	// them, which the leak check above leaves out.
+	epochs, gs = r.Holdings()
 	// Every epoch key a member holds stays readable to every other member,
 	// including those made by a rekey that lost the total order.
 	for k, role := range f.Roles {
@@ -267,6 +320,11 @@ func check(u Store, rules Rules, pred func(Store, *Result) bool) error {
 				continue
 			}
 			for e := range epochs[j] {
+				// A key a malicious operation that doesn't count made is
+				// the attacker's.
+				if mk := r[e]; mk != nil && (mk.Backdated || mk.Rogue) && !f.Counts[mk.ID] {
+					continue
+				}
 				if !epochs[k][e] {
 					return fmt.Errorf("after recovery, %v %v lacks an epoch key %v holds", role, k, j)
 				}
@@ -310,9 +368,17 @@ func sortedKeysOf(m map[Key]map[ID]bool) []Key {
 	return out
 }
 
-// docPredicate is Removal step 3 as written: the current keys were sealed
-// or delivered to a member the fold removed.
+// docPredicate is Removal step 3: the current keys reached a key the fold
+// doesn't keep as a member (removed, or whose add didn't count), or the
+// current epoch key reached a mirror.
 func docPredicate(u Store, f *Result) bool {
+	epochs, gs := u.Holdings()
+	return leaked(f, epochs, gs) != ""
+}
+
+// removedPredicate is Removal step 3 as first written: the current keys were
+// sealed or delivered to a member the fold removed. Demotion breaks it.
+func removedPredicate(u Store, f *Result) bool {
 	epochs, gs := u.Holdings()
 	for k := range f.Removed {
 		if epochs[k][f.Current] || gs[k][f.Current] {
@@ -369,10 +435,8 @@ func explore(t *testing.T, rules Rules, pred func(Store, *Result) bool, depth in
 }
 
 // TestRosterModel model-checks the roster rules, with Removal step 3's
-// corrective-rekey condition as written. Honest concurrency can also put the
-// current keys on a mirror or on a key whose add didn't count, but only by a
-// key-maker that hadn't seen a removal, which then also sealed them to the
-// removed member, so the written condition fires.
+// corrective-rekey condition: the current keys reached a key the fold
+// doesn't keep, or the current epoch key reached a mirror.
 func TestRosterModel(t *testing.T) {
 	maxPasses = 0
 	states, failure := explore(t, Rules{}, docPredicate, *depth)
@@ -392,7 +456,11 @@ func TestRosterModel(t *testing.T) {
 func TestMutations(t *testing.T) {
 	for _, m := range []string{
 		"no view rule", "admins add admins", "admins remove admins", "owner removable",
-		"members add", "members remove", "members rekey", "deliver off the roster", "role changes count",
+		// "deliver off the roster" leaks past epoch keys, which the leak
+		// check (current keys only) doesn't see: TestDeliverOffRosterLeaksHistory.
+		"members add", "members remove", "members rekey", "role changes count",
+		"admins set roles", "no demotion view rule", "unseen grants count",
+		"removers need not see demotions", "restores need not be seen",
 	} {
 		t.Run(m, func(t *testing.T) {
 			mutation = m
@@ -435,6 +503,50 @@ func TestRemovedReAdd(t *testing.T) {
 	}
 	if err := check(w.union(), Rules{}, docPredicate); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// restoredScenario is an admin demoted and then promoted again, which writes
+// a rekey after seeing both: the promotion restores its authority, so the
+// rekey counts.
+func restoredScenario(t *testing.T) error {
+	w := setup(t, Rules{})
+	steps := []func() *Op{
+		func() *Op { return Author(w[O], Rules{}, SetRole, O, A, Member) },
+		func() *Op { return Author(w[O], Rules{}, SetRole, O, A, Admin) },
+	}
+	for i, st := range steps {
+		if st() == nil {
+			return fmt.Errorf("step %d not written", i)
+		}
+	}
+	for id, o := range w[O] {
+		w[A][id] = o
+	}
+	rk := Author(w[A], Rules{}, Rekey, A, 0, None)
+	if rk == nil {
+		return fmt.Errorf("A can't rekey after its promotion")
+	}
+	f, err := Fold(w.union())
+	if err != nil {
+		return err
+	}
+	if !f.Counts[rk.ID] {
+		return fmt.Errorf("A's rekey after its re-promotion doesn't count")
+	}
+	return nil
+}
+
+func TestRestoredByPromotion(t *testing.T) {
+	admitted.Clear()
+	if err := restoredScenario(t); err != nil {
+		t.Fatal(err)
+	}
+	mutation = "demotions never restored"
+	defer func() { mutation = "" }()
+	admitted.Clear()
+	if restoredScenario(t) == nil {
+		t.Fatal("mutation not caught")
 	}
 }
 
@@ -482,6 +594,64 @@ func TestFourPassChain(t *testing.T) {
 	}
 	if err := check(u, Rules{}, docPredicate); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestRemovedOnlyCondition shows the corrective rekey's first condition,
+// keys reaching a removed member, misses a leak demotion makes possible: an
+// admin that hadn't seen its demotion adds a key, the demotion's view rule
+// drops the add, and the key holds the current epoch key off the roster
+// while nobody removed holds it.
+func TestRemovedOnlyCondition(t *testing.T) {
+	_, failure := explore(t, Rules{}, removedPredicate, *depth)
+	demotion := strings.Contains(failure, "O role A as member") || strings.Contains(failure, "O role B as member")
+	if !strings.Contains(failure, "off the roster") || !demotion {
+		t.Fatalf("want the demotion counterexample, got: %q", failure)
+	}
+	t.Logf("counterexample: %s", failure)
+}
+
+// TestDeliverOffRosterLeaksHistory pins delivery's roster check: without
+// it, a deliver hands a key outside the sender's roster every past epoch
+// key its sender holds, which no rekey takes back. The corrective rekey
+// still takes back the current keys.
+func TestDeliverOffRosterLeaksHistory(t *testing.T) {
+	try := func() (u Store, d, rekey *Op) {
+		w := setup(t, Rules{})
+		if rekey = Author(w[O], Rules{}, Rekey, O, 0, None); rekey == nil {
+			t.Fatal("setup: O can't rekey")
+		}
+		for id, o := range w[O] {
+			w[M][id] = o
+		}
+		d = Author(w[M], Rules{}, Deliver, M, N, None)
+		return w.union(), d, rekey
+	}
+	if _, d, _ := try(); d != nil {
+		t.Fatal("a deliver to a key never on the roster was written")
+	}
+	mutation = "deliver off the roster"
+	defer func() { mutation = "" }()
+	u, d, rekey := try()
+	if d == nil {
+		t.Fatal("with the roster check off, the deliver to N was not written")
+	}
+	var genesis ID
+	for id, o := range u {
+		if o.Kind == Genesis {
+			genesis = id
+		}
+	}
+	epochs, _ := u.Holdings()
+	if !epochs[N][genesis] || !epochs[N][rekey.ID] {
+		t.Fatalf("N should hold the genesis and current epoch keys, holds %v", epochs[N])
+	}
+	// The corrective rekey, run under the real rules, takes back the
+	// current keys. Nothing un-seals a key, so the genesis epoch key stays
+	// with N.
+	mutation = ""
+	if err := check(u, Rules{}, docPredicate); err != nil {
+		t.Fatalf("check failed: %v", err)
 	}
 }
 
