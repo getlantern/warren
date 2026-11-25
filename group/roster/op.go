@@ -133,6 +133,18 @@ type Op struct {
 	id  ID
 }
 
+// clone is a deep copy.
+func (o *Op) clone() *Op {
+	c := *o
+	c.Parents = slices.Clone(o.Parents)
+	c.Sig = slices.Clone(o.Sig)
+	c.Seals = make([]Seal, len(o.Seals))
+	for i, s := range o.Seals {
+		c.Seals[i] = Seal{To: s.To, Box: slices.Clone(s.Box), Holds: slices.Clone(s.Holds)}
+	}
+	return &c
+}
+
 // ID returns the operation's ID. It is valid once the operation is signed
 // or decoded.
 func (o *Op) ID() ID { return o.id }

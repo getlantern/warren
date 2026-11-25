@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 
 	"filippo.io/edwards25519"
 	"github.com/getlantern/warren/bencode"
@@ -378,31 +379,33 @@ func TestWritersStayDecodable(t *testing.T) {
 // TestRosterIsolated: what callers get back, and what they passed in,
 // can't change the roster.
 func TestRosterIsolated(t *testing.T) {
-	r, owner, admin, _ := group(t)
+	r, _, admin, _ := group(t)
 	rk, err := (&Writer{R: r, Me: admin}).Rekey()
 	if err != nil {
 		t.Fatal(err)
 	}
 	before, _ := r.Fold()
-	for id := range r.History(rk.ID()) {
-		delete(r.History(rk.ID()), id)
-	}
 	h := r.History(rk.ID())
 	for id := range h {
 		delete(h, id)
 	}
 	rk.Name = "changed after adding"
 	rk.Parents = nil
-	got := r.Op(rk.ID())
-	got.Name = "changed after reading"
+	r.Op(rk.ID()).Name = "changed after reading"
+	for _, o := range before.Order {
+		o.Parents, o.Lamport = nil, 0
+	}
 	after, err := r.Fold()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !after.Counts[rk.ID()] || after.Current != before.Current || r.Op(rk.ID()).Name != "" {
+	if !after.Counts[rk.ID()] || after.Current != before.Current || r.Op(rk.ID()).Name != "" || len(r.Heads()) != 1 {
 		t.Fatal("a caller's change reached the roster")
 	}
-	_ = owner
+	// The changed op is no longer the signed one.
+	if _, err := r.Add(rk); err == nil {
+		t.Fatal("a changed op was accepted as already held")
+	}
 }
 
 func TestLogHeadAtSeqZero(t *testing.T) {
@@ -434,5 +437,32 @@ func TestDecodeRejectsFieldsOutsideKind(t *testing.T) {
 		if _, err := Decode(o.Encode()); !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+// TestFoldScales: a long chain of one admin's operations folds in time
+// linear in the chain per authority check, not quadratic or worse.
+func TestFoldScales(t *testing.T) {
+	r, _, admin, _ := group(t)
+	w := &Writer{R: r, Me: admin}
+	inv := me(8).Public()
+	const n = 3000
+	for i := range n {
+		o := w.base(Invite)
+		o.Invite, o.Expires = inv, int64(i+1)
+		o.Sign(admin)
+		if _, err := r.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("folding %d ops took %v", n, d)
+	} else {
+		t.Logf("folded %d ops in %v", len(f.Order), d)
 	}
 }

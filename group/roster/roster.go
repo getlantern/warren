@@ -34,6 +34,9 @@ type Roster struct {
 	// history. An ID commits to that history, and every op here has been
 	// verified against its ID, so the view never changes.
 	views map[ID]*view
+	// anc caches descends: whether the second op is an ancestor of the
+	// first, which never changes once both are held.
+	anc map[[2]ID]bool
 }
 
 type view struct {
@@ -51,7 +54,7 @@ func New(genesis *Op) (*Roster, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Roster{group: g.id, ops: map[ID]*Op{}, views: map[ID]*view{}}
+	r := &Roster{group: g.id, ops: map[ID]*Op{}, views: map[ID]*view{}, anc: map[[2]ID]bool{}}
 	r.ops[g.id] = g
 	return r, nil
 }
@@ -64,15 +67,10 @@ func (r *Roster) Len() int { return len(r.ops) }
 
 // Op returns a copy of the operation with id, or nil.
 func (r *Roster) Op(id ID) *Op {
-	o := r.ops[id]
-	if o == nil {
-		return nil
+	if o := r.ops[id]; o != nil {
+		return o.clone()
 	}
-	c, err := Decode(o.Encode())
-	if err != nil {
-		panic(err) // every held op decoded once already
-	}
-	return c
+	return nil
 }
 
 // Has reports whether the roster holds id.
@@ -83,9 +81,6 @@ func (r *Roster) Has(id ID) bool { return r.ops[id] != nil }
 // exactly what peers would accept, and the caller's later changes to o
 // can't reach it. It reports whether the operation was new.
 func (r *Roster) Add(o *Op) (bool, error) {
-	if r.ops[o.id] != nil {
-		return false, nil
-	}
 	o, err := Decode(o.Encode())
 	if err != nil {
 		return false, err
@@ -163,28 +158,36 @@ func (r *Roster) descends(o, a ID) bool {
 	if ao == nil || oo == nil {
 		return false
 	}
-	seen := map[ID]bool{}
-	stack := slices.Clone(oo.Parents)
-	for len(stack) > 0 {
-		p := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if p == a {
-			return true
-		}
-		if seen[p] || r.ops[p].Lamport <= ao.Lamport {
-			continue
-		}
-		seen[p] = true
-		stack = append(stack, r.ops[p].Parents...)
+	return r.desc(oo, ao)
+}
+
+// desc is descends over parents, memoizing every intermediate answer, so
+// one ancestor's queries cost O(ops) together however many are asked.
+func (r *Roster) desc(oo, ao *Op) bool {
+	key := [2]ID{oo.id, ao.id}
+	if v, ok := r.anc[key]; ok {
+		return v
 	}
-	return false
+	v := false
+	for _, p := range oo.Parents {
+		if p == ao.id {
+			v = true
+			break
+		}
+		if po := r.ops[p]; po.Lamport > ao.Lamport && r.desc(po, ao) {
+			v = true
+			break
+		}
+	}
+	r.anc[key] = v
+	return v
 }
 
 // sub is the roster of only the given operations, which must be causally
-// closed, sharing r's caches: an operation's history and view are the same
-// in any roster that holds it.
+// closed, sharing r's view and ancestry caches: an operation's view and
+// ancestors are the same in any roster that holds it.
 func (r *Roster) sub(ids map[ID]bool) *Roster {
-	s := &Roster{group: r.group, ops: make(map[ID]*Op, len(ids)), views: r.views}
+	s := &Roster{group: r.group, ops: make(map[ID]*Op, len(ids)), views: r.views, anc: r.anc}
 	for id := range ids {
 		s.ops[id] = r.ops[id]
 	}
@@ -264,7 +267,29 @@ func (r *Roster) order() []*Op {
 // in its history, unless a later promotion they've seen restored it. Those
 // view rules can drop operations earlier passes applied, so the fold
 // repeats until the dropped set is stable, or cycles.
+//
+// The result's operations are copies, so changing them can't reach the
+// roster.
 func (r *Roster) Fold() (*Result, error) {
+	res, err := r.fold()
+	if err != nil {
+		return nil, err
+	}
+	clones := make(map[ID]*Op, len(res.Order))
+	for i, o := range res.Order {
+		clones[o.id] = o.clone()
+		res.Order[i] = clones[o.id]
+	}
+	for k, gs := range res.Grants {
+		for i, g := range gs {
+			gs[i] = clones[g.id]
+		}
+		res.Grants[k] = gs
+	}
+	return res, nil
+}
+
+func (r *Roster) fold() (*Result, error) {
 	order := r.order()
 	dropped := map[ID]bool{}
 	var tried []map[ID]bool
@@ -330,7 +355,7 @@ func (r *Roster) foldOrFail() (*Result, error) {
 	if len(r.ops) == 0 {
 		return &Result{Roles: map[keys.PublicKey]Role{}, Removed: map[keys.PublicKey]ID{}}, nil
 	}
-	return r.Fold()
+	return r.fold()
 }
 
 func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {

@@ -52,12 +52,12 @@ func (w *Writer) finish(o *Op) (*Op, error) {
 	return o, nil
 }
 
-func (w *Writer) fold() (*Result, error) { return w.R.Fold() }
+func (w *Writer) fold() (*Result, error) { return w.R.fold() }
 
 // foldWithKeys also opens the writer's keyring, for the operations that
 // seal keys it holds.
 func (w *Writer) foldWithKeys() (*Result, *Keyring, error) {
-	f, err := w.R.Fold()
+	f, err := w.R.fold()
 	if err != nil {
 		return nil, nil, err
 	}
