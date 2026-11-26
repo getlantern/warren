@@ -53,6 +53,10 @@ type Config struct {
 	Profile *punch.Profile
 	// Authorize, if set, decides which callers a listener answers.
 	Authorize func(caller [32]byte) bool
+	// AuthorizeListener, if set, decides which callers each listener key
+	// answers (a group's rendezvous key, say, only its members), after
+	// Authorize if both are set.
+	AuthorizeListener func(listener, caller [32]byte) bool
 	// SignerFailed, if set, is told when the listener's signer fails to
 	// re-sign a record (a hardware key gone, say): callers can't reach it
 	// once the record held before ages out. It is called on its own
@@ -103,6 +107,9 @@ type Conn struct {
 	// PeerKey is the provider's key for an outbound connection, the
 	// caller's verified key for an inbound one.
 	PeerKey [32]byte
+	// LocalKey is our key: the identity that signed an outbound
+	// connection's offer, or the listener key an inbound one called.
+	LocalKey [32]byte
 	// Secret is shared only by the two ends, for binding a later
 	// cryptographic handshake (QUIC, Noise) to this path.
 	Secret []byte
@@ -636,6 +643,20 @@ func (e *Endpoint) Listen(ctx context.Context, priv crypto.Signer) error {
 	return e.node.Listen(ctx, priv)
 }
 
+// AddListener makes this endpoint reachable under priv's key as well as
+// any listened under already; Conn.LocalKey says which key a caller
+// called. Listen replaces every key; AddListener replaces only one under
+// the same key.
+func (e *Endpoint) AddListener(ctx context.Context, priv crypto.Signer) error {
+	return e.node.AddListener(ctx, priv)
+}
+
+// RemoveListener stops listening under pub, leaving any other key.
+// Connections made under it carry on.
+func (e *Endpoint) RemoveListener(ctx context.Context, pub [32]byte) error {
+	return e.node.RemoveListener(ctx, pub)
+}
+
 func (e *Endpoint) Accept(ctx context.Context) (*Conn, error) {
 	for {
 		select {
@@ -740,7 +761,8 @@ func (e *Endpoint) Connect(ctx context.Context, identity crypto.Signer, peer [32
 	if err != nil {
 		return nil, err
 	}
-	c := e.newConn(pd, peer, secret, identity)
+	local, _ := dht.SignerKey(identity) // checked at the top
+	c := e.newConn(pd, peer, local, secret, identity)
 	if c == nil {
 		pd.sock.Close()
 		return nil, ErrRefusing // refusing began while we punched
@@ -767,9 +789,9 @@ type punched struct {
 // identity is set only for outbound connections. While the endpoint refuses
 // new connections it registers nothing and returns nil; the caller closes
 // the socket.
-func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity crypto.Signer) *Conn {
+func (e *Endpoint) newConn(pd punched, peer, local [32]byte, secret []byte, identity crypto.Signer) *Conn {
 	c := &Conn{
-		Remote: pd.remote, PeerKey: peer, Secret: secret, Relayed: pd.relayed,
+		Remote: pd.remote, PeerKey: peer, LocalKey: local, Secret: secret, Relayed: pd.relayed,
 		p: newPath(pd.sock, pd.remote), e: e, resume: resumeID(secret),
 		outbound: identity != nil, identity: identity, created: time.Now(),
 	}
@@ -818,10 +840,16 @@ func (e *Endpoint) forget(c *Conn) {
 
 // resumable returns the live inbound connection a resume ID names, if the
 // offer comes from that connection's caller.
-func (e *Endpoint) resumable(id [16]byte, caller [32]byte) *Conn {
+// resumable is the inbound connection a resume offer names, if it called
+// the same listener key: a caller can't move a connection made under one
+// of our keys by calling another.
+func (e *Endpoint) resumable(id [16]byte, caller, listener [32]byte) *Conn {
 	e.connsMu.Lock()
 	defer e.connsMu.Unlock()
-	return e.inConns[connKey{caller, id}]
+	if c := e.inConns[connKey{caller, id}]; c != nil && c.LocalKey == listener {
+		return c
+	}
+	return nil
 }
 
 // Migrate moves an outbound connection onto a freshly punched path, for
@@ -1256,6 +1284,9 @@ func (e *Endpoint) incoming(in dht.Incoming) {
 	if e.cfg.Authorize != nil && !e.cfg.Authorize(in.Caller) {
 		return
 	}
+	if e.cfg.AuthorizeListener != nil && !e.cfg.AuthorizeListener(in.Listener, in.Caller) {
+		return
+	}
 	offer, err := punch.UnmarshalOffer(in.Payload)
 	if err != nil || len(offer.Secret) < 16 {
 		return
@@ -1275,7 +1306,7 @@ func (e *Endpoint) incoming(in dht.Incoming) {
 		// A resume naming no live connection of this caller is answered at
 		// once, empty, even when every punch slot is busy: it would never
 		// punch, and the caller shouldn't wait out signaling.
-		if id, _, ok := parseResume(offer.Resume); !ok || e.resumable(id, in.Caller) == nil {
+		if id, _, ok := parseResume(offer.Resume); !ok || e.resumable(id, in.Caller, in.Listener) == nil {
 			e.wg.Go(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), e.cfg.GatherWait)
 				defer cancel()
@@ -1327,7 +1358,7 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 	if len(offer.Resume) > 0 {
 		id, seq, ok := parseResume(offer.Resume)
 		if ok {
-			resumed, resumeSeq = e.resumable(id, in.Caller), seq
+			resumed, resumeSeq = e.resumable(id, in.Caller, in.Listener), seq
 		}
 		if resumed == nil || !resumed.allowResume(time.Now()) {
 			e.answerEmpty(ctx, in, entry)
@@ -1413,7 +1444,7 @@ func (e *Endpoint) inbound(in dht.Incoming, offer punch.Offer, entry *offerEntry
 		}
 		return
 	}
-	c := e.newConn(pd, in.Caller, offer.Secret, nil)
+	c := e.newConn(pd, in.Caller, in.Listener, offer.Secret, nil)
 	if c == nil {
 		pd.sock.Close() // refusing began while we punched
 		return

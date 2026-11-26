@@ -644,12 +644,52 @@ func TestListenNeverSplitsIdentities(t *testing.T) {
 	}
 	keys, listening := map[[32]byte]bool{}, 0
 	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
-		if pk, ok := d.Listening(); ok {
-			keys[pk] = true
+		for _, l := range d.Listeners() {
+			keys[l.Key] = true
 			listening++
 		}
 	})
 	if listening != 2 || len(keys) != 1 || !keys[[32]byte(old.Public().(ed25519.PublicKey))] {
 		t.Fatalf("%d families listening under %d keys: want both, under the old one", listening, len(keys))
 	}
+}
+
+// TestAddListenerSplitRestores: a signer failing for one family on
+// AddListener puts the other family's listeners back as they were.
+func TestAddListenerSplitRestores(t *testing.T) {
+	n, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	defer n.Close()
+	if len(n.Addrs()) != 2 {
+		t.Skip("only one family bound")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a := ed25519.NewKeyFromSeed(make([]byte, 32))
+	b := ed25519.NewKeyFromSeed(append(make([]byte, 31), 1))
+	for _, k := range []ed25519.PrivateKey{a, b} {
+		if err := n.AddListener(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, c, _ := ed25519.GenerateKey(rand.Reader)
+	if err := n.AddListener(ctx, &budget{k: c, n: 1}); !errors.Is(err, dht.ErrSigner) {
+		t.Fatalf("a signer failing for one family: %v", err)
+	}
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		ls := d.Listeners()
+		if len(ls) != 2 || ls[0].Key != [32]byte(a.Public().(ed25519.PublicKey)) || ls[1].Key != [32]byte(b.Public().(ed25519.PublicKey)) {
+			t.Errorf("a family's listeners after the split: %d", len(ls))
+		}
+	})
+	if err := n.RemoveListener(ctx, [32]byte(a.Public().(ed25519.PublicKey))); err != nil {
+		t.Fatal(err)
+	}
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		if ls := d.Listeners(); len(ls) != 1 {
+			t.Errorf("%d listeners after removing one", len(ls))
+		}
+	})
 }

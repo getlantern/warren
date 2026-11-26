@@ -743,41 +743,58 @@ func (n *Node) Snapshot(ctx context.Context) ([]byte, error) {
 }
 
 // Listen makes us reachable for signaling under priv's key on every node, so
-// callers of either family can reach us. Offers arrive as dht.Incoming on
-// Events; reply with Answer.
+// callers of either family can reach us, replacing every key listened
+// under before. Offers arrive as dht.Incoming on Events; reply with Answer.
 func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
-	// One signaling key for every family, so their records are identical.
+	return n.listen(ctx, priv, func(d *dht.Node, now time.Time, x *ecdh.PrivateKey) error {
+		return d.ListenKey(now, priv, x)
+	})
+}
+
+// AddListener makes us reachable under priv's key as well as any listened
+// under already, on every node; dht.Incoming.Listener says which key an
+// offer called.
+func (n *Node) AddListener(ctx context.Context, priv crypto.Signer) error {
+	return n.listen(ctx, priv, func(d *dht.Node, now time.Time, x *ecdh.PrivateKey) error {
+		return d.AddListenerKey(now, priv, x)
+	})
+}
+
+// RemoveListener stops listening under pub on every node, leaving any
+// other key.
+func (n *Node) RemoveListener(ctx context.Context, pub [32]byte) error {
+	_, err := n.each(ctx, func(_ int, d *dht.Node, _ time.Time) error {
+		d.RemoveListener(pub)
+		return nil
+	})
+	return err
+}
+
+// listen runs f on every node with one signaling key, so their records are
+// identical, all on one turn of the loop, so no family serves a new key
+// while another's signer failure is still being undone.
+func (n *Node) listen(ctx context.Context, priv crypto.Signer, f func(*dht.Node, time.Time, *ecdh.PrivateKey) error) error {
 	x, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
-	// All on one turn of the loop, so no family serves a new identity while
-	// another's signer failure is still being undone.
 	res := make(chan error, 1)
 	if err := n.do(ctx, func(now time.Time) {
-		type was struct {
-			priv crypto.Signer
-			x    *ecdh.PrivateKey
-			ok   bool
-		}
-		prev := make([]was, len(n.fams))
+		prev := make([][]dht.Listener, len(n.fams))
 		errs := make([]error, len(n.fams))
 		for i, fm := range n.fams {
-			prev[i].priv, prev[i].x, prev[i].ok = fm.node.Listener()
-			errs[i] = fm.node.ListenKey(now, priv, x)
+			prev[i] = fm.node.Listeners()
+			errs[i] = f(fm.node, now, x)
 		}
-		// A family whose signer failed kept its old identity while the
-		// others moved: move them back, so siblings never publish different
-		// identities. (A family failing for another reason, a family down,
-		// leaves the rest listening, as before.)
+		// A family whose signer failed kept its listeners while the others
+		// changed theirs: put those back, so siblings never publish
+		// different keys. (A family failing for another reason, a family
+		// down, leaves the rest listening, as before.)
 		i := slices.IndexFunc(errs, func(e error) bool { return errors.Is(e, dht.ErrSigner) })
 		if i >= 0 && slices.Contains(errs, nil) {
 			for j, fm := range n.fams {
-				if errs[j] != nil {
-					continue
-				}
-				if !prev[j].ok || fm.node.ListenKey(now, prev[j].priv, prev[j].x) != nil {
-					fm.node.Unlisten()
+				if errs[j] == nil {
+					restore(now, fm.node, prev[j])
 				}
 			}
 			res <- errs[i]
@@ -788,6 +805,15 @@ func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
 		return err
 	}
 	return <-res
+}
+
+// restore puts d's listeners back as they were. One that won't sign again
+// is left off rather than published under a key its siblings lack.
+func restore(now time.Time, d *dht.Node, prev []dht.Listener) {
+	d.Unlisten()
+	for _, l := range prev {
+		_ = d.AddListenerKey(now, l.Signer, l.SignalKey)
+	}
 }
 
 // Answer replies to an offer through the node that delivered it.

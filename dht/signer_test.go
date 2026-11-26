@@ -83,12 +83,12 @@ func TestFailedSignKeepsRecord(t *testing.T) {
 	if err := n.Listen(t0, f); err != nil {
 		t.Fatal(err)
 	}
-	if len(n.lst.records) != 1 {
-		t.Fatalf("%d records", len(n.lst.records))
+	if len(n.lsts[0].records) != 1 {
+		t.Fatalf("%d records", len(n.lsts[0].records))
 	}
 	f.fail = true
-	n.resign(t0.Add(time.Second))
-	for _, target := range n.lst.records {
+	n.resign(t0.Add(time.Second), n.lsts[0])
+	for _, target := range n.lsts[0].records {
 		o := n.owned[target]
 		if o == nil || o.rec.mut == nil || !o.rec.mut.Verify() {
 			t.Fatal("a failed re-sign replaced the record with an invalid one")
@@ -97,13 +97,13 @@ func TestFailedSignKeepsRecord(t *testing.T) {
 	// A new epoch's record isn't made while signing fails, and is once it
 	// works again.
 	later := t0.Add(2 * RecordEpoch)
-	n.ensureRecords(later)
-	if _, ok := n.lst.records[epochOf(later)]; ok {
+	n.ensureRecords(later, n.lsts[0])
+	if _, ok := n.lsts[0].records[epochOf(later)]; ok {
 		t.Fatal("a record was stored for an epoch the signer couldn't sign")
 	}
 	f.fail = false
-	n.ensureRecords(later)
-	if _, ok := n.lst.records[epochOf(later)]; !ok {
+	n.ensureRecords(later, n.lsts[0])
+	if _, ok := n.lsts[0].records[epochOf(later)]; !ok {
 		t.Fatal("no record once the signer works again")
 	}
 }
@@ -156,7 +156,7 @@ func TestListenRefusesUnsigningSigner(t *testing.T) {
 		if err := n.Listen(t0, s); !errors.Is(err, ErrSigner) {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if n.lst == nil || n.lst.pub != [32]byte(good.Public().(ed25519.PublicKey)) || len(n.lst.records) == 0 {
+		if len(n.lsts) == 0 || n.lsts[0].pub != [32]byte(good.Public().(ed25519.PublicKey)) || len(n.lsts[0].records) == 0 {
 			t.Fatalf("%s: the identity listened under before was dropped", name)
 		}
 	}
@@ -183,15 +183,15 @@ func TestSignerFailedOnce(t *testing.T) {
 	}
 	count()
 	f.fail = true
-	n.resign(t0.Add(time.Second))
-	n.resign(t0.Add(2 * time.Second))
+	n.resign(t0.Add(time.Second), n.lsts[0])
+	n.resign(t0.Add(2*time.Second), n.lsts[0])
 	if c := count(); c != 1 {
 		t.Fatalf("%d SignerFailed events for one run of failures", c)
 	}
 	f.fail = false
-	n.resign(t0.Add(3 * time.Second))
+	n.resign(t0.Add(3*time.Second), n.lsts[0])
 	f.fail = true
-	n.resign(t0.Add(4 * time.Second))
+	n.resign(t0.Add(4*time.Second), n.lsts[0])
 	if c := count(); c != 1 {
 		t.Fatalf("%d SignerFailed events after a success and a new failure", c)
 	}
@@ -208,7 +208,7 @@ func TestRebindRetriedAfterFailedSign(t *testing.T) {
 		t.Fatal(err)
 	}
 	var target krpc.NodeID
-	for _, tg := range n.lst.records {
+	for _, tg := range n.lsts[0].records {
 		target = tg
 	}
 	seq := n.recordSeq[target]
@@ -218,21 +218,21 @@ func TestRebindRetriedAfterFailedSign(t *testing.T) {
 	for i := range 4 {
 		h := &holder{addr: netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)}), 6881), target: target, mapped: old}
 		hs = append(hs, h)
-		n.lst.holders = append(n.lst.holders, h)
+		n.lsts[0].holders = append(n.lsts[0].holders, h)
 	}
 	f.fail, f.signs = true, 0
 	for _, h := range hs {
 		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: moved})
 	}
-	if f.signs > len(n.lst.records) {
+	if f.signs > len(n.lsts[0].records) {
 		t.Fatalf("%d signs for one mapping change seen by %d holders", f.signs, len(hs))
 	}
-	if !n.lst.resignDue {
+	if !n.lsts[0].resignDue {
 		t.Fatal("a failed re-sign left nothing due")
 	}
 	f.fail = false
 	n.maintain(t0.Add(2 * time.Second))
-	if n.lst.resignDue || n.recordSeq[target] <= seq {
+	if n.lsts[0].resignDue || n.recordSeq[target] <= seq {
 		t.Fatal("maintenance didn't re-sign after the signer recovered")
 	}
 }
@@ -273,11 +273,11 @@ func TestFailingSignerAskedOncePerPass(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.fail = true
-	n.resign(t0.Add(time.Second)) // fails: resignDue
+	n.resign(t0.Add(time.Second), n.lsts[0]) // fails: resignDue
 	c.signs = 0
 	n.Rebound(t0.Add(2 * time.Second)) // marks records due and runs a pass
-	if c.signs > len(n.lst.records) {
-		t.Fatalf("%d signs in one pass for %d records", c.signs, len(n.lst.records))
+	if c.signs > len(n.lsts[0].records) {
+		t.Fatalf("%d signs in one pass for %d records", c.signs, len(n.lsts[0].records))
 	}
 }
 
@@ -329,11 +329,11 @@ func TestKeyChangeAfterListenRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.shifted = true
-	n.resign(t0.Add(time.Second))
-	if !n.lst.resignDue {
+	n.resign(t0.Add(time.Second), n.lsts[0])
+	if !n.lsts[0].resignDue {
 		t.Fatal("a re-sign under a changed key was taken")
 	}
-	for _, target := range n.lst.records {
+	for _, target := range n.lsts[0].records {
 		if o := n.owned[target]; o.rec.mut.Key != [32]byte(a.Public().(ed25519.PublicKey)) {
 			t.Fatal("a record under the changed key was stored")
 		}

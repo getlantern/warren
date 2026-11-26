@@ -289,9 +289,10 @@ recovery and memory caps.
   call across a period boundary). Then, inside the encrypted session, each
   side signs the session's secret with its **member key**, and each checks
   the other's member key is on its roster. Nothing is served before both
-  checks pass. Warren needs two changes for this: an endpoint listening under
-  several keys at once (today the DHT node holds a single listener), and
-  `Authorize` told which listener key was called.
+  checks pass. Warren provides this (built): an endpoint listens under
+  several keys at once (`AddListener`/`RemoveListener`), each connection
+  says which key was called (`Conn.LocalKey`), and `AuthorizeListener` is
+  told that key.
 - **A caller the callee doesn't know yet** (a member added since the
   callee last synced): signaling can't carry the proof, since admission
   comes before any session. The callee admits a caller whose key it doesn't
@@ -615,9 +616,12 @@ so an app chooses where data lives and how much.
 
 ## Warren changes needed
 
-1. **Several listeners per endpoint** (one per group, each on its own
-   socket, plus invite listeners), and `Authorize` given the listener key
-   that was called.
+1. **Several listeners per endpoint** (built: `AddListener` and
+   `RemoveListener` on the endpoint, driver and DHT node, up to
+   `dht.MaxListeners`, sharing the endpoint's socket and one bound on
+   offers in progress), and `AuthorizeListener` given the listener key that
+   was called (`Conn.LocalKey` and `dht.Incoming.Listener` carry it too).
+   `Listen` still replaces every key, as before.
 2. **Ed25519 key blinding** for rendezvous keys (scalar multiplication on
    the curve, as in Tor's rend-spec-v3), built in `group/keys`: the blinding
    scalar hashes the factor with the member key, and a blinded key signs

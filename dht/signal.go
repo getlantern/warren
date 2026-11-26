@@ -46,9 +46,10 @@ type SessionID [16]byte
 
 // Incoming is an offer delivered to a listening provider. Reply with Answer.
 type Incoming struct {
-	Session SessionID
-	Caller  [32]byte // the caller's ed25519 key, verified
-	Payload []byte
+	Session  SessionID
+	Caller   [32]byte // the caller's ed25519 key, verified
+	Listener [32]byte // the key it called, one of ours
+	Payload  []byte
 }
 
 // Answered completes a Signal call.
@@ -401,7 +402,15 @@ type listener struct {
 	retry     time.Duration // publication backoff while nothing stores our record
 }
 
-// Listen publishes a signaling record for priv's key and keeps it reachable.
+// MaxListeners bounds the keys a node listens under at once: each keeps
+// records published and holders kept alive.
+const MaxListeners = 64
+
+// ErrTooManyListeners means AddListener would exceed MaxListeners.
+var ErrTooManyListeners = errors.New("dht: too many listeners")
+
+// Listen publishes a signaling record for priv's key and keeps it
+// reachable, replacing every key listened under before.
 func (n *Node) Listen(now time.Time, priv crypto.Signer) error {
 	x, err := ecdh.X25519().NewPrivateKey(n.randBytes(32))
 	if err != nil {
@@ -418,28 +427,92 @@ func (n *Node) Listen(now time.Time, priv crypto.Signer) error {
 // priv signs on the node's own loop, so its Sign must be quick: a hardware
 // key waiting for a touch would stall every lookup meanwhile.
 func (n *Node) ListenKey(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey) error {
+	return n.listen(now, priv, x, true)
+}
+
+// AddListener listens under priv's key as well as any listened under
+// already (a group member under its rendezvous keys, say), replacing only
+// a listener under the same key. Offers say which key they called
+// (Incoming.Listener).
+func (n *Node) AddListener(now time.Time, priv crypto.Signer) error {
+	x, err := ecdh.X25519().NewPrivateKey(n.randBytes(32))
+	if err != nil {
+		return err
+	}
+	return n.AddListenerKey(now, priv, x)
+}
+
+// AddListenerKey is AddListener with a given signaling key, shared by
+// sibling nodes as for ListenKey.
+func (n *Node) AddListenerKey(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey) error {
+	return n.listen(now, priv, x, false)
+}
+
+// listen installs a listener for priv, replacing every other one if
+// replaceAll, else only one under the same key.
+func (n *Node) listen(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey, replaceAll bool) error {
 	pub, err := SignerKey(priv)
 	if err != nil {
 		return err
 	}
-	// Sign the new identity's current record before dropping the identity
-	// listened under now, so a signer that can't sign leaves that one
-	// reachable and nothing changed.
+	if !replaceAll && n.listener(pub) == nil && len(n.lsts) >= MaxListeners {
+		return ErrTooManyListeners
+	}
+	// Sign the new listener's current record before dropping anything, so
+	// a signer that can't sign leaves every listener as it was.
 	cur := epochOf(now)
 	target, seq, m, err := n.makeRecord(now, priv, pub, x, cur)
 	if err != nil {
 		return err
 	}
-	// A new identity replaces the old one entirely: its records stop being
+	// A listener replaced is dropped entirely: its records stop being
 	// republished, since their offers could no longer be decrypted.
-	n.Unlisten()
-	n.lst = &listener{
+	if replaceAll {
+		n.Unlisten()
+	} else {
+		n.RemoveListener(pub)
+	}
+	l := &listener{
 		priv: priv, pub: pub, x: x,
 		records: map[int64]krpc.NodeID{}, sessions: map[SessionID]*session{}, seen: map[string]time.Time{},
 	}
+	n.lsts = append(n.lsts, l)
 	n.storeRecord(now, target, seq, m)
-	n.lst.records[cur] = target
+	l.records[cur] = target
 	n.maintain(now)
+	return nil
+}
+
+// listener returns the listener under pub, or nil.
+func (n *Node) listener(pub [32]byte) *listener {
+	for _, l := range n.lsts {
+		if l.pub == pub {
+			return l
+		}
+	}
+	return nil
+}
+
+// owner returns the listener one of whose records is target, and that
+// record's epoch.
+func (n *Node) owner(target krpc.NodeID) (*listener, int64, bool) {
+	for _, l := range n.lsts {
+		for e, t := range l.records {
+			if t == target {
+				return l, e, true
+			}
+		}
+	}
+	return nil, 0, false
+}
+
+// holderOwner returns the listener keeping h alive, or nil.
+func (n *Node) holderOwner(h *holder) *listener {
+	for _, l := range n.lsts {
+		if slices.Contains(l.holders, h) {
+			return l
+		}
+	}
 	return nil
 }
 
@@ -470,7 +543,7 @@ func (n *Node) Rebound(now time.Time) {
 			n.abandon(now, t)
 		}
 	}
-	if l := n.lst; l != nil {
+	for _, l := range n.lsts {
 		// Write tokens are bound to our old source IP; holders would reject
 		// answers carrying them. Keepalives and answer-token fetches get
 		// fresh ones.
@@ -490,32 +563,43 @@ func (n *Node) Rebound(now time.Time) {
 	n.maintain(now)
 }
 
-// SignalKey is the X25519 key callers encrypt offers to, zero when not
-// listening.
+// SignalKey is the X25519 key callers encrypt offers to, of the first
+// listener; zero when not listening.
 func (n *Node) SignalKey() (k [32]byte) {
-	if n.lst != nil {
-		copy(k[:], n.lst.x.PublicKey().Bytes())
+	if len(n.lsts) > 0 {
+		copy(k[:], n.lsts[0].x.PublicKey().Bytes())
 	}
 	return k
 }
 
+// Unlisten stops listening under every key.
 func (n *Node) Unlisten() {
-	if n.lst == nil {
+	for _, l := range n.lsts {
+		for _, t := range l.records {
+			delete(n.owned, t)
+		}
+	}
+	n.lsts = nil
+}
+
+// RemoveListener stops listening under pub, leaving any other key.
+func (n *Node) RemoveListener(pub [32]byte) {
+	l := n.listener(pub)
+	if l == nil {
 		return
 	}
-	for _, t := range n.lst.records {
+	for _, t := range l.records {
 		delete(n.owned, t)
 	}
-	n.lst = nil
+	n.lsts = slices.DeleteFunc(n.lsts, func(x *listener) bool { return x == l })
 }
 
 // ensureRecords publishes the current epoch's record and retires records
 // older than the previous epoch, which callers still try during rollover.
-func (n *Node) ensureRecords(now time.Time) {
-	l := n.lst
+func (n *Node) ensureRecords(now time.Time, l *listener) {
 	cur := epochOf(now)
 	if _, ok := l.records[cur]; !ok {
-		if t, ok := n.signRecord(now, cur); ok {
+		if t, ok := n.signRecord(now, l, cur); ok {
 			l.records[cur] = t
 		}
 	}
@@ -532,8 +616,7 @@ func (n *Node) ensureRecords(now time.Time) {
 // and whether it signed: a signer can fail (a hardware key unplugged), and
 // then nothing changes, so the record held before keeps being served and
 // the next pass tries again.
-func (n *Node) signRecord(now time.Time, epoch int64) (krpc.NodeID, bool) {
-	l := n.lst
+func (n *Node) signRecord(now time.Time, l *listener, epoch int64) (krpc.NodeID, bool) {
 	target, seq, m, err := n.makeRecord(now, l.priv, l.pub, l.x, epoch)
 	if err != nil {
 		// Maintenance re-signs every record on its next pass; until then
@@ -593,42 +676,23 @@ const maxRecordSeqs = 64
 // holders to our current address after a NAT mapping change.
 // A record that fails to sign leaves resignDue set, and maintenance tries
 // them all again on its next pass.
-func (n *Node) resign(now time.Time) {
-	n.lst.resignDue = false
-	for e := range n.lst.records {
-		n.signRecord(now, e)
+func (n *Node) resign(now time.Time, l *listener) {
+	l.resignDue = false
+	for e := range l.records {
+		n.signRecord(now, l, e)
 	}
-}
-
-// recordEpoch reports the epoch of one of our record targets.
-func (n *Node) recordEpoch(target krpc.NodeID) (int64, bool) {
-	if n.lst == nil {
-		return 0, false
-	}
-	for e, t := range n.lst.records {
-		if t == target {
-			return e, true
-		}
-	}
-	return 0, false
 }
 
 func (n *Node) isRecord(target krpc.NodeID) bool {
-	if n.lst == nil {
-		return false
-	}
-	for _, t := range n.lst.records {
-		if t == target {
-			return true
-		}
-	}
-	return false
+	_, _, ok := n.owner(target)
+	return ok
 }
 
 // recordStored adopts the nodes that acknowledged a record put as holders:
 // the closest few, plus a domestic one when domestic copies are on.
 func (n *Node) recordStored(now time.Time, l *lookup) {
-	if n.lst == nil || !n.isRecord(l.target) {
+	lst, _, ok := n.owner(l.target)
+	if !ok {
 		return // a publication started by a listener since replaced
 	}
 	if l.gen != n.gen {
@@ -637,13 +701,13 @@ func (n *Node) recordStored(now time.Time, l *lookup) {
 	if len(l.acked) == 0 {
 		// Nothing stored it, e.g. Listen before Bootstrap or every contact
 		// briefly unreachable: retry soon rather than at the next republish.
-		n.lst.retry = min(max(2*n.lst.retry, 5*time.Second), time.Minute)
+		lst.retry = min(max(2*lst.retry, 5*time.Second), time.Minute)
 		if o := n.owned[l.target]; o != nil {
-			o.next = now.Add(n.lst.retry)
+			o.next = now.Add(lst.retry)
 		}
 		return
 	}
-	n.lst.retry = 0
+	lst.retry = 0
 	var picked []*holder
 	dom := 0
 	for _, a := range l.acked {
@@ -661,12 +725,11 @@ func (n *Node) recordStored(now time.Time, l *lookup) {
 	if len(picked) == 0 {
 		return
 	}
-	n.lst.holders = slices.DeleteFunc(n.lst.holders, func(h *holder) bool { return h.target == l.target })
-	n.lst.holders = append(n.lst.holders, picked...)
+	lst.holders = slices.DeleteFunc(lst.holders, func(h *holder) bool { return h.target == l.target })
+	lst.holders = append(lst.holders, picked...)
 }
 
-func (n *Node) keepalive(now time.Time) {
-	l := n.lst
+func (n *Node) keepalive(now time.Time, l *listener) {
 	if now.Before(l.nextKA) {
 		return
 	}
@@ -688,7 +751,7 @@ func (n *Node) keepalive(now time.Time) {
 }
 
 func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
-	if n.lst == nil || !slices.Contains(n.lst.holders, h) {
+	if n.holderOwner(h) == nil {
 		return
 	}
 	h.fails = 0
@@ -704,23 +767,29 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 	if m.IP.IsValid() {
 		// After a failed re-sign maintenance retries, once a pass, so other
 		// holders' replies don't ask a failing signer again.
-		if h.mapped.IsValid() && h.mapped != m.IP && !n.lst.resignDue {
-			n.resign(now)
+		if h.mapped.IsValid() && h.mapped != m.IP {
+			// Our address moved: every listener's holders bind to it.
+			for _, x := range n.lsts {
+				if !x.resignDue {
+					n.resign(now, x)
+				}
+			}
 		}
 		h.mapped = m.IP
 	}
 }
 
 func (n *Node) keepaliveFailed(now time.Time, h *holder) {
-	if n.lst == nil {
+	l := n.holderOwner(h)
+	if l == nil {
 		return
 	}
 	if h.fails++; h.fails < holderMaxFailures {
 		return
 	}
-	n.lst.holders = slices.DeleteFunc(n.lst.holders, func(x *holder) bool { return x == h })
+	l.holders = slices.DeleteFunc(l.holders, func(x *holder) bool { return x == h })
 	live := 0
-	for _, x := range n.lst.holders {
+	for _, x := range l.holders {
 		if x.target == h.target {
 			live++
 		}
@@ -734,16 +803,19 @@ func (n *Node) keepaliveFailed(now time.Time, h *holder) {
 
 // acceptOffer decrypts an offer for one of our records.
 func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) bool {
-	l := n.lst
-	matched := false
-	for _, t := range l.records {
-		if saltMatchesRecord(m.Salt, t) {
-			matched = true
-			break
+	var l *listener
+	for _, x := range n.lsts {
+		for _, t := range x.records {
+			if saltMatchesRecord(m.Salt, t) {
+				l = x
+			}
 		}
 	}
-	if !matched || !fresh(m.Seq, now) || len(l.sessions) >= maxSessions {
-		return matched
+	if l == nil {
+		return false
+	}
+	if !fresh(m.Seq, now) || n.sessionCount() >= maxSessions {
+		return true
 	}
 	if _, dup := l.seen[string(m.Salt)]; dup {
 		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil && from != s.via && !slices.Contains(s.relays, from) {
@@ -757,7 +829,7 @@ func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) b
 				}
 				s.relays = append(s.relays, from)
 				if s.answer != nil {
-					n.sendAnswer(now, s, from)
+					n.sendAnswer(now, l, s, from)
 				}
 			}
 		}
@@ -786,29 +858,46 @@ func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) b
 	l.seen[string(m.Salt)] = now
 	id := SessionID(m.Salt[:16])
 	l.sessions[id] = &session{via: from, answerSalt: answerSalt(m.Salt), key: answerKey, expires: now.Add(sessionLifetime)}
-	n.events = append(n.events, Incoming{Session: id, Caller: m.Key, Payload: payload})
+	n.events = append(n.events, Incoming{Session: id, Caller: m.Key, Listener: l.pub, Payload: payload})
 	return true
+}
+
+// sessionCount is the offers in progress across every listener: one bound
+// for all, so more listeners don't mean more state.
+func (n *Node) sessionCount() int {
+	c := 0
+	for _, l := range n.lsts {
+		c += len(l.sessions)
+	}
+	return c
 }
 
 // Answer replies to an Incoming offer through the holder that relayed it.
 func (n *Node) Answer(now time.Time, id SessionID, payload []byte) error {
-	if n.lst == nil {
+	if len(n.lsts) == 0 {
 		return ErrNotListening
 	}
 	if len(payload) > MaxSignalPayload {
 		return ErrPayloadTooLarge
 	}
-	s := n.lst.sessions[id]
+	var l *listener
+	var s *session
+	for _, x := range n.lsts {
+		if s = x.sessions[id]; s != nil {
+			l = x
+			break
+		}
+	}
 	if s == nil || !now.Before(s.expires) || s.answer != nil {
 		return ErrUnknownSession
 	}
-	m, err := NewMutable(n.lst.priv, s.answerSalt, now.Unix(), bencode.AppendBytes(nil, n.seal(s.key, payload)))
+	m, err := NewMutable(l.priv, s.answerSalt, now.Unix(), bencode.AppendBytes(nil, n.seal(s.key, payload)))
 	if err != nil {
 		return err
 	}
 	s.answer = &m
 	for _, via := range append([]netip.AddrPort{s.via}, s.relays...) {
-		n.sendAnswer(now, s, via)
+		n.sendAnswer(now, l, s, via)
 	}
 	return nil
 }
@@ -817,14 +906,14 @@ func (n *Node) Answer(now time.Time, id SessionID, payload []byte) error {
 // replica of our record can relay one, including one whose put
 // acknowledgement we lost and so never adopted; without a write token for it
 // we fetch one with a get first.
-func (n *Node) sendAnswer(now time.Time, s *session, via netip.AddrPort) {
-	if tok := n.lst.tokenFor(s, via); tok != nil {
+func (n *Node) sendAnswer(now time.Time, l *listener, s *session, via netip.AddrPort) {
+	if tok := l.tokenFor(s, via); tok != nil {
 		a := s.answer.args()
 		a.Token = tok
 		n.send(now, via, "put", a, &txn{kind: txPing})
 		return
 	}
-	for _, target := range n.lst.records {
+	for _, target := range l.records {
 		t := target
 		n.send(now, via, "get", krpc.Args{Target: &t}, &txn{kind: txAnswerToken, session: s})
 		return
@@ -833,7 +922,7 @@ func (n *Node) sendAnswer(now time.Time, s *session, via netip.AddrPort) {
 
 // answerToken completes sendAnswer once a relay hands us a write token.
 func (n *Node) answerToken(now time.Time, via netip.AddrPort, m *krpc.Msg, s *session) {
-	if n.lst == nil || s == nil || s.answer == nil || m.Y != krpc.Response || len(m.R.Token) == 0 {
+	if len(n.lsts) == 0 || s == nil || s.answer == nil || m.Y != krpc.Response || len(m.R.Token) == 0 {
 		return
 	}
 	if s.tokens == nil {
@@ -1231,7 +1320,7 @@ func (n *Node) handleSignal(now time.Time, from netip.AddrPort, q *krpc.Msg) boo
 	}
 	m := &MutableItem{Key: [32]byte(q.A.K), Salt: q.A.Salt, Seq: *q.A.Seq, V: q.A.V, Sig: [64]byte(q.A.Sig)}
 	pending := len(n.signals) > 0
-	listening := n.lst != nil
+	listening := len(n.lsts) > 0
 	if !pending && !listening {
 		return false
 	}
@@ -1246,29 +1335,28 @@ func (n *Node) handleSignal(now time.Time, from netip.AddrPort, q *krpc.Msg) boo
 
 // Holders reports the record holders a listening provider keeps alive.
 func (n *Node) Holders() []netip.AddrPort {
-	if n.lst == nil {
-		return nil
-	}
 	var out []netip.AddrPort
-	for _, h := range n.lst.holders {
-		out = append(out, h.addr)
+	for _, l := range n.lsts {
+		for _, h := range l.holders {
+			out = append(out, h.addr)
+		}
 	}
 	return out
 }
 
-// Listening reports the key the node listens under, if it listens.
-func (n *Node) Listening() ([32]byte, bool) {
-	if n.lst == nil {
-		return [32]byte{}, false
-	}
-	return n.lst.pub, true
+// Listener is one key a node listens under.
+type Listener struct {
+	Key       [32]byte
+	Signer    crypto.Signer
+	SignalKey *ecdh.PrivateKey
 }
 
-// Listener returns what the node listens under, if it listens, so a
-// caller moving several nodes to a new identity can move one back.
-func (n *Node) Listener() (crypto.Signer, *ecdh.PrivateKey, bool) {
-	if n.lst == nil {
-		return nil, nil, false
+// Listeners returns the keys the node listens under, in the order added,
+// so a caller moving several nodes to new keys can move one back.
+func (n *Node) Listeners() []Listener {
+	out := make([]Listener, len(n.lsts))
+	for i, l := range n.lsts {
+		out[i] = Listener{Key: l.pub, Signer: l.priv, SignalKey: l.x}
 	}
-	return n.lst.priv, n.lst.x, true
+	return out
 }

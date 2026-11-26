@@ -116,10 +116,13 @@ func TestResumeNeedsTheSameCaller(t *testing.T) {
 	defer out.Close()
 	in := <-accepted
 	defer in.Close()
-	if provider.resumable(in.resume, pub(key("someone-else"))) != nil {
+	if provider.resumable(in.resume, pub(key("someone-else")), pub(pk)) != nil {
 		t.Fatal("another caller could resume this connection")
 	}
-	if provider.resumable(in.resume, pub(key("resume-caller"))) != in {
+	if provider.resumable(in.resume, pub(key("resume-caller")), pub(key("another listener"))) != nil {
+		t.Fatal("a resume through another of our keys could move this connection")
+	}
+	if provider.resumable(in.resume, pub(key("resume-caller")), pub(pk)) != in {
 		t.Fatal("the connection's own caller couldn't resume it")
 	}
 	in.Close() // the provider's side is gone: a resume names nothing
@@ -142,13 +145,13 @@ func TestRegistrySlotsCantBeTakenOver(t *testing.T) {
 	a, b := &net.UDPConn{}, &net.UDPConn{}
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	caller := [32]byte{1}
-	first := e.newConn(punched{sock: a}, caller, secret, nil)
-	e.newConn(punched{sock: b}, caller, secret, nil) // same caller, same secret
-	if e.resumable(first.resume, caller) != first {
+	first := e.newConn(punched{sock: a}, caller, [32]byte{}, secret, nil)
+	e.newConn(punched{sock: b}, caller, [32]byte{}, secret, nil) // same caller, same secret
+	if e.resumable(first.resume, caller, [32]byte{}) != first {
 		t.Fatal("a repeated secret took over a live connection's slot")
 	}
-	out := e.newConn(punched{sock: b}, caller, secret, key("me")) // an outbound one, same key and secret
-	if e.resumable(first.resume, caller) != first || e.outConns[out.key()] != out {
+	out := e.newConn(punched{sock: b}, caller, [32]byte{}, secret, key("me")) // an outbound one, same key and secret
+	if e.resumable(first.resume, caller, [32]byte{}) != first || e.outConns[out.key()] != out {
 		t.Fatal("inbound and outbound slots mixed")
 	}
 }

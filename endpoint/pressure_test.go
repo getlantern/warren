@@ -116,11 +116,11 @@ func TestRefusingDropsLateConnections(t *testing.T) {
 	e.SetRefusing(true)
 	pd := punchedLoopback(t)
 	defer pd.sock.Close()
-	if c := e.newConn(pd, [32]byte{1}, []byte("secret-secret-secret"), nil); c != nil || e.Connections() != 0 {
+	if c := e.newConn(pd, [32]byte{1}, [32]byte{}, []byte("secret-secret-secret"), nil); c != nil || e.Connections() != 0 {
 		t.Fatal("a connection punched while refusing was registered")
 	}
 	e.SetRefusing(false)
-	if c := e.newConn(pd, [32]byte{1}, []byte("secret-secret-secret"), nil); c == nil || e.Connections() != 1 {
+	if c := e.newConn(pd, [32]byte{1}, [32]byte{}, []byte("secret-secret-secret"), nil); c == nil || e.Connections() != 1 {
 		t.Fatal("a connection wasn't registered once refusing ended")
 	}
 }
@@ -130,7 +130,7 @@ func TestRefusingDropsLateConnections(t *testing.T) {
 func TestAcceptSkipsShedConnections(t *testing.T) {
 	e := &Endpoint{accept: make(chan *Conn, 1), done: make(chan struct{})}
 	conn := func(b byte) *Conn {
-		c := e.newConn(punchedLoopback(t), [32]byte{b}, []byte("secret-secret-secret"), nil)
+		c := e.newConn(punchedLoopback(t), [32]byte{b}, [32]byte{}, []byte("secret-secret-secret"), nil)
 		t.Cleanup(func() { c.Close() })
 		return c
 	}
@@ -160,7 +160,7 @@ func TestAcceptSkipsShedConnections(t *testing.T) {
 func TestConcurrentEnqueueKeepsLiveConnections(t *testing.T) {
 	e := &Endpoint{accept: make(chan *Conn, 3), done: make(chan struct{})}
 	conn := func(b byte) *Conn {
-		c := e.newConn(punchedLoopback(t), [32]byte{b}, []byte("secret-secret-secret"), nil)
+		c := e.newConn(punchedLoopback(t), [32]byte{b}, [32]byte{}, []byte("secret-secret-secret"), nil)
 		t.Cleanup(func() { c.Close() })
 		return c
 	}

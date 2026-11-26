@@ -400,3 +400,108 @@ func TestSignerFailedReachesApp(t *testing.T) {
 		t.Fatal("the app was never told its signer failed")
 	}
 }
+
+// TestTwoListenerKeys: one endpoint listens under two keys; a caller
+// reaches it by each, the connection says which key was called, and
+// AuthorizeListener is asked with that key.
+func TestTwoListenerKeys(t *testing.T) {
+	seed := network(t, 10)
+	asked := make(chan [2][32]byte, 4)
+	provider, err := New(Config{DHT: member(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1),
+		AuthorizeListener: func(listener, caller [32]byte) bool {
+			asked <- [2][32]byte{listener, caller}
+			return true
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { provider.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := provider.DHT().Bootstrap(ctx, []netip.AddrPort{seed}); err != nil {
+		t.Fatal(err)
+	}
+	caller := phone(t, seed)
+	ka, kb, ck := key("listener a"), key("listener b"), key("two-key caller")
+	for _, k := range []ed25519.PrivateKey{ka, kb} {
+		if err := provider.AddListener(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for {
+		var holders int
+		provider.DHT().Inspect(ctx, func(d *dht.Node) { holders = len(d.Holders()) })
+		if holders > 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("never published")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	for _, k := range []ed25519.PrivateKey{ka, kb} {
+		accepted := make(chan *Conn, 1)
+		go func() {
+			c, _ := provider.Accept(ctx)
+			accepted <- c
+		}()
+		out, err := caller.Connect(ctx, ck, pub(k))
+		if err != nil {
+			t.Fatalf("connect to listener: %v", err)
+		}
+		in := <-accepted
+		if in == nil {
+			t.Fatal("nothing accepted")
+		}
+		if in.LocalKey != pub(k) || out.LocalKey != pub(ck) {
+			t.Errorf("local keys: provider sees %x, caller %x", in.LocalKey[:4], out.LocalKey[:4])
+		}
+		select {
+		case a := <-asked:
+			if a[0] != pub(k) || a[1] != pub(ck) {
+				t.Errorf("AuthorizeListener asked for %x by %x", a[0][:4], a[1][:4])
+			}
+		default:
+			t.Error("AuthorizeListener was never asked")
+		}
+		out.Close()
+		in.Close()
+	}
+	// Removing one key leaves the other listening.
+	if err := provider.RemoveListener(ctx, pub(ka)); err != nil {
+		t.Fatal(err)
+	}
+	var keys [][32]byte
+	provider.DHT().Inspect(ctx, func(d *dht.Node) {
+		for _, l := range d.Listeners() {
+			keys = append(keys, l.Key)
+		}
+	})
+	if len(keys) != 1 || keys[0] != pub(kb) {
+		t.Fatalf("listening under %x after removing one", keys)
+	}
+}
+
+// TestAuthorizeListenerRefuses: a listener key's own rule refuses a caller.
+func TestAuthorizeListenerRefuses(t *testing.T) {
+	seed := network(t, 10)
+	provider, err := New(Config{DHT: member(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1),
+		AuthorizeListener: func(listener, caller [32]byte) bool { return false }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { provider.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := provider.DHT().Bootstrap(ctx, []netip.AddrPort{seed}); err != nil {
+		t.Fatal(err)
+	}
+	pk := key("refusing listener")
+	listenAndWait(t, provider, pk)
+	cctx, ccancel := context.WithTimeout(ctx, 3*time.Second)
+	defer ccancel()
+	if _, err := phone(t, seed).Connect(cctx, key("refused caller"), pub(pk)); err == nil {
+		t.Fatal("connected through a listener that refuses every caller")
+	}
+}
