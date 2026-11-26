@@ -115,7 +115,10 @@ const (
 	pendingAnswerTTL  = 30 * time.Second
 	maxBindings       = 512
 	maxPendingAnswers = 256
-	maxSessions       = 64
+	maxSessions       = 64 // offers in progress per listener
+	// maxNodeSessions bounds them across every listener: a flood to one
+	// key (a public invite's) fills its own share, not every key's.
+	maxNodeSessions   = 4 * maxSessions
 	maxHolders        = 4
 	holderMaxFailures = 2
 )
@@ -438,7 +441,8 @@ func (n *Node) ListenKey(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey) 
 // AddListener listens under priv's key as well as any listened under
 // already (a group member under its rendezvous keys, say), replacing only
 // a listener under the same key. Offers say which key they called
-// (Incoming.Listener).
+// (Incoming.Listener). Replacing drops that key's offers in progress and
+// gives it a new signaling key, so add each key once, not on every pass.
 func (n *Node) AddListener(now time.Time, priv crypto.Signer) error {
 	x, err := ecdh.X25519().NewPrivateKey(n.randBytes(32))
 	if err != nil {
@@ -778,13 +782,18 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 		// mapping), so many listeners' holders don't each set one off.
 		if h.mapped.IsValid() && h.mapped != m.IP {
 			if now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval / 2)) {
-				// Re-signed for a change this round already: a later one (a
-				// second move) is left to the next maintenance pass, not lost.
-				for _, x := range n.lsts {
-					x.resignDue = true
+				// Re-signed for a change this round already. Other holders
+				// reporting the same new address need nothing more; one not
+				// seen yet (a second move) is left to the next maintenance
+				// pass, not lost.
+				if !n.resignedFor[m.IP] {
+					n.resignedFor[m.IP] = true
+					for _, x := range n.lsts {
+						x.resignDue = true
+					}
 				}
 			} else {
-				n.resignedAt = now
+				n.resignedAt, n.resignedFor = now, map[netip.AddrPort]bool{m.IP: true}
 				for _, x := range n.lsts {
 					if !x.resignDue {
 						n.resign(now, x)
@@ -821,17 +830,19 @@ func (n *Node) keepaliveFailed(now time.Time, h *holder) {
 // acceptOffer decrypts an offer for one of our records.
 func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) bool {
 	var l *listener
+find:
 	for _, x := range n.lsts {
 		for _, t := range x.records {
 			if saltMatchesRecord(m.Salt, t) {
 				l = x
+				break find
 			}
 		}
 	}
 	if l == nil {
 		return false
 	}
-	if !fresh(m.Seq, now) || n.sessionCount() >= maxSessions {
+	if !fresh(m.Seq, now) || len(l.sessions) >= maxSessions || n.sessionCount() >= maxNodeSessions {
 		return true
 	}
 	if _, dup := l.seen[string(m.Salt)]; dup {

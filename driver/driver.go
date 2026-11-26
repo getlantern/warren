@@ -811,7 +811,10 @@ func (n *Node) listen(ctx context.Context, priv crypto.Signer, replaceAll bool) 
 				undoAdd(now, fm.node, pub, prev[j])
 			}
 		}
-		n.reconcile()
+		if dropped := n.reconcile(); len(dropped) > 0 {
+			res <- errors.Join(errs[i], fmt.Errorf("driver: undoing it, could not keep listening under %d key(s), now dropped everywhere: %x", len(dropped), dropped))
+			return
+		}
 		res <- errs[i]
 	}); err != nil {
 		return err
@@ -842,20 +845,24 @@ func undoAdd(now time.Time, d *dht.Node, pub [32]byte, prev []dht.Listener) {
 // reconcile drops any key not every node listens under, so after an undo
 // whose re-listening failed somewhere (a signer that won't sign again) the
 // siblings still publish the same keys.
-func (n *Node) reconcile() {
+// It returns the keys dropped.
+func (n *Node) reconcile() [][32]byte {
 	count := map[[32]byte]int{}
 	for _, fm := range n.fams {
 		for _, l := range fm.node.Listeners() {
 			count[l.Key]++
 		}
 	}
+	var dropped [][32]byte
 	for k, c := range count {
 		if c < len(n.fams) {
+			dropped = append(dropped, k)
 			for _, fm := range n.fams {
 				fm.node.RemoveListener(k)
 			}
 		}
 	}
+	return dropped
 }
 
 // Answer replies to an offer through the node that delivered it.

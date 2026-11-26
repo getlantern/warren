@@ -165,8 +165,10 @@ type Node struct {
 	events []Event
 
 	lsts []*listener // in the order added
-	// resignedAt is when a mapping change last re-signed every listener.
-	resignedAt time.Time
+	// resignedAt is when a mapping change last re-signed every listener,
+	// and resignedFor the new addresses re-signed for since.
+	resignedAt  time.Time
+	resignedFor map[netip.AddrPort]bool
 	// recordSeq is the last sequence number signed per record target. It
 	// outlives the listener, so re-listening never reuses a number.
 	recordSeq map[krpc.NodeID]int64

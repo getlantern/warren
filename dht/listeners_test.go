@@ -151,20 +151,31 @@ func TestReboundResignsEveryListener(t *testing.T) {
 	}
 }
 
-// TestSessionsBoundedAcrossListeners: the cap on offers in progress is one
-// for the node, not one per listener.
-func TestSessionsBoundedAcrossListeners(t *testing.T) {
+// TestFloodedListenerLeavesOthers: offers in progress are capped per
+// listener, so a flood to one key leaves another reachable, and the node's
+// total stays bounded.
+func TestFloodedListenerLeavesOthers(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
 	n.AddListener(t0, seededKey(1))
 	n.AddListener(t0, seededKey(2))
 	n.Drain()
-	for i := range maxSessions {
-		n.acceptOffer(t0, addr(40), offerTo(n, n.lsts[i%2], seededKey(byte(10+i%200)), "hi"))
+	for i := range maxSessions + 10 {
+		n.acceptOffer(t0, addr(40), offerTo(n, n.lsts[0], seededKey(byte(10+i%200)), "flood"))
 	}
-	n.acceptOffer(t0, addr(41), offerTo(n, n.lsts[0], seededKey(250), "hi"))
-	n.acceptOffer(t0, addr(41), offerTo(n, n.lsts[1], seededKey(251), "hi"))
-	if c := n.sessionCount(); c > maxSessions {
-		t.Fatalf("%d sessions across listeners, cap %d", c, maxSessions)
+	if c := len(n.lsts[0].sessions); c > maxSessions {
+		t.Fatalf("%d sessions on the flooded key, cap %d", c, maxSessions)
+	}
+	n.Drain()
+	n.acceptOffer(t0, addr(41), offerTo(n, n.lsts[1], seededKey(250), "member"))
+	_, evs := n.Drain()
+	got := false
+	for _, e := range evs {
+		if in, ok := e.(Incoming); ok && in.Listener == pubOf(seededKey(2)) {
+			got = true
+		}
+	}
+	if !got {
+		t.Fatal("a flood to one key locked another out")
 	}
 }
 
@@ -308,5 +319,26 @@ func TestSecondMoveInRoundNotLost(t *testing.T) {
 	n.maintain(t0.Add(3 * time.Second))
 	if n.recordSeq[target] <= seq {
 		t.Fatal("maintenance didn't re-sign for the second move")
+	}
+}
+
+// TestSameMoveReportedByManyResignsOnce: holders reporting the one move
+// already re-signed for leave nothing due.
+func TestSameMoveReportedByManyResignsOnce(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	l := n.lsts[0]
+	var target krpc.NodeID
+	for _, tg := range l.records {
+		target = tg
+	}
+	old, moved := netip.MustParseAddrPort("192.0.2.1:1000"), netip.MustParseAddrPort("192.0.2.9:2000")
+	for i := range 3 {
+		h := &holder{addr: addr(60 + i), target: target, mapped: old}
+		l.holders = append(l.holders, h)
+		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: moved})
+	}
+	if l.resignDue {
+		t.Fatal("holders reporting the move already re-signed for left a re-sign due")
 	}
 }

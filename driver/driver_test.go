@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -809,8 +810,9 @@ func TestUndoReconciles(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, c, _ := ed25519.GenerateKey(rand.Reader)
-	if err := n.Listen(ctx, &budget{k: c, n: 1}); !errors.Is(err, dht.ErrSigner) {
-		t.Fatalf("a signer failing for one family: %v", err)
+	err := n.Listen(ctx, &budget{k: c, n: 1})
+	if !errors.Is(err, dht.ErrSigner) || !strings.Contains(err.Error(), "dropped everywhere") {
+		t.Fatalf("a failed restore should name what it dropped: %v", err)
 	}
 	var sets [][][32]byte
 	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
