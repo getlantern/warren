@@ -112,11 +112,13 @@ Warren's signaling records are signed by the listener key and stored by
 holders next to the listener's address, so a holder sees a key that changes
 every hour and means nothing without `G`.
 
-A device in several groups listens under one rendezvous key per group, each
-on its own socket. That hides the link from holders only where a shared NAT
-or carrier-grade NAT puts many devices behind one address. On a public
-address, a holder of two of the device's records sees one IP behind both and
-can link the memberships. That is a stated non-goal for v1 (*Goals*);
+A device in several groups listens under one rendezvous key per group.
+`group/node`'s `Host` puts them all on one endpoint, so one socket: a holder
+of two of the device's records sees the same address and port behind both
+and can link the memberships, even behind a shared or carrier-grade NAT.
+Separate hosts, one per group, put each on its own socket; that hides the
+link only where such a NAT puts many devices behind one address, and on a
+public address one IP behind both still links them. That is a stated non-goal for v1 (*Goals*);
 routing each group's listening through different relays could close it
 later.
 

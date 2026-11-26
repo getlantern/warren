@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -147,20 +148,32 @@ func (x *group) join(t *testing.T, h *Host, id *keys.Identity, r *roster.Roster)
 	}
 }
 
+// post appends an app entry to id's log on n, through Do.
+func post(t *testing.T, n *Node, id *keys.Identity, msg string) {
+	t.Helper()
+	err := n.Do(func(r *roster.Roster, logs *memberlog.Set) error {
+		f, err := r.Fold()
+		if err != nil {
+			return err
+		}
+		e, err := memberlog.Write(id, r.Group(), nil, f.Current, r.Keyring(id).Epochs[f.Current], memberlog.App, []byte(msg))
+		if err != nil {
+			return err
+		}
+		_, err = logs.Add(e)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMembersSyncOverNetwork(t *testing.T) {
 	seed := network(t, 10)
 	x := newGroup(t)
 	a := x.join(t, host(t, seed), x.m1, x.r)
 	b := x.join(t, host(t, seed), x.m2, x.r)
-	f, _ := a.cfg.Roster.Fold()
-	ep := a.cfg.Roster.Keyring(x.m1).Epochs[f.Current]
-	e, err := memberlog.Write(x.m1, x.r.Group(), nil, f.Current, ep, memberlog.App, []byte("hello group"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.cfg.Logs.Add(e); err != nil {
-		t.Fatal(err)
-	}
+	post(t, a, x.m1, "hello group")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	// Ticks alongside the session, which the race detector checks.
@@ -417,6 +430,17 @@ func TestAdmits(t *testing.T) {
 	if h.authorize(rv(x.m2, p), rv(x.m2, p)) {
 		t.Fatal("a listener the host doesn't hold admitted a caller")
 	}
+	// A member added through Do is admitted at once.
+	newcomer := me(7)
+	if err := n.Do(func(r *roster.Roster, _ *memberlog.Set) error {
+		_, err := (&roster.Writer{R: r, Me: x.owner}).Add(newcomer.Public(), "n", roster.Member, keys.PublicKey{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !n.admits(rv(newcomer, p)) {
+		t.Fatal("a member added through Do wasn't admitted")
+	}
 }
 
 // TestJoinFailureLeavesNothing: a join that can't listen isn't left on the
@@ -584,14 +608,7 @@ func TestSyncAllCarriesOn(t *testing.T) {
 	x := newGroup(t)
 	a := x.join(t, host(t, seed), x.m1, x.r)
 	b := x.join(t, host(t, seed), x.m2, x.r) // the owner never joins
-	f, _ := a.cfg.Roster.Fold()
-	e, err := memberlog.Write(x.m1, x.r.Group(), nil, f.Current, a.cfg.Roster.Keyring(x.m1).Epochs[f.Current], memberlog.App, []byte("hi"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.cfg.Logs.Add(e); err != nil {
-		t.Fatal(err)
-	}
+	post(t, a, x.m1, "hi")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := a.SyncAll(ctx); err == nil {
@@ -632,5 +649,61 @@ func TestPublishSightings(t *testing.T) {
 	}
 	if _, ok := got[x.m2.Public()]; !ok {
 		t.Fatal("the directory didn't show the member that was reached")
+	}
+}
+
+// TestTwoGroupsOnOneHost: a host routes each call to the group listening
+// under the key called, not just the first group it joined.
+func TestTwoGroupsOnOneHost(t *testing.T) {
+	seed := network(t, 10)
+	x, y := newGroup(t), newGroup(t) // the same members, two groups
+	h := host(t, seed)
+	x.join(t, h, x.m1, x.r)
+	ny := y.join(t, h, y.m1, y.r)
+	b := y.join(t, host(t, seed), y.m2, y.r)
+	post(t, ny, y.m1, "to the second group")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := b.Call(ctx, y.m1.Public()); err != nil {
+		t.Fatalf("calling the second group on a host: %v", err)
+	}
+	var got int
+	_ = b.Do(func(_ *roster.Roster, logs *memberlog.Set) error {
+		if l := logs.Log(y.m1.Public()); l != nil {
+			got = len(l.Entries())
+		}
+		return nil
+	})
+	if got != 1 {
+		t.Fatal("the second group's entry didn't sync")
+	}
+}
+
+// TestSyncAllOrder: SyncAll calls the members reached most recently first.
+func TestSyncAllOrder(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	x.join(t, host(t, seed), x.m2, x.r)
+	x.join(t, host(t, seed), x.owner, x.r)
+	// Reach first the member that key order would put first, so recency
+	// and key order disagree.
+	first, last := x.owner.Public(), x.m2.Public()
+	if slices.Compare(first[:], last[:]) > 0 {
+		first, last = last, first
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, m := range []keys.PublicKey{first, last} {
+		if err := a.Call(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.SyncAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	seen := a.Seen()
+	if !seen[last].Before(seen[first]) {
+		t.Fatal("SyncAll didn't call the most recently reached member first")
 	}
 }

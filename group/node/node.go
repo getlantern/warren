@@ -163,7 +163,8 @@ func (h *Host) accept(ctx context.Context) {
 	}
 }
 
-// Config is one group a host joins.
+// Config is one group a host joins. Once joined, its Roster and Logs are
+// shared with the group's sessions: use Node.Do to reach them.
 type Config struct {
 	Me     *keys.Identity
 	Group  keys.Secret
@@ -265,8 +266,7 @@ type rolesView struct {
 
 // Tick brings the listeners up to the clock: this and the next period's
 // rendezvous keys, the older ones dropped, and the admission set rebuilt.
-// Run it every few minutes (and after a roster change from outside a
-// session).
+// Run it every few minutes.
 func (n *Node) Tick(ctx context.Context) error {
 	err := n.rotate(ctx)
 	// After lmu is released, as the host's admission and routing take it.
@@ -458,7 +458,7 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 			return
 		}
 		if _, err := n.session(ctx, stream, c, false); err == nil {
-			n.linger(stream)
+			n.linger(ctx, stream)
 		}
 	})
 	if err != nil {
@@ -512,6 +512,17 @@ func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, c
 	return peer, err
 }
 
+// Do runs fn on the group's roster and logs, which a joined group shares
+// with its sessions: change or read them only through Do. It waits for a
+// running session to end, and refreshes what the group admits afterwards.
+func (n *Node) Do(fn func(*roster.Roster, *memberlog.Set) error) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	err := fn(n.cfg.Roster, n.cfg.Logs)
+	n.refresh()
+	return err
+}
+
 // view is the roster's members as of the last refresh.
 func (n *Node) view() (map[keys.PublicKey]roster.Role, error) {
 	v := n.roles.Load()
@@ -524,12 +535,14 @@ func (n *Node) view() (map[keys.PublicKey]roster.Role, error) {
 // writes done once its session has ended, which needs the other's last
 // frame, so reading the peer's done means ours arrived. It waits no
 // longer than a call.
-func (n *Node) linger(stream net.Conn) {
+func (n *Node) linger(ctx context.Context, stream net.Conn) {
+	t := time.AfterFunc(n.cfg.CallTimeout, func() { _ = stream.Close() })
+	defer t.Stop()
+	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
+	defer stop()
 	if _, err := stream.Write([]byte{doneMark}); err != nil {
 		return
 	}
-	t := time.AfterFunc(n.cfg.CallTimeout, func() { _ = stream.Close() })
-	defer t.Stop()
 	var b [1]byte
 	_, _ = io.ReadFull(stream, b[:])
 }
@@ -634,7 +647,7 @@ func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) (time.
 	_, err = n.session(ctx, stream, c, true)
 	rtt := time.Since(start)
 	if err == nil {
-		n.linger(stream)
+		n.linger(ctx, stream)
 	}
 	return rtt, err
 }
