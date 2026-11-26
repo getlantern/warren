@@ -428,3 +428,27 @@ func TestSameAddressSpreadOverPasses(t *testing.T) {
 		t.Fatalf("%d signs at the first report (want 1); %d over 6 passes, %d without the move", first, got, base)
 	}
 }
+
+// TestReturnToEarlierAddressResigns: moving back to an address re-signed
+// for before (A, then B, then A) is acted on again.
+func TestReturnToEarlierAddressResigns(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	l := n.lsts[0]
+	var target krpc.NodeID
+	for _, tg := range l.records {
+		target = tg
+	}
+	c := netip.MustParseAddrPort("203.0.113.5:5000")
+	a, b := netip.MustParseAddrPort("192.0.2.1:1000"), netip.MustParseAddrPort("198.51.100.7:4000")
+	h := &holder{addr: addr(60), target: target, mapped: c}
+	l.holders = append(l.holders, h)
+	keep := krpc.Return{V: []byte("1:v")}
+	n.keepaliveReply(t0.Add(time.Minute), h, &krpc.Msg{IP: a, R: keep})   // acted on: A
+	n.keepaliveReply(t0.Add(2*time.Minute), h, &krpc.Msg{IP: b, R: keep}) // acted on: B
+	seq := n.recordSeq[target]
+	n.keepaliveReply(t0.Add(3*time.Minute), h, &krpc.Msg{IP: a, R: keep}) // back to A
+	if n.recordSeq[target] <= seq && !l.resignDue {
+		t.Fatal("a return to an earlier address was skipped")
+	}
+}
