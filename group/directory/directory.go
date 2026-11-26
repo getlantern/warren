@@ -324,12 +324,13 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 		if _, err := d.Store.PutMutable(ctx, m, nil); err != nil {
 			return err
 		}
+		hi = m.Seq // replicas that took this put refuse another value at its number
 		back, backSeq, err := d.readShard(ctx, p, shard, byRendezvous)
 		if err != nil {
 			return err
 		}
 		known, hi = merge(known, back), max(hi, backSeq)
-		if present(back, mine) {
+		if present(back, mine, known) {
 			return nil
 		}
 	}
@@ -338,15 +339,16 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 
 // present reports whether every one of mine is in got, at least as
 // recent, unless Seal's own capacity policy (newest first, by time then
-// key) would leave it out of a shard holding got and mine: a displaced
-// entry means a concurrent writer, an evicted one doesn't.
-func present(got, mine []Entry) bool {
+// key) would leave it out of a shard holding everything known (read so
+// far, got included) and mine: a displaced entry means a concurrent
+// writer, an evicted one doesn't, even when a stale read-back shows less.
+func present(got, mine, known []Entry) bool {
 	at := map[keys.PublicKey]time.Time{}
 	for _, e := range got {
 		at[e.Key] = e.Seen
 	}
 	kept := map[keys.PublicKey]bool{}
-	for _, e := range newest(merge(got, mine)) {
+	for _, e := range newest(merge(known, got, mine)) {
 		kept[e.Key] = true
 	}
 	for _, e := range mine {

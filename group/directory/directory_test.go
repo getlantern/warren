@@ -481,3 +481,56 @@ func TestRetryPutsAboveReadBack(t *testing.T) {
 		t.Fatalf("a retry below the sequence number its read-back saw: %v", err)
 	}
 }
+
+// TestRetryAboveItsOwnPut: a retry after a stale read-back puts above its
+// own first put, so the merge it learned meanwhile is stored, not refused
+// at the first put's number.
+func TestRetryAboveItsOwnPut(t *testing.T) {
+	r := newReplicas(2)
+	a, b, c := member(1), member(2), member(3)
+	seal := func(seq int64, es ...Entry) dht.MutableItem {
+		v, _ := Seal(g, p, 0, es)
+		m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), seq, v)
+		return m
+	}
+	start := seal(5, Entry{Key: rendezvous(c, p), Seen: now})
+	r.held[0][target(start.Key, start.Salt)] = start
+	r.held[1][target(start.Key, start.Salt)] = start
+	r.puts = func() []int { return []int{0} }
+	r.after = func() { // a value at seq 5 with b, on replica 1 only
+		m := seal(5, Entry{Key: rendezvous(c, p), Seen: now}, Entry{Key: rendezvous(b, p), Seen: now})
+		r.held[1][target(m.Key, m.Salt)] = m
+	}
+	r.onGet = func(n int) { r.hidden = map[int]bool{0: n == 2 || n == 3} } // stale: replica 1 only
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	if err := d.Write(context.Background(), p, members(a, b, c), []Entry{{Key: rendezvous(a, p), Seen: now}}); err != nil {
+		t.Fatal(err)
+	}
+	r.onGet, r.hidden = nil, nil
+	stored, _ := Open(g, p, 0, r.held[0][target(start.Key, start.Salt)].V)
+	if !slices.ContainsFunc(stored, func(e Entry) bool { return e.Key == rendezvous(b, p) }) {
+		t.Fatal("the retry's merge, with b, wasn't stored")
+	}
+}
+
+// TestEvictionSurvivesStaleReadBack: a writer whose entry its own capacity
+// policy evicted (a shard full of newer ones) isn't misled by an empty
+// read-back into reporting displacement.
+func TestEvictionSurvivesStaleReadBack(t *testing.T) {
+	r := newReplicas(2)
+	ids, es := fullShard(10)
+	for i := range es {
+		es[i].Seen = now // all newer than the writer's
+	}
+	v, _ := Seal(g, p, 0, es)
+	m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 1, v)
+	r.held[0][target(m.Key, m.Salt)] = m
+	r.puts = func() []int { return []int{0} }
+	r.onGet = func(n int) { r.hidden = map[int]bool{0: n%2 == 0} } // read-backs see only the empty replica
+	w := member(250)
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	err := d.Write(context.Background(), p, append(members(ids...), w.Public()), []Entry{{Key: rendezvous(w, p), Seen: now.Add(-time.Hour)}})
+	if err != nil {
+		t.Fatalf("an evicted entry and a stale read-back: %v", err)
+	}
+}
