@@ -12,6 +12,7 @@ import (
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/memberlog"
 	"github.com/getlantern/warren/group/roster"
+	gsync "github.com/getlantern/warren/group/sync"
 )
 
 var now = time.Unix(1_800_000_000, 0)
@@ -398,5 +399,73 @@ func TestSendChainSplits(t *testing.T) {
 	s.sendChain(ops)
 	if len(s.out) != len(ops) {
 		t.Fatalf("%d frames for %d operations, one each at this chunk size", len(s.out), len(ops))
+	}
+}
+
+// TestSendChainFitsFrames: many small operations at the default chunk
+// size, with their encoding overhead, still fit each frame.
+func TestSendChainFitsFrames(t *testing.T) {
+	x := newGroup(t)
+	op := x.r.Op(x.r.IDs()[1])
+	ops := make([]*roster.Op, 4*chainChunk/len(op.Encode()))
+	for i := range ops {
+		ops[i] = op
+	}
+	s := &session{out: make(chan []byte, 64)}
+	s.sendChain(ops)
+	for len(s.out) > 0 {
+		if f := <-s.out; len(f)-4 > maxFrame {
+			t.Fatalf("a %d-byte chain frame, past the %d limit", len(f)-4, maxFrame)
+		}
+	}
+}
+
+// TestFailedSyncKeepsLogsCurrent: a peer that sends a removal in an
+// unfinished batch of operations and drops leaves the callee's logs
+// following the roster that now holds it.
+func TestFailedSyncKeepsLogsCurrent(t *testing.T) {
+	x := newGroup(t)
+	c := x.member(t, x.owner, x.r) // the callee, before the removal
+	rm, err := (&roster.Writer{R: x.r, Me: x.owner}).Remove(x.m2.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	a, b := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), b, Config{Me: c.id, Group: x.g, Roster: c.r, Logs: c.logs, Secret: secret,
+			Local: x.rendezvous(x.owner), Peer: x.rendezvous(x.m1), Now: now})
+		done <- err
+	}()
+	// m1, admitted properly, then a batch with More and a drop.
+	peer := &session{conn: a, cfg: Config{Me: x.m1, Roster: x.r, Secret: secret, Caller: true,
+		Local: x.rendezvous(x.m1), Peer: x.rendezvous(x.owner)}}
+	go func() {
+		for {
+			if _, _, err := peer.read(); err != nil {
+				return
+			}
+		}
+	}()
+	frame := func(kind byte, body []byte) []byte {
+		return append(append(binary.BigEndian.AppendUint32(nil, uint32(len(body)+1)), kind), body...)
+	}
+	sig := x.m1.Sign(peer.proofFor(true))
+	pub := x.m1.Public()
+	hello := bencode.Append(nil, bencode.Value{Kind: bencode.Dict, Dict: []bencode.Pair{
+		{Key: []byte("h"), Value: bencode.Value{Kind: bencode.List}},
+		{Key: []byte("k"), Value: bencode.Value{Kind: bencode.String, Str: pub[:]}},
+		{Key: []byte("s"), Value: bencode.Value{Kind: bencode.String, Str: sig}},
+	}})
+	a.Write(frame(frameHello, hello))
+	a.Write(frame(frameSync, gsync.Encode(gsync.Have{IDs: c.r.IDs()})))
+	a.Write(frame(frameSync, gsync.Encode(gsync.Ops{Ops: []*roster.Op{rm}, More: true})))
+	a.Close()
+	if err := <-done; err == nil {
+		t.Fatal("an unfinished session succeeded")
+	}
+	if _, down, _ := c.logs.Next(x.m2.Public()); !down {
+		t.Fatal("the logs didn't follow a removal the roster took before the drop")
 	}
 }

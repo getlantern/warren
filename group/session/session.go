@@ -273,11 +273,12 @@ func (s *session) sendChain(ops []*roster.Op) {
 	}
 	for _, o := range ops {
 		b := o.Encode()
-		if size+len(b) > chainChunk {
+		n := len(b) + 16 // its string's length prefix, with room to spare
+		if size+n > chainChunk && len(cur) > 0 {
 			flush()
 		}
 		cur = append(cur, bencode.Value{Kind: bencode.String, Str: b})
-		size += len(b)
+		size += n
 	}
 	flush()
 }
@@ -446,8 +447,18 @@ func (s *session) transportMatches(member keys.PublicKey) bool {
 	return !s.cfg.Caller && s.viaSync()
 }
 
-// sync runs the group/sync exchange to its end.
-func (s *session) sync() error {
+// sync runs the group/sync exchange to its end. On failure the logs are
+// brought up to the roster as it now stands: operations taken before the
+// session failed (a removal in a batch the peer never finished) stay in
+// the roster, so the logs must follow them.
+func (s *session) sync() (err error) {
+	defer func() {
+		if err != nil {
+			if f, ferr := s.cfg.Roster.Fold(); ferr == nil {
+				_ = s.cfg.Logs.Update(f)
+			}
+		}
+	}()
 	x := gsync.New(s.cfg.Roster, s.cfg.Logs)
 	for _, m := range x.Start() {
 		s.send(frameSync, gsync.Encode(m))
