@@ -193,3 +193,36 @@ func TestMappingChangeResignsEveryListener(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionIDUniqueAcrossListeners: an offer to another of our keys
+// reusing a live session's ID is refused, so Answer reaches the caller
+// that made the session.
+func TestSessionIDUniqueAcrossListeners(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	n.AddListener(t0, seededKey(2))
+	n.Drain()
+	first := offerTo(n, n.lsts[0], seededKey(9), "genuine")
+	if !n.acceptOffer(t0, addr(40), first) {
+		t.Fatal("offer refused")
+	}
+	// Another offer, to the second key, under the first one's session ID.
+	reuse := offerTo(n, n.lsts[1], seededKey(10), "reused id")
+	var target krpc.NodeID
+	for _, tg := range n.lsts[1].records {
+		target = tg
+	}
+	salt := offerSalt(first.Salt[:16], target)
+	m, _ := NewMutable(seededKey(10), salt, t0.Unix(), reuse.V)
+	n.acceptOffer(t0, addr(41), &m)
+	_, evs := n.Drain()
+	incoming := 0
+	for _, e := range evs {
+		if _, ok := e.(Incoming); ok {
+			incoming++
+		}
+	}
+	if incoming != 1 || len(n.lsts[1].sessions) != 0 {
+		t.Fatalf("%d offers delivered; the reused session ID was taken", incoming)
+	}
+}

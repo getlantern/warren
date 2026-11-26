@@ -835,6 +835,14 @@ func (n *Node) acceptOffer(now time.Time, from netip.AddrPort, m *MutableItem) b
 		}
 		return true
 	}
+	// The caller picks the session ID (the salt's first half): one already
+	// in use under any listener is refused, so Answer can never seal one
+	// caller's answer for another who reused its ID with another key.
+	for _, x := range n.lsts {
+		if x.sessions[SessionID(m.Salt[:16])] != nil {
+			return true
+		}
+	}
 	sealed, ok := decodeString(m.V)
 	if !ok || len(sealed) < 32 {
 		return true
