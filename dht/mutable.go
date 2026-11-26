@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"crypto"
 	"crypto/ed25519"
 	"crypto/sha1"
 	"errors"
@@ -35,16 +36,49 @@ type MutableItem struct {
 	Sig  [64]byte
 }
 
+// ErrSigner means a signer is nil, its key isn't an Ed25519 key, or it
+// failed to sign.
+var ErrSigner = errors.New("dht: not a usable ed25519 signer")
+
+// SignerKey returns s's Ed25519 public key. Every key this package signs
+// with is a crypto.Signer: an ed25519.PrivateKey, or anything else that
+// signs Ed25519 messages whole (a blinded key, a key in hardware).
+func SignerKey(s crypto.Signer) ([32]byte, error) {
+	if s == nil {
+		return [32]byte{}, ErrSigner
+	}
+	pk, ok := s.Public().(ed25519.PublicKey)
+	if !ok || len(pk) != ed25519.PublicKeySize {
+		return [32]byte{}, ErrSigner
+	}
+	return [32]byte(pk), nil
+}
+
+// sign signs msg whole with s, as Ed25519 does.
+func sign(s crypto.Signer, msg []byte) ([64]byte, error) {
+	sig, err := s.Sign(nil, msg, crypto.Hash(0))
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return [64]byte{}, ErrSigner
+	}
+	return [64]byte(sig), nil
+}
+
 // NewMutable signs v under priv.
-func NewMutable(priv ed25519.PrivateKey, salt []byte, seq int64, v []byte) (MutableItem, error) {
+func NewMutable(priv crypto.Signer, salt []byte, seq int64, v []byte) (MutableItem, error) {
 	if len(v) > MaxValueSize {
 		return MutableItem{}, ErrTooLarge
 	}
 	if len(salt) > MaxSaltSize {
 		return MutableItem{}, ErrSaltTooLarge
 	}
-	m := MutableItem{Key: [32]byte(priv.Public().(ed25519.PublicKey)), Salt: salt, Seq: seq, V: v}
-	m.Sig = [64]byte(ed25519.Sign(priv, signedPayload(salt, seq, v)))
+	key, err := SignerKey(priv)
+	if err != nil {
+		return MutableItem{}, err
+	}
+	m := MutableItem{Key: key, Salt: salt, Seq: seq, V: v}
+	if m.Sig, err = sign(priv, signedPayload(salt, seq, v)); err != nil {
+		return MutableItem{}, err
+	}
 	return m, nil
 }
 

@@ -623,11 +623,14 @@ so an app chooses where data lives and how much.
    scalar hashes the factor with the member key, and a blinded key signs
    standard Ed25519 signatures from its expanded scalar. A blinded key is a
    bare scalar, not an `ed25519.PrivateKey`, so every API that takes or
-   keeps a signing key moves to a signer interface (`keys.Signer`) that can
-   sign with one: listening
-   (`endpoint.Listen`, `driver.Node.Listen`, `dht.Node.Listen`/`ListenKey`),
-   calling (`endpoint.Connect`, `driver.Node.Signal`, `dht.Node.Signal`),
-   and the identity a `Conn` keeps to sign migration and resume offers.
+   keeps a signing key takes a `crypto.Signer` of an Ed25519 key instead
+   (built): listening (`endpoint.Listen`, `driver.Node.Listen`,
+   `dht.Node.Listen`/`ListenKey`), calling (`endpoint.Connect`,
+   `driver.Node.Signal`, `dht.Node.Signal`), mutable items
+   (`dht.NewMutable`), the identity a `Conn` keeps to sign migration and
+   resume offers, and hy2's server certificate. An `ed25519.PrivateKey` is
+   one, so existing callers are unchanged; `keys.CryptoSigner` adapts a
+   blinded `keys.Signer`.
 3. **Mutable-item puts** from the endpoint, for the directory (the DHT
    supports them; the endpoint doesn't expose puts yet), and **reads that
    return every distinct value** the replicas hold, including different

@@ -24,10 +24,10 @@ package dht
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/ed25519"
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -377,7 +377,7 @@ type session struct {
 const maxSessionRelays = 4
 
 type listener struct {
-	priv     ed25519.PrivateKey
+	priv     crypto.Signer
 	pub      [32]byte
 	x        *ecdh.PrivateKey
 	records  map[int64]krpc.NodeID // epoch → record target
@@ -389,7 +389,7 @@ type listener struct {
 }
 
 // Listen publishes a signaling record for priv's key and keeps it reachable.
-func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
+func (n *Node) Listen(now time.Time, priv crypto.Signer) error {
 	x, err := ecdh.X25519().NewPrivateKey(n.randBytes(32))
 	if err != nil {
 		return err
@@ -401,12 +401,16 @@ func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
 // for one identity must share it: they publish the same record target, and
 // a holder that keeps one store across families would otherwise reject one
 // record, or hand callers a key the receiving node can't decrypt with.
-func (n *Node) ListenKey(now time.Time, priv ed25519.PrivateKey, x *ecdh.PrivateKey) error {
+func (n *Node) ListenKey(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey) error {
+	pub, err := SignerKey(priv)
+	if err != nil {
+		return err
+	}
 	// A new identity replaces the old one entirely: its records stop being
 	// republished, since their offers could no longer be decrypted.
 	n.Unlisten()
 	n.lst = &listener{
-		priv: priv, pub: [32]byte(priv.Public().(ed25519.PublicKey)), x: x,
+		priv: priv, pub: pub, x: x,
 		records: map[int64]krpc.NodeID{}, sessions: map[SessionID]*session{}, seen: map[string]time.Time{},
 	}
 	n.ensureRecords(now)
@@ -791,7 +795,7 @@ func (l *listener) tokenFor(s *session, via netip.AddrPort) []byte {
 
 type signalOp struct {
 	op        OpID
-	priv      ed25519.PrivateKey
+	priv      crypto.Signer
 	provider  [32]byte
 	payload   []byte
 	epoch     int64 // the current epoch's
@@ -834,7 +838,10 @@ type offerTry struct {
 // Signal sends payload to provider through the DHT and returns its answer
 // as an Answered event, or SignalFailed. priv signs the offer; the provider
 // sees its public key as the caller's identity.
-func (n *Node) Signal(now time.Time, priv ed25519.PrivateKey, provider [32]byte, payload []byte) (OpID, error) {
+func (n *Node) Signal(now time.Time, priv crypto.Signer, provider [32]byte, payload []byte) (OpID, error) {
+	if _, err := SignerKey(priv); err != nil {
+		return 0, err
+	}
 	if len(payload) > MaxSignalPayload {
 		return 0, ErrPayloadTooLarge
 	}

@@ -2,9 +2,11 @@ package endpoint
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/getlantern/warren/dht"
 	"github.com/getlantern/warren/driver"
+	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/krpc"
 	"github.com/getlantern/warren/overlay"
 )
@@ -77,7 +80,7 @@ func phone(t *testing.T, seed netip.AddrPort) *Endpoint {
 	return e
 }
 
-func listenAndWait(t *testing.T, e *Endpoint, k ed25519.PrivateKey) {
+func listenAndWait(t *testing.T, e *Endpoint, k crypto.Signer) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -147,6 +150,58 @@ func TestConnectByPublicKey(t *testing.T) {
 	}
 	roundTrip(t, out, in, "hello provider")
 	roundTrip(t, in, out, "hello caller")
+}
+
+// TestConnectUnderBlindedKeys: both ends sign with blinded keys, which
+// have no seed and so aren't ed25519.PrivateKeys; the caller reaches the
+// provider by its blinded public key, and each sees the other's.
+func TestConnectUnderBlindedKeys(t *testing.T) {
+	seed := network(t, 10)
+	provider, caller := phone(t, seed), phone(t, seed)
+	var g keys.Secret
+	g[0] = 7
+	pk := keys.CryptoSigner(keys.IdentityFromSeed([32]byte{1}).Rendezvous(g, 42))
+	ck := keys.CryptoSigner(keys.IdentityFromSeed([32]byte{2}).Rendezvous(g, 42))
+	listenAndWait(t, provider, pk)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	accepted := make(chan *Conn, 1)
+	go func() {
+		c, err := provider.Accept(ctx)
+		if err != nil {
+			t.Error(err)
+		}
+		accepted <- c
+	}()
+	ppub, cpub := [32]byte(pk.Public().(ed25519.PublicKey)), [32]byte(ck.Public().(ed25519.PublicKey))
+	out, err := caller.Connect(ctx, ck, ppub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	in := <-accepted
+	if in == nil {
+		t.Fatal("nothing accepted")
+	}
+	defer in.Close()
+	if out.PeerKey != ppub || in.PeerKey != cpub {
+		t.Errorf("peer keys: caller sees %x, provider sees %x", out.PeerKey[:4], in.PeerKey[:4])
+	}
+	roundTrip(t, out, in, "hello, blinded provider")
+}
+
+func TestConnectRefusesBadSigner(t *testing.T) {
+	seed := network(t, 4)
+	e := phone(t, seed)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := e.Connect(ctx, nil, [32]byte{1}); !errors.Is(err, dht.ErrSigner) {
+		t.Fatalf("connect with no signer: %v", err)
+	}
+	if err := e.Listen(ctx, nil); err == nil {
+		t.Fatal("listened with no signer")
+	}
 }
 
 func TestConcurrentCallers(t *testing.T) {

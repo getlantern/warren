@@ -1,6 +1,7 @@
 package keys
 
 import (
+	"crypto"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/sha512"
@@ -19,6 +20,25 @@ type PublicKey [32]byte
 type Signer interface {
 	Public() PublicKey
 	Sign(msg []byte) []byte
+}
+
+// CryptoSigner adapts s to a crypto.Signer, the form warren's endpoint,
+// driver, dht and hy2 take a key in, so a member can listen and connect
+// under a blinded key. It signs messages whole, as Ed25519 does.
+func CryptoSigner(s Signer) crypto.Signer { return cryptoSigner{s} }
+
+type cryptoSigner struct{ s Signer }
+
+func (c cryptoSigner) Public() crypto.PublicKey {
+	pk := c.s.Public()
+	return ed25519.PublicKey(pk[:])
+}
+
+func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	if opts != nil && opts.HashFunc() != 0 {
+		return nil, errors.New("keys: Ed25519 signs messages whole, not digests")
+	}
+	return c.s.Sign(msg), nil
 }
 
 // Verify reports whether sig is pk's signature of msg, and pk is a usable

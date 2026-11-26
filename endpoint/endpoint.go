@@ -11,7 +11,7 @@ package endpoint
 
 import (
 	"context"
-	"crypto/ed25519"
+	"crypto"
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -105,7 +105,7 @@ type Conn struct {
 	e        *Endpoint
 	resume   [16]byte
 	outbound bool
-	identity ed25519.PrivateKey // signs resume offers; outbound only
+	identity crypto.Signer // signs resume offers; outbound only
 	// migrateSlot serializes migrations of this connection: a newer one
 	// waits for one in flight and then runs, so the latest network change
 	// always gets the last word (a one-slot semaphore, so a waiter can give
@@ -623,7 +623,7 @@ func defaultRoutes() [2]netip.Addr {
 
 // Listen makes this endpoint reachable under priv's key; accept connections
 // with Accept.
-func (e *Endpoint) Listen(ctx context.Context, priv ed25519.PrivateKey) error {
+func (e *Endpoint) Listen(ctx context.Context, priv crypto.Signer) error {
 	return e.node.Listen(ctx, priv)
 }
 
@@ -680,7 +680,7 @@ func (e *Endpoint) enqueue(c *Conn) {
 }
 
 // Connect reaches peer by public key, signing the offer with identity.
-func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, peer [32]byte) (*Conn, error) {
+func (e *Endpoint) Connect(ctx context.Context, identity crypto.Signer, peer [32]byte) (*Conn, error) {
 	// An outbound connection is owned by the endpoint until it is returned:
 	// Close cancels it and waits for its runner and sockets to be released.
 	e.mu.Lock()
@@ -754,7 +754,7 @@ type punched struct {
 // identity is set only for outbound connections. While the endpoint refuses
 // new connections it registers nothing and returns nil; the caller closes
 // the socket.
-func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed25519.PrivateKey) *Conn {
+func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity crypto.Signer) *Conn {
 	c := &Conn{
 		Remote: pd.remote, PeerKey: peer, Secret: secret, Relayed: pd.relayed,
 		p: newPath(pd.sock, pd.remote), e: e, resume: resumeID(secret),

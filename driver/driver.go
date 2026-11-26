@@ -8,8 +8,8 @@ package driver
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdh"
-	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -744,7 +744,7 @@ func (n *Node) Snapshot(ctx context.Context) ([]byte, error) {
 // Listen makes us reachable for signaling under priv's key on every node, so
 // callers of either family can reach us. Offers arrive as dht.Incoming on
 // Events; reply with Answer.
-func (n *Node) Listen(ctx context.Context, priv ed25519.PrivateKey) error {
+func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
 	// One signaling key for every family, so their records are identical.
 	x, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -777,7 +777,7 @@ func (n *Node) Answer(ctx context.Context, s dht.SessionID, payload []byte) erro
 
 // Signal sends payload to provider through every node and returns the first
 // answer, or the last failure if none answers.
-func (n *Node) Signal(ctx context.Context, priv ed25519.PrivateKey, provider [32]byte, payload []byte) ([]byte, error) {
+func (n *Node) Signal(ctx context.Context, priv crypto.Signer, provider [32]byte, payload []byte) ([]byte, error) {
 	payload = append([]byte(nil), payload...) // a slower family reads it after we return
 	got, partial, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		op, err := d.Signal(now, priv, provider, payload)
