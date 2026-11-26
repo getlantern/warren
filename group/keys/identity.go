@@ -38,6 +38,9 @@ func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]b
 	if opts != nil && opts.HashFunc() != 0 {
 		return nil, errors.New("keys: Ed25519 signs messages whole, not digests")
 	}
+	if o, ok := opts.(*ed25519.Options); ok && o.Context != "" {
+		return nil, errors.New("keys: no Ed25519ctx: a blinded key signs pure Ed25519 only")
+	}
 	return c.s.Sign(msg), nil
 }
 

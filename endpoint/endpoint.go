@@ -681,6 +681,10 @@ func (e *Endpoint) enqueue(c *Conn) {
 
 // Connect reaches peer by public key, signing the offer with identity.
 func (e *Endpoint) Connect(ctx context.Context, identity crypto.Signer, peer [32]byte) (*Conn, error) {
+	// Before any socket is punched: a bad signer would fail only at Signal.
+	if _, err := dht.SignerKey(identity); err != nil {
+		return nil, err
+	}
 	// An outbound connection is owned by the endpoint until it is returned:
 	// Close cancels it and waits for its runner and sockets to be released.
 	e.mu.Lock()

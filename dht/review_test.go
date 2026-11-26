@@ -292,7 +292,7 @@ func TestRecordSeqPruneKeepsLiveEntries(t *testing.T) {
 	for e := range n.lst.records {
 		epoch = e
 	}
-	prev := n.signRecord(t0, epoch-1)
+	prev, _ := n.signRecord(t0, epoch-1)
 	for range 5 {
 		n.signRecord(t0, epoch-1) // several re-signs in one second: ahead of the clock
 	}

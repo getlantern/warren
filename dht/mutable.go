@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha1"
 	"errors"
+	"fmt"
 
 	"github.com/getlantern/warren/bencode"
 	"github.com/getlantern/warren/krpc"
@@ -43,10 +44,17 @@ var ErrSigner = errors.New("dht: not a usable ed25519 signer")
 // SignerKey returns s's Ed25519 public key. Every key this package signs
 // with is a crypto.Signer: an ed25519.PrivateKey, or anything else that
 // signs Ed25519 messages whole (a blinded key, a key in hardware).
-func SignerKey(s crypto.Signer) ([32]byte, error) {
+func SignerKey(s crypto.Signer) (key [32]byte, err error) {
 	if s == nil {
 		return [32]byte{}, ErrSigner
 	}
+	// A typed nil (a nil ed25519.PrivateKey, an adapter around nothing)
+	// passes the check above and panics in Public.
+	defer func() {
+		if recover() != nil {
+			key, err = [32]byte{}, ErrSigner
+		}
+	}()
 	pk, ok := s.Public().(ed25519.PublicKey)
 	if !ok || len(pk) != ed25519.PublicKeySize {
 		return [32]byte{}, ErrSigner
@@ -57,8 +65,11 @@ func SignerKey(s crypto.Signer) ([32]byte, error) {
 // sign signs msg whole with s, as Ed25519 does.
 func sign(s crypto.Signer, msg []byte) ([64]byte, error) {
 	sig, err := s.Sign(nil, msg, crypto.Hash(0))
-	if err != nil || len(sig) != ed25519.SignatureSize {
-		return [64]byte{}, ErrSigner
+	if err != nil {
+		return [64]byte{}, fmt.Errorf("%w: %w", ErrSigner, err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return [64]byte{}, fmt.Errorf("%w: a %d-byte signature", ErrSigner, len(sig))
 	}
 	return [64]byte(sig), nil
 }
@@ -78,6 +89,11 @@ func NewMutable(priv crypto.Signer, salt []byte, seq int64, v []byte) (MutableIt
 	m := MutableItem{Key: key, Salt: salt, Seq: seq, V: v}
 	if m.Sig, err = sign(priv, signedPayload(salt, seq, v)); err != nil {
 		return MutableItem{}, err
+	}
+	// A signer whose signature isn't its public key's would publish items
+	// every peer rejects: catch it here, where it can be reported.
+	if !m.Verify() {
+		return MutableItem{}, fmt.Errorf("%w: its signature doesn't verify under its key", ErrSigner)
 	}
 	return m, nil
 }

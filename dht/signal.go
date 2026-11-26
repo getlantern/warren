@@ -490,7 +490,9 @@ func (n *Node) ensureRecords(now time.Time) {
 	l := n.lst
 	cur := epochOf(now)
 	if _, ok := l.records[cur]; !ok {
-		l.records[cur] = n.signRecord(now, cur)
+		if t, ok := n.signRecord(now, cur); ok {
+			l.records[cur] = t
+		}
 	}
 	for e, t := range l.records {
 		if e < cur-1 {
@@ -501,7 +503,11 @@ func (n *Node) ensureRecords(now time.Time) {
 	}
 }
 
-func (n *Node) signRecord(now time.Time, epoch int64) krpc.NodeID {
+// signRecord signs and stores our record for epoch, reporting its target
+// and whether it signed: a signer can fail (a hardware key unplugged), and
+// then nothing changes, so the record held before keeps being served and
+// the next pass tries again.
+func (n *Node) signRecord(now time.Time, epoch int64) (krpc.NodeID, bool) {
 	l := n.lst
 	salt := RecordSalt(l.pub, epoch)
 	target := MutableTarget(l.pub, salt)
@@ -509,7 +515,10 @@ func (n *Node) signRecord(now time.Time, epoch int64) krpc.NodeID {
 	// Unlisten and Listen (which re-keys): storage nodes reject an equal seq
 	// with a new value (BEP 44 error 302), stranding the stale record.
 	seq := max(now.Unix(), n.recordSeq[target]+1)
-	m, _ := NewMutable(l.priv, salt, seq, encodeRecord([32]byte(l.x.PublicKey().Bytes())))
+	m, err := NewMutable(l.priv, salt, seq, encodeRecord([32]byte(l.x.PublicKey().Bytes())))
+	if err != nil {
+		return target, false
+	}
 	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now}
 	if n.recordSeq == nil {
 		n.recordSeq = map[krpc.NodeID]int64{}
@@ -526,7 +535,7 @@ func (n *Node) signRecord(now time.Time, epoch int64) krpc.NodeID {
 		}
 	}
 	n.recordSeq[target] = seq
-	return target
+	return target, true
 }
 
 const maxRecordSeqs = 64

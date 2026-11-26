@@ -383,3 +383,13 @@ func TestCryptoSigner(t *testing.T) {
 		t.Fatalf("a self-signed certificate under the blinded key: %v", err)
 	}
 }
+
+func TestCryptoSignerRefusesContext(t *testing.T) {
+	cs := CryptoSigner(IdentityFromSeed([32]byte{4}))
+	if _, err := cs.Sign(nil, []byte("m"), &ed25519.Options{Context: "warren"}); err == nil {
+		t.Fatal("signed with an Ed25519ctx context as pure Ed25519")
+	}
+	if _, err := cs.Sign(nil, []byte("m"), &ed25519.Options{}); err != nil {
+		t.Fatalf("pure Ed25519 options: %v", err)
+	}
+}

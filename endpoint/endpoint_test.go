@@ -196,8 +196,11 @@ func TestConnectRefusesBadSigner(t *testing.T) {
 	e := phone(t, seed)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := e.Connect(ctx, nil, [32]byte{1}); !errors.Is(err, dht.ErrSigner) {
-		t.Fatalf("connect with no signer: %v", err)
+	var nilKey ed25519.PrivateKey
+	for _, s := range []crypto.Signer{nil, nilKey, keys.CryptoSigner(nil)} {
+		if _, err := e.Connect(ctx, s, [32]byte{1}); !errors.Is(err, dht.ErrSigner) {
+			t.Fatalf("connect with signer %T: %v", s, err)
+		}
 	}
 	if err := e.Listen(ctx, nil); err == nil {
 		t.Fatal("listened with no signer")
