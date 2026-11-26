@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"bytes"
 	"net/netip"
 	"slices"
 	"time"
@@ -63,10 +64,12 @@ type lookup struct {
 	rec   record // put payload
 	cas   *int64
 	value []byte // immutable get result
-	// Mutable gets: the expected key and salt, and the best verified item.
+	// Mutable gets: the expected key and salt, the newest verified item,
+	// and the MaxGetItems newest distinct ones seen (by signature).
 	key        *[32]byte
 	salt       []byte
 	best       *MutableItem
+	items      []*MutableItem
 	finished   bool
 	queried    int
 	failures   int
@@ -250,4 +253,48 @@ func (l *lookup) closestResponded(k int) []krpc.NodeInfo {
 		}
 	}
 	return out
+}
+
+// observe takes a verified item c returned to a mutable get. The newest is
+// the one SortItems puts first (on equal seq, the lower signature), so
+// Item and Items[0] agree; holders are the nodes storing that very item,
+// not another value at its seq.
+func (l *lookup) observe(mi *MutableItem, c *cand) {
+	switch {
+	case l.best == nil || older(l.best, mi):
+		l.best, l.holders = mi, []*cand{c}
+	case mi.Sig == l.best.Sig:
+		l.holders = append(l.holders, c)
+	}
+	l.keep(mi)
+}
+
+// keep records a verified item a mutable get saw, once per signature,
+// keeping the MaxGetItems newest: old signed items anyone can replay must
+// not crowd out the current ones.
+func (l *lookup) keep(mi *MutableItem) {
+	if slices.ContainsFunc(l.items, func(x *MutableItem) bool { return x.Sig == mi.Sig }) {
+		return
+	}
+	if len(l.items) < MaxGetItems {
+		l.items = append(l.items, mi)
+		return
+	}
+	oldest := 0
+	for i, x := range l.items {
+		if older(x, l.items[oldest]) {
+			oldest = i
+		}
+	}
+	if older(l.items[oldest], mi) {
+		l.items[oldest] = mi
+	}
+}
+
+// older reports whether a sorts after b in SortItems' newest-first order.
+func older(a, b *MutableItem) bool {
+	if a.Seq != b.Seq {
+		return a.Seq < b.Seq
+	}
+	return bytes.Compare(a.Sig[:], b.Sig[:]) > 0
 }

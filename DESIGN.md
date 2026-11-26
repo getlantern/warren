@@ -936,7 +936,9 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       (built: `AddListener`/`RemoveListener`, `Conn.LocalKey`,
       `Config.AuthorizeListener`; `Listen` unchanged);
    3. mutable-item puts from the endpoint, and reads that return every
-      distinct value the replicas hold.
+      distinct value the replicas hold (built: puts through
+      `Endpoint.DHT().PutMutable`; `dht.GetDone.Items` and
+      `driver.Node.GetMutableAll`).
 5. **Sessions and the directory** in the simulator: rendezvous under
    blinded keys, admission (roster, then member-key proof in the
    session), sync sessions under the sync key, join and rejoin sessions,

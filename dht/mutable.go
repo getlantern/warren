@@ -1,12 +1,15 @@
 package dht
 
 import (
+	"bytes"
+	"cmp"
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha1"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/getlantern/warren/bencode"
 	"github.com/getlantern/warren/krpc"
@@ -83,6 +86,22 @@ func sign(s crypto.Signer, msg []byte) (out [64]byte, err error) {
 		return [64]byte{}, fmt.Errorf("%w: a %d-byte signature", ErrSigner, len(sig))
 	}
 	return [64]byte(sig), nil
+}
+
+// MaxGetItems bounds the distinct items a mutable get keeps, so replicas
+// answering with many differently signed values can't grow it without
+// bound.
+const MaxGetItems = 32
+
+// SortItems orders items newest first: by sequence number, then by
+// signature, so the order is the same wherever they were found.
+func SortItems(items []MutableItem) {
+	slices.SortFunc(items, func(a, b MutableItem) int {
+		if a.Seq != b.Seq {
+			return cmp.Compare(b.Seq, a.Seq)
+		}
+		return bytes.Compare(a.Sig[:], b.Sig[:])
+	})
 }
 
 // NewMutable signs v under priv.

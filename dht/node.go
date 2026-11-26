@@ -45,8 +45,15 @@ type GetDone struct {
 	Op     OpID
 	Target krpc.NodeID
 	Value  []byte // nil if not found
-	// Item is the highest-sequence verified item, for mutable gets.
-	Item     *MutableItem
+	// Item is the newest verified item, for mutable gets: highest sequence
+	// number, and on a tie the lower signature, as Items[0].
+	Item *MutableItem
+	// Items is every distinct verified item the get saw (distinct by
+	// signature: different values at one sequence number included), up to
+	// MaxGetItems, newest first. Replicas can disagree, since a BEP 44
+	// compare-and-swap isn't atomic across them, so a reader merging
+	// concurrent writes needs all of them, not just Item.
+	Items    []MutableItem
 	Queried  int
 	Failures int
 	Timing   Timing
@@ -497,6 +504,10 @@ func (n *Node) finish(now time.Time, l *lookup) {
 		if l.best != nil {
 			g.Value, g.Item = l.best.V, l.best
 		}
+		for _, it := range l.items {
+			g.Items = append(g.Items, *it)
+		}
+		SortItems(g.Items)
 		slices.SortFunc(l.holders, func(a, b *cand) int { return compareID(a.dist, b.dist) })
 		n.complete(now, l, g)
 	case putItem:
@@ -659,13 +670,8 @@ func (n *Node) lookupReply(now time.Time, l *lookup, from netip.AddrPort, m *krp
 	}
 	if l.kind == getItem && l.key != nil {
 		if mi, ok := mutableFromReturn(&m.R, l.salt); ok && mi.Key == *l.key && mi.Verify() {
-			switch {
-			case l.best == nil || mi.Seq > l.best.Seq:
-				mi.V = slices.Clone(mi.V)
-				l.best, l.holders = mi, []*cand{c}
-			case mi.Seq == l.best.Seq:
-				l.holders = append(l.holders, c)
-			}
+			mi.V, mi.Salt = slices.Clone(mi.V), slices.Clone(mi.Salt)
+			l.observe(mi, c)
 		}
 	} else if l.kind == getItem && m.R.V != nil && krpc.NodeID(sha1.Sum(m.R.V)) == l.target {
 		l.value = slices.Clone(m.R.V)
