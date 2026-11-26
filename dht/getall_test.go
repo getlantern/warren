@@ -154,3 +154,42 @@ func TestGetKeepsNewestUnderReplays(t *testing.T) {
 		t.Fatal("an item older than every kept one displaced one")
 	}
 }
+
+// TestItemIsItemsFirst: with several values at the top sequence number,
+// Item is the one Items puts first, whatever order replies arrive in.
+func TestItemIsItemsFirst(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	key := [32]byte(priv.Public().(ed25519.PublicKey))
+	salt := []byte("shard")
+	a, _ := NewMutable(priv, salt, 5, ImmutableValue([]byte("alice")))
+	b, _ := NewMutable(priv, salt, 5, ImmutableValue([]byte("bob")))
+	for _, order := range [][]*MutableItem{{&a, &b}, {&b, &a}} {
+		g := getWithReplies(t, key, salt, order)
+		if g.Item == nil || len(g.Items) != 2 || g.Item.Sig != g.Items[0].Sig {
+			t.Fatal("Item isn't Items[0]")
+		}
+	}
+}
+
+// TestHoldersStoreTheItem: a node storing another value at the newest
+// item's seq isn't taken as one of its holders; one storing the same item
+// is.
+func TestHoldersStoreTheItem(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	salt := []byte("shard")
+	a, _ := NewMutable(priv, salt, 5, ImmutableValue([]byte("alice")))
+	b, _ := NewMutable(priv, salt, 5, ImmutableValue([]byte("bob")))
+	first, second := &a, &b
+	if older(first, second) {
+		first, second = second, first
+	}
+	l := &lookup{}
+	c1, c2, c3 := &cand{}, &cand{}, &cand{}
+	l.observe(first, c1)
+	l.observe(second, c2) // another value at the same seq
+	dup := *first
+	l.observe(&dup, c3) // the same item again
+	if l.best.Sig != first.Sig || len(l.holders) != 2 || l.holders[0] != c1 || l.holders[1] != c3 {
+		t.Fatalf("holders %d; want the two storing the newest item", len(l.holders))
+	}
+}

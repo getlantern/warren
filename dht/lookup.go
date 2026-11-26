@@ -255,6 +255,20 @@ func (l *lookup) closestResponded(k int) []krpc.NodeInfo {
 	return out
 }
 
+// observe takes a verified item c returned to a mutable get. The newest is
+// the one SortItems puts first (on equal seq, the lower signature), so
+// Item and Items[0] agree; holders are the nodes storing that very item,
+// not another value at its seq.
+func (l *lookup) observe(mi *MutableItem, c *cand) {
+	switch {
+	case l.best == nil || older(l.best, mi):
+		l.best, l.holders = mi, []*cand{c}
+	case mi.Sig == l.best.Sig:
+		l.holders = append(l.holders, c)
+	}
+	l.keep(mi)
+}
+
 // keep records a verified item a mutable get saw, once per signature,
 // keeping the MaxGetItems newest: old signed items anyone can replay must
 // not crowd out the current ones.

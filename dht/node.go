@@ -670,13 +670,7 @@ func (n *Node) lookupReply(now time.Time, l *lookup, from netip.AddrPort, m *krp
 	if l.kind == getItem && l.key != nil {
 		if mi, ok := mutableFromReturn(&m.R, l.salt); ok && mi.Key == *l.key && mi.Verify() {
 			mi.V, mi.Salt = slices.Clone(mi.V), slices.Clone(mi.Salt)
-			switch {
-			case l.best == nil || mi.Seq > l.best.Seq:
-				l.best, l.holders = mi, []*cand{c}
-			case mi.Seq == l.best.Seq:
-				l.holders = append(l.holders, c)
-			}
-			l.keep(mi)
+			l.observe(mi, c)
 		}
 	} else if l.kind == getItem && m.R.V != nil && krpc.NodeID(sha1.Sum(m.R.V)) == l.target {
 		l.value = slices.Clone(m.R.V)
