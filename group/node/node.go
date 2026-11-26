@@ -145,10 +145,11 @@ type Config struct {
 	// Now is the clock that places the group in a period; nil means
 	// time.Now.
 	Now func() time.Time
-	// CallTimeout bounds one attempt to reach a member, and a session's
-	// admission (a caller holding an admitted key, such as any holder of G
-	// with a sync key, can't hold the group busy past it without proving
-	// it's a member); zero means 15s.
+	// CallTimeout bounds one attempt to reach a member, the wait between
+	// tries of a busy one, and a session's admission (a caller holding an
+	// admitted key, such as any holder of G with a sync key, can't hold the
+	// group busy past it without proving it's a member). A connection with
+	// no session and no new try for twice it is let go. Zero means 15s.
 	CallTimeout time.Duration
 	// SessionTimeout bounds one session; zero means a minute.
 	SessionTimeout time.Duration
@@ -327,13 +328,33 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.SessionTimeout)
 	defer cancel()
+	// The connection ends when its session does, or, with no session
+	// begun, when the caller has used its tries, sends something else, or
+	// goes idle: no stream for idleFor (its tries come at most CallTimeout
+	// apart, and some never reach us, so a count alone can't tell).
 	done := make(chan struct{})
 	var (
 		streams  atomic.Int32 // tries the caller has made
-		started  atomic.Bool  // a session has begun on c
-		doneOnce sync.Once
+		cmu      sync.Mutex   // started and finished, so neither undoes the other
+		started  bool         // a session has begun on c
+		finished bool
 	)
-	finish := func() { doneOnce.Do(func() { close(done) }) }
+	finish := func() {
+		if !finished {
+			finished = true
+			close(done)
+		}
+	}
+	giveUp := func() { // cmu not held
+		cmu.Lock()
+		defer cmu.Unlock()
+		if !started {
+			finish()
+		}
+	}
+	idleFor := 2 * n.cfg.CallTimeout
+	idle := time.AfterFunc(idleFor, giveUp)
+	defer idle.Stop()
 	// Handlers are joined before serve returns, so Host.Close waits for a
 	// session to end and not just for serve.
 	var (
@@ -355,31 +376,41 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 		defer stop()
 		// Each try is a stream; one session per connection.
-		if dest != streamName || streams.Add(1) > busyTries || started.Load() {
+		idle.Reset(idleFor)
+		try := streams.Add(1)
+		if dest != streamName || try > busyTries {
 			return
 		}
 		var b [1]byte
 		if _, err := io.ReadFull(stream, b[:]); err != nil || b[0] != preamble {
-			finish() // not a caller of ours
+			giveUp() // not a caller of ours
 			return
 		}
 		if !n.begin() {
 			// In a session already. Hold the stream until the caller hangs
-			// up, so the answer isn't lost with the teardown; once it has
-			// used its tries, the connection is done.
+			// up, so the answer isn't lost with the teardown.
 			if _, err := stream.Write([]byte{busy}); err == nil {
 				_, _ = io.Copy(io.Discard, stream)
 			}
-			if streams.Load() >= busyTries {
-				finish()
+			if try == busyTries { // the caller's last
+				giveUp()
 			}
 			return
 		}
-		if !started.CompareAndSwap(false, true) {
+		cmu.Lock()
+		if started || finished {
+			cmu.Unlock()
 			n.end()
 			return
 		}
-		defer finish()
+		started = true
+		cmu.Unlock()
+		idle.Stop()
+		defer func() {
+			cmu.Lock()
+			finish()
+			cmu.Unlock()
+		}()
 		if _, err := stream.Write([]byte{answerGo}); err != nil {
 			n.end()
 			return
@@ -493,7 +524,8 @@ func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey
 	// would spend the callee's per-caller budget.
 	// The wait is random over a window that starts at four round trips
 	// (at least busyWait), so two callers retrying at once rarely collide
-	// again even on a slow path, and doubles each try.
+	// again even on a slow path, and doubles each try, up to CallTimeout
+	// (which also keeps our tries within the callee's idle bound).
 	window := busyWait
 	for try := 1; ; try++ {
 		if try > 1 {
@@ -502,13 +534,13 @@ func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey
 			case <-sctx.Done():
 				return true, sctx.Err()
 			}
-			window *= 2
+			window = min(2*window, n.cfg.CallTimeout)
 		}
 		rtt, err := n.try(sctx, cl, c)
 		if !errors.Is(err, ErrBusy) || try == busyTries {
 			return true, err
 		}
-		window = max(window, 4*rtt)
+		window = min(max(window, 4*rtt), n.cfg.CallTimeout)
 	}
 }
 

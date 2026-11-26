@@ -200,7 +200,7 @@ func TestMembersSyncOverNetwork(t *testing.T) {
 
 func eventually(t *testing.T, msg string, ok func() bool) {
 	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); !ok(); time.Sleep(20 * time.Millisecond) {
+	for deadline := time.Now().Add(10 * time.Second); !ok(); time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal(msg)
 		}
@@ -263,6 +263,9 @@ func TestBusyCalleeAnswers(t *testing.T) {
 	if !answered || !errors.Is(err2, ErrBusy) {
 		t.Fatalf("a busy caller: answered=%v err=%v, want ErrBusy", answered, err2)
 	}
+	// None of those tries reached the callee, which lets the idle
+	// connection go well before the session would have timed out.
+	eventually(t, "the callee kept serving a caller whose tries never came", func() bool { return b.h.serving.Load() == 0 })
 	if !errors.Is(err, ErrBusy) {
 		t.Fatalf("got %v, want ErrBusy", err)
 	}
