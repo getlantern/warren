@@ -46,6 +46,9 @@ const (
 var (
 	// ErrMalformed means a shard's value isn't a sealed list of entries.
 	ErrMalformed = errors.New("directory: malformed shard")
+	// ErrTime means a last-seen time outside what a shard can hold: from
+	// the Unix epoch to 2106, in whole seconds.
+	ErrTime = errors.New("directory: last-seen time out of range")
 	// ErrPinned means a shard's sequence number is at its maximum (a
 	// holder of G signed one there), so no newer value can replace it
 	// this period; the next period's directory key gives a fresh slot.
@@ -93,6 +96,11 @@ func slot(p uint64, shard uint32) []byte {
 // Seal encodes and seals entries for shard in period p, as a BEP 44
 // value: at most MaxEntries, the newest kept.
 func Seal(g keys.Secret, p uint64, shard uint32, entries []Entry) ([]byte, error) {
+	for _, e := range entries {
+		if !inRange(e.Seen) {
+			return nil, ErrTime
+		}
+	}
 	entries = newest(entries)
 	pt := make([]byte, 0, len(entries)*entrySize)
 	for _, e := range entries {
@@ -132,6 +140,13 @@ func Open(g keys.Secret, p uint64, shard uint32, v []byte) ([]Entry, error) {
 		out = append(out, Entry{Key: keys.PublicKey(pt[i : i+32]), Seen: time.Unix(int64(binary.BigEndian.Uint32(pt[i+32:i+entrySize])), 0)})
 	}
 	return out, nil
+}
+
+// inRange reports whether t fits a shard's 4-byte time: after the epoch
+// (an unset time.Time isn't) and before 2106.
+func inRange(t time.Time) bool {
+	u := t.Unix()
+	return u > 0 && u <= math.MaxUint32
 }
 
 // merge is the union of entries, one per key with its latest sighting.
@@ -186,14 +201,22 @@ func (d *Directory) now() time.Time {
 // than maxSkew, at the wire's precision (whole seconds). Both paths
 // apply it: a reader so a holder of G can't list strangers, a writer so
 // it doesn't keep and republish what a holder of G planted.
-func (d *Directory) valid(entries []Entry, byRendezvous map[keys.PublicKey]keys.PublicKey) []Entry {
+//
+// For shard (shard >= 0) it also keeps only entries that belong there, so
+// a holder of G can't fill one shard with members from the others,
+// evicting the members assigned to it.
+func (d *Directory) valid(entries []Entry, byRendezvous map[keys.PublicKey]keys.PublicKey, shard int64) []Entry {
 	limit := d.now().Add(maxSkew)
 	var out []Entry
 	for _, e := range entries {
 		e.Seen = time.Unix(e.Seen.Unix(), 0)
-		if _, ok := byRendezvous[e.Key]; ok && !e.Seen.After(limit) {
-			out = append(out, e)
+		if _, ok := byRendezvous[e.Key]; !ok || e.Seen.After(limit) || !inRange(e.Seen) {
+			continue
 		}
+		if shard >= 0 && int64(ShardOf(e.Key, max(d.Shards, 1))) != shard {
+			continue
+		}
+		out = append(out, e)
 	}
 	return out
 }
@@ -223,7 +246,7 @@ func (d *Directory) readShard(ctx context.Context, p uint64, shard uint32, byRen
 	for _, it := range items {
 		seq = max(seq, it.Seq)
 		if es, oerr := Open(d.Group, p, shard, it.V); oerr == nil {
-			lists = append(lists, d.valid(es, byRendezvous))
+			lists = append(lists, d.valid(es, byRendezvous, int64(shard)))
 		}
 	}
 	return merge(lists...), seq, err
@@ -259,7 +282,7 @@ func (d *Directory) Read(ctx context.Context, p uint64, members []keys.PublicKey
 func (d *Directory) Write(ctx context.Context, p uint64, members []keys.PublicKey, entries []Entry) error {
 	byRendezvous := d.rendezvousOf(p, members)
 	byShard := map[uint32][]Entry{}
-	for _, e := range d.valid(entries, byRendezvous) {
+	for _, e := range d.valid(entries, byRendezvous, -1) { // each goes to its own shard below
 		s := ShardOf(e.Key, max(d.Shards, 1))
 		byShard[s] = append(byShard[s], e)
 	}
@@ -275,6 +298,9 @@ func (d *Directory) Write(ctx context.Context, p uint64, members []keys.PublicKe
 func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine []Entry, byRendezvous map[keys.PublicKey]keys.PublicKey) error {
 	key := d.Group.DirectoryKey(p)
 	salt := d.Group.DirectorySalt(p, shard)
+	// known is everything read across rounds: a retry repairs what a
+	// concurrent writer dropped, not just this writer's own entries.
+	var known []Entry
 	for range writeTries {
 		cur, seq, err := d.readShard(ctx, p, shard, byRendezvous)
 		if err != nil && len(cur) == 0 && seq == 0 {
@@ -283,7 +309,8 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 		if seq == math.MaxInt64 {
 			return ErrPinned
 		}
-		v, err := Seal(d.Group, p, shard, merge(cur, mine))
+		known = merge(known, cur)
+		v, err := Seal(d.Group, p, shard, merge(known, mine))
 		if err != nil {
 			return err
 		}
@@ -298,6 +325,7 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 		if err != nil {
 			return err
 		}
+		known = merge(known, back)
 		if present(back, mine) {
 			return nil
 		}

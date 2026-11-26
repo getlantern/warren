@@ -47,6 +47,8 @@ type replicas struct {
 	held  []map[string]dht.MutableItem
 	puts  func() []int
 	after func() // runs after each put: a concurrent writer
+	gets  int
+	onGet func(n int) // runs before the n-th get answers
 }
 
 func newReplicas(n int) *replicas {
@@ -60,6 +62,10 @@ func newReplicas(n int) *replicas {
 func target(key [32]byte, salt []byte) string { return string(key[:]) + string(salt) }
 
 func (r *replicas) GetMutableAll(_ context.Context, key [32]byte, salt []byte) ([]dht.MutableItem, error) {
+	r.gets++
+	if r.onGet != nil {
+		r.onGet(r.gets)
+	}
 	var out []dht.MutableItem
 	for _, h := range r.held {
 		if it, ok := h[target(key, salt)]; ok && !slices.ContainsFunc(out, func(x dht.MutableItem) bool { return x.Sig == it.Sig }) {
@@ -363,5 +369,92 @@ func TestOverflowAtOneSecondWritesOnce(t *testing.T) {
 	}
 	if puts != 1 {
 		t.Fatalf("%d puts for one uncontested write", puts)
+	}
+}
+
+// TestCrossShardEntriesDropped: entries sealed into a shard they don't
+// belong to aren't read, nor kept by a writer.
+func TestCrossShardEntriesDropped(t *testing.T) {
+	r := newReplicas(1)
+	d := &Directory{Group: g, Shards: 3, Store: r, Now: clock}
+	var stray *keys.Identity
+	for i := byte(1); ; i++ {
+		if ShardOf(rendezvous(member(i), p), 3) != 0 {
+			stray = member(i)
+			break
+		}
+	}
+	v, _ := Seal(g, p, 0, []Entry{{Key: rendezvous(stray, p), Seen: now}})
+	m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 1, v)
+	r.PutMutable(context.Background(), m, nil)
+	got, _ := d.Read(context.Background(), p, members(stray))
+	if len(got) != 0 {
+		t.Fatal("an entry in another member's shard was read")
+	}
+}
+
+// TestTimesOutOfRange: an unset or pre-epoch time is refused by Seal and
+// dropped by a writer, rather than encoded as another date.
+func TestTimesOutOfRange(t *testing.T) {
+	if _, err := Seal(g, p, 0, []Entry{{Key: keys.PublicKey{1}}}); !errors.Is(err, ErrTime) {
+		t.Fatalf("sealing an unset time: %v", err)
+	}
+	r := newReplicas(1)
+	puts := 0
+	r.puts = func() []int { puts++; return []int{0} }
+	a, b := member(1), member(2)
+	err := (&Directory{Group: g, Shards: 1, Store: r, Now: clock}).Write(context.Background(), p, members(a, b),
+		[]Entry{{Key: rendezvous(a, p)}, {Key: rendezvous(b, p), Seen: now}})
+	if err != nil || puts != 1 {
+		t.Fatalf("a write with an unset time: %v after %d puts", err, puts)
+	}
+}
+
+// TestRetryKeepsWhatItRead: a writer that read C, put {A,C}, and was then
+// displaced by a concurrent {B}, puts all three on its retry.
+func TestRetryKeepsWhatItRead(t *testing.T) {
+	r := newReplicas(1)
+	a, b, c := member(1), member(2), member(3)
+	put := func(seq int64, es ...Entry) {
+		v, _ := Seal(g, p, 0, es)
+		m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), seq, v)
+		r.held[0][target(m.Key, m.Salt)] = m
+	}
+	put(1, Entry{Key: rendezvous(c, p), Seen: now})
+	r.after = func() { put(100, Entry{Key: rendezvous(b, p), Seen: now}) }
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	if err := d.Write(context.Background(), p, members(a, b, c), []Entry{{Key: rendezvous(a, p), Seen: now}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.Read(context.Background(), p, members(a, b, c))
+	if len(got) != 3 {
+		t.Fatalf("read %d of 3; the retry forgot what it had read", len(got))
+	}
+}
+
+// TestRetryKeepsReadBack: an entry seen only in a read-back (gone again by
+// the next read, a third writer replacing it) is kept by the retry.
+func TestRetryKeepsReadBack(t *testing.T) {
+	r := newReplicas(1)
+	a, b, c := member(1), member(2), member(3)
+	put := func(seq int64, es ...Entry) {
+		v, _ := Seal(g, p, 0, es)
+		m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), seq, v)
+		r.held[0][target(m.Key, m.Salt)] = m
+	}
+	r.after = func() { put(100, Entry{Key: rendezvous(b, p), Seen: now}) } // displaces a's put
+	r.onGet = func(n int) {
+		if n == 3 { // the retry's read: c's writer replaced b's value
+			put(200, Entry{Key: rendezvous(c, p), Seen: now})
+		}
+	}
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	if err := d.Write(context.Background(), p, members(a, b, c), []Entry{{Key: rendezvous(a, p), Seen: now}}); err != nil {
+		t.Fatal(err)
+	}
+	r.onGet = nil
+	got, _ := d.Read(context.Background(), p, members(a, b, c))
+	if _, ok := got[b.Public()]; !ok {
+		t.Fatal("an entry the writer saw in its read-back was lost on the retry")
 	}
 }
