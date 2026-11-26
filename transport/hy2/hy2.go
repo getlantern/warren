@@ -20,6 +20,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/netip"
@@ -304,11 +305,23 @@ func certificate(identity crypto.Signer) (tls.Certificate, error) {
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, identity.Public(), identity)
+	der, err := createCertificate(tmpl, identity)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: identity}, nil
+}
+
+// createCertificate self-signs tmpl with identity, turning a panic in the
+// signer (a hardware key gone, say) into an error rather than the end of
+// the process.
+func createCertificate(tmpl *x509.Certificate, identity crypto.Signer) (der []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			der, err = nil, fmt.Errorf("hy2: the identity's signer panicked: %v", r)
+		}
+	}()
+	return x509.CreateCertificate(rand.Reader, tmpl, tmpl, identity.Public(), identity)
 }
 
 // socketDialer hands hysteria2 the existing socket, bound to the peer.

@@ -639,13 +639,14 @@ func TestListenNeverSplitsIdentities(t *testing.T) {
 	if err := n.Listen(ctx, &budget{k: k, n: 1}); !errors.Is(err, dht.ErrSigner) {
 		t.Fatalf("a signer failing for one family: %v", err)
 	}
-	keys := map[[32]byte]bool{}
+	keys, listening := map[[32]byte]bool{}, 0
 	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
 		if pk, ok := d.Listening(); ok {
 			keys[pk] = true
+			listening++
 		}
 	})
-	if len(keys) > 1 {
-		t.Fatalf("families listen under %d different keys", len(keys))
+	if listening != 2 || len(keys) != 1 || !keys[[32]byte(old.Public().(ed25519.PublicKey))] {
+		t.Fatalf("%d families listening under %d keys: want both, under the old one", listening, len(keys))
 	}
 }

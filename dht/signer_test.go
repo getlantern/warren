@@ -247,3 +247,17 @@ func (c *counting) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte
 	c.signs++
 	return c.failing.Sign(r, msg, opts)
 }
+
+// TestListenSignsOnce: one Listen asks the signer once, as a hardware key
+// needing a touch per signature would want.
+func TestListenSignsOnce(t *testing.T) {
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	c := &counting{failing: failing{k: k}}
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	if err := n.Listen(t0, c); err != nil {
+		t.Fatal(err)
+	}
+	if c.signs != 1 {
+		t.Fatalf("%d signatures for one Listen", c.signs)
+	}
+}

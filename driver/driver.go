@@ -751,21 +751,43 @@ func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
 	if err != nil {
 		return err
 	}
-	errs, err := n.each(ctx, func(_ int, d *dht.Node, now time.Time) error { return d.ListenKey(now, priv, x) })
-	if err != nil {
+	// All on one turn of the loop, so no family serves a new identity while
+	// another's signer failure is still being undone.
+	res := make(chan error, 1)
+	if err := n.do(ctx, func(now time.Time) {
+		type was struct {
+			priv crypto.Signer
+			x    *ecdh.PrivateKey
+			ok   bool
+		}
+		prev := make([]was, len(n.fams))
+		errs := make([]error, len(n.fams))
+		for i, fm := range n.fams {
+			prev[i].priv, prev[i].x, prev[i].ok = fm.node.Listener()
+			errs[i] = fm.node.ListenKey(now, priv, x)
+		}
+		// A family whose signer failed kept its old identity while the
+		// others moved: move them back, so siblings never publish different
+		// identities. (A family failing for another reason, a family down,
+		// leaves the rest listening, as before.)
+		i := slices.IndexFunc(errs, func(e error) bool { return errors.Is(e, dht.ErrSigner) })
+		if i >= 0 && slices.Contains(errs, nil) {
+			for j, fm := range n.fams {
+				if errs[j] != nil {
+					continue
+				}
+				if !prev[j].ok || fm.node.ListenKey(now, prev[j].priv, prev[j].x) != nil {
+					fm.node.Unlisten()
+				}
+			}
+			res <- errs[i]
+			return
+		}
+		res <- anyOK(errs)
+	}); err != nil {
 		return err
 	}
-	// A family whose signer failed kept its old identity while the others
-	// moved: siblings would publish different identities. Unlisten them
-	// all. (A family failing for another reason, a family down, leaves the
-	// rest listening, as before.)
-	for _, e := range errs {
-		if errors.Is(e, dht.ErrSigner) && slices.Contains(errs, nil) {
-			_, _ = n.each(ctx, func(_ int, d *dht.Node, _ time.Time) error { d.Unlisten(); return nil })
-			return e
-		}
-	}
-	return anyOK(errs)
+	return <-res
 }
 
 // Answer replies to an offer through the node that delivered it.

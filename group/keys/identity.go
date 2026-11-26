@@ -22,6 +22,16 @@ type Signer interface {
 	Sign(msg []byte) []byte
 }
 
+// hashFunc is o.HashFunc, or false if o is a typed nil that panics in it.
+func hashFunc(o crypto.SignerOpts) (h crypto.Hash, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	return o.HashFunc(), true
+}
+
 // CryptoSigner adapts s to a crypto.Signer, the form warren's endpoint,
 // driver, dht and hy2 take a key in, so a member can listen and connect
 // under a blinded key. It signs messages whole, as Ed25519 does.
@@ -40,13 +50,7 @@ func (c cryptoSigner) Public() crypto.PublicKey {
 	return ed25519.PublicKey(pk[:])
 }
 
-func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) (sig []byte, err error) {
-	// A typed-nil option of another kind panics in HashFunc.
-	defer func() {
-		if recover() != nil {
-			sig, err = nil, errors.New("keys: unusable signer options")
-		}
-	}()
+func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
 	switch o := opts.(type) {
 	case nil:
 	case *ed25519.Options:
@@ -54,7 +58,7 @@ func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) (sig
 			return nil, errors.New("keys: a blinded key signs pure Ed25519 only: no Ed25519ph or Ed25519ctx")
 		}
 	default:
-		if o.HashFunc() != 0 {
+		if h, ok := hashFunc(o); !ok || h != 0 {
 			return nil, errors.New("keys: Ed25519 signs messages whole, not digests")
 		}
 	}

@@ -55,7 +55,11 @@ type Config struct {
 	Authorize func(caller [32]byte) bool
 	// SignerFailed, if set, is told when the listener's signer fails to
 	// sign a record (a hardware key gone, say): callers can't reach it once
-	// the record held before ages out. It is called on its own goroutine.
+	// the record held before ages out. It is called on its own goroutine,
+	// once per DHT family, and like every DHT event it is best effort: one
+	// that arrives while the event queue is full is dropped. (A signer that
+	// can't fail, an ed25519.PrivateKey or keys.CryptoSigner, never calls
+	// it.)
 	SignerFailed func(err error)
 	// RelayOnly never reveals this endpoint's addresses to peers: every
 	// connection goes through a relay router.

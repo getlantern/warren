@@ -563,7 +563,7 @@ func (n *Node) makeRecord(now time.Time, priv crypto.Signer, pub [32]byte, x *ec
 
 // storeRecord makes a signed record ours to publish.
 func (n *Node) storeRecord(now time.Time, target krpc.NodeID, seq int64, m MutableItem) {
-	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now}
+	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now, fresh: true}
 	if n.recordSeq == nil {
 		n.recordSeq = map[krpc.NodeID]int64{}
 	}
@@ -1239,14 +1239,6 @@ func (n *Node) handleSignal(now time.Time, from netip.AddrPort, q *krpc.Msg) boo
 }
 
 // Holders reports the record holders a listening provider keeps alive.
-// Listening reports the key the node listens under, if it listens.
-func (n *Node) Listening() ([32]byte, bool) {
-	if n.lst == nil {
-		return [32]byte{}, false
-	}
-	return n.lst.pub, true
-}
-
 func (n *Node) Holders() []netip.AddrPort {
 	if n.lst == nil {
 		return nil
@@ -1256,4 +1248,21 @@ func (n *Node) Holders() []netip.AddrPort {
 		out = append(out, h.addr)
 	}
 	return out
+}
+
+// Listening reports the key the node listens under, if it listens.
+func (n *Node) Listening() ([32]byte, bool) {
+	if n.lst == nil {
+		return [32]byte{}, false
+	}
+	return n.lst.pub, true
+}
+
+// Listener returns what the node listens under, if it listens, so a
+// caller moving several nodes to a new identity can move one back.
+func (n *Node) Listener() (crypto.Signer, *ecdh.PrivateKey, bool) {
+	if n.lst == nil {
+		return nil, nil, false
+	}
+	return n.lst.priv, n.lst.x, true
 }
