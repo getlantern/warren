@@ -647,12 +647,15 @@ so an app chooses where data lives and how much.
    resume offers, and hy2's server certificate. An `ed25519.PrivateKey` is
    one, so existing callers are unchanged; `keys.CryptoSigner` adapts a
    blinded `keys.Signer`.
-3. **Mutable-item puts** from the endpoint, for the directory (the DHT
-   supports them; the endpoint doesn't expose puts yet), and **reads that
-   return every distinct value** the replicas hold, including different
-   values at the same sequence number. Today a get keeps one value per
-   sequence number and `driver.Node.GetMutable` returns only the newest, so
-   the directory merge (*Discovery*) would miss concurrent writes.
+3. **Mutable-item puts** from the endpoint, for the directory, and **reads
+   that return every distinct value** the replicas hold, including
+   different values at the same sequence number (built). Puts go through
+   `Endpoint.DHT().PutMutable`, signed by `dht.NewMutable` with any
+   `crypto.Signer` (the directory's derived key). A get keeps every
+   distinct verified item it sees (`dht.GetDone.Items`, up to
+   `dht.MaxGetItems`), and `driver.Node.GetMutableAll` merges them across
+   families, newest first, so the directory merge (*Discovery*) sees
+   concurrent writes; `GetMutable` still returns only the newest.
 4. Nothing in the data plane: sessions are hysteria2 over `Conn`.
 
 ## Phasing

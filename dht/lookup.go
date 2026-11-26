@@ -63,10 +63,12 @@ type lookup struct {
 	rec   record // put payload
 	cas   *int64
 	value []byte // immutable get result
-	// Mutable gets: the expected key and salt, and the best verified item.
+	// Mutable gets: the expected key and salt, the best verified item, and
+	// every distinct one seen (by signature), up to MaxGetItems.
 	key        *[32]byte
 	salt       []byte
 	best       *MutableItem
+	items      []*MutableItem
 	finished   bool
 	queried    int
 	failures   int
@@ -250,4 +252,12 @@ func (l *lookup) closestResponded(k int) []krpc.NodeInfo {
 		}
 	}
 	return out
+}
+
+// keep records a verified item a mutable get saw, once per signature, up
+// to MaxGetItems.
+func (l *lookup) keep(mi *MutableItem) {
+	if len(l.items) < MaxGetItems && !slices.ContainsFunc(l.items, func(x *MutableItem) bool { return x.Sig == mi.Sig }) {
+		l.items = append(l.items, mi)
+	}
 }

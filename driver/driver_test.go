@@ -826,3 +826,18 @@ func TestUndoReconciles(t *testing.T) {
 		t.Fatalf("families listen under different keys: %d and %d", len(sets[0]), len(sets[1]))
 	}
 }
+
+// TestMergeItemsAcrossFamilies: items both families found count once, and
+// the merge is newest first.
+func TestMergeItemsAcrossFamilies(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	mk := func(seq int64, v string) dht.MutableItem {
+		m, _ := dht.NewMutable(priv, []byte("shard"), seq, dht.ImmutableValue([]byte(v)))
+		return m
+	}
+	a, b, c := mk(1, "a"), mk(3, "b"), mk(3, "c")
+	got := mergeItems([]dht.Event{dht.GetDone{Items: []dht.MutableItem{a, b}}, dht.GetDone{Items: []dht.MutableItem{b, c}}})
+	if len(got) != 3 || got[0].Seq != 3 || got[1].Seq != 3 || got[2].Seq != 1 {
+		t.Fatalf("merged %d items, want 3 newest first", len(got))
+	}
+}

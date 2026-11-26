@@ -696,6 +696,39 @@ func (n *Node) GetMutable(ctx context.Context, key [32]byte, salt []byte) (*dht.
 	return best, partial
 }
 
+// GetMutableAll returns every distinct verified item any node found for
+// key and salt (distinct by signature, different values at one sequence
+// number included), newest first. Replicas can disagree, since a BEP 44
+// compare-and-swap isn't atomic across them: a reader merging concurrent
+// writes (a group directory shard, say) needs them all. As for GetMutable,
+// an error comes with whatever was found.
+func (n *Node) GetMutableAll(ctx context.Context, key [32]byte, salt []byte) ([]dht.MutableItem, error) {
+	got, partial, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
+		op, err := d.GetMutable(now, key, salt)
+		return op, false, err
+	}, nil)
+	items := mergeItems(got)
+	if err != nil {
+		return items, err
+	}
+	return items, partial
+}
+
+// mergeItems is every distinct item across the families' gets, newest
+// first: at most MaxGetItems from each.
+func mergeItems(got []dht.Event) []dht.MutableItem {
+	var items []dht.MutableItem
+	for _, e := range got {
+		for _, it := range e.(dht.GetDone).Items {
+			if !slices.ContainsFunc(items, func(x dht.MutableItem) bool { return x.Sig == it.Sig }) {
+				items = append(items, it)
+			}
+		}
+	}
+	dht.SortItems(items)
+	return items
+}
+
 // PutMutable stores m through every node and returns the acknowledgements
 // summed across them, including any that arrived before an error.
 func (n *Node) PutMutable(ctx context.Context, m dht.MutableItem, cas *int64) (dht.PutDone, error) {
