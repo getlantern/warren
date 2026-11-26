@@ -156,6 +156,24 @@ func TestRegistrySlotsCantBeTakenOver(t *testing.T) {
 	}
 }
 
+// TestRegistrySlotPerListener: one caller's connections through two of our
+// keys with one secret get a slot each, so each can be resumed through its
+// own key.
+func TestRegistrySlotPerListener(t *testing.T) {
+	e := &Endpoint{}
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	caller, la, lb := [32]byte{1}, [32]byte{0xa}, [32]byte{0xb}
+	ca := e.newConn(punched{sock: &net.UDPConn{}}, caller, la, secret, nil)
+	cb := e.newConn(punched{sock: &net.UDPConn{}}, caller, lb, secret, nil)
+	if e.resumable(ca.resume, caller, la) != ca || e.resumable(cb.resume, caller, lb) != cb {
+		t.Fatal("a connection through a second key got no registry slot")
+	}
+	e.forget(ca)
+	if e.resumable(cb.resume, caller, lb) != cb {
+		t.Fatal("forgetting one key's connection dropped the other's slot")
+	}
+}
+
 // A write that chose the old socket just before a swap closed it follows
 // the path to the new socket instead of failing (QUIC treats a write error
 // as fatal).

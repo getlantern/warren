@@ -775,12 +775,16 @@ func (e *Endpoint) Connect(ctx context.Context, identity crypto.Signer, peer [32
 	return c, nil
 }
 
+// connKey names a connection's registry slot: its peer, our key it was
+// made under (so one caller's connections through two of our keys are two
+// slots), and its resume ID.
 type connKey struct {
 	peer   [32]byte
+	local  [32]byte
 	resume [16]byte
 }
 
-func (c *Conn) key() connKey { return connKey{c.PeerKey, c.resume} }
+func (c *Conn) key() connKey { return connKey{c.PeerKey, c.LocalKey, c.resume} }
 
 // punched is a freshly punched path: its socket and the peer's address.
 type punched struct {
@@ -850,10 +854,7 @@ func (e *Endpoint) forget(c *Conn) {
 func (e *Endpoint) resumable(id [16]byte, caller, listener [32]byte) *Conn {
 	e.connsMu.Lock()
 	defer e.connsMu.Unlock()
-	if c := e.inConns[connKey{caller, id}]; c != nil && c.LocalKey == listener {
-		return c
-	}
-	return nil
+	return e.inConns[connKey{caller, listener, id}]
 }
 
 // Migrate moves an outbound connection onto a freshly punched path, for
