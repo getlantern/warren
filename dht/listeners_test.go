@@ -323,27 +323,6 @@ func TestSecondMoveInRoundNotLost(t *testing.T) {
 	}
 }
 
-// TestSameMoveReportedByManyResignsOnce: holders reporting the one move
-// already re-signed for leave nothing due.
-func TestSameMoveReportedByManyResignsOnce(t *testing.T) {
-	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
-	n.AddListener(t0, seededKey(1))
-	l := n.lsts[0]
-	var target krpc.NodeID
-	for _, tg := range l.records {
-		target = tg
-	}
-	old, moved := netip.MustParseAddrPort("192.0.2.1:1000"), netip.MustParseAddrPort("192.0.2.9:2000")
-	for i := range 3 {
-		h := &holder{addr: addr(60 + i), target: target, mapped: old}
-		l.holders = append(l.holders, h)
-		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: moved})
-	}
-	if l.resignDue {
-		t.Fatal("holders reporting the move already re-signed for left a re-sign due")
-	}
-}
-
 // TestRetryAtCapGetsAnswer: a caller's retry through another holder, of an
 // offer already taken, gets the answer even with the listener full.
 func TestRetryAtCapGetsAnswer(t *testing.T) {
@@ -366,25 +345,32 @@ func TestRetryAtCapGetsAnswer(t *testing.T) {
 	if s := l.sessions[in.Session]; s == nil || !slices.Contains(s.relays, addr(77)) {
 		t.Fatal("a retry at the cap was dropped")
 	}
+	sends, _ := n.Drain()
+	if !slices.ContainsFunc(sends, func(s Send) bool { return s.To == addr(77) }) {
+		t.Fatal("the answer wasn't re-sent to the retry's holder")
+	}
 }
 
-// TestSymmetricNATMoveResignsOnce: holders each seeing their own port after
-// one move leave nothing more due.
-func TestSymmetricNATMoveResignsOnce(t *testing.T) {
+// TestMoveReportedByManyBounded: holders reporting one move re-sign once at
+// once and at most once more, on the next maintenance pass.
+func TestMoveReportedByManyBounded(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
-	n.AddListener(t0, seededKey(1))
+	c := &counting{failing: failing{k: seededKey(1)}}
+	n.AddListener(t0, c)
 	l := n.lsts[0]
 	var target krpc.NodeID
 	for _, tg := range l.records {
 		target = tg
 	}
-	for i := range 3 {
+	c.signs = 0
+	for i := range 4 {
 		h := &holder{addr: addr(60 + i), target: target, mapped: netip.MustParseAddrPort("192.0.2.1:1000")}
 		l.holders = append(l.holders, h)
 		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: netip.AddrPortFrom(netip.MustParseAddr("198.51.100.7"), uint16(40001+i))})
 	}
-	if l.resignDue {
-		t.Fatal("ports of one new host each set a re-sign due")
+	n.maintain(t0.Add(2 * time.Second))
+	if c.signs > 2*len(l.records) {
+		t.Fatalf("%d signs for one move reported by 4 holders", c.signs)
 	}
 }
 
@@ -400,5 +386,9 @@ func TestMoveNearZeroClock(t *testing.T) {
 	}
 	h := &holder{addr: addr(60), target: target, mapped: netip.MustParseAddrPort("192.0.2.1:1000")}
 	l.holders = append(l.holders, h)
+	seq := n.recordSeq[target]
 	n.keepaliveReply(time.Time{}.Add(time.Second), h, &krpc.Msg{IP: netip.MustParseAddrPort("192.0.2.9:2000")})
+	if n.recordSeq[target] <= seq {
+		t.Fatal("the first move, near the zero clock, wasn't re-signed at once")
+	}
 }

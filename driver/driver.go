@@ -25,10 +25,13 @@ import (
 )
 
 const (
-	inboxSize   = 128 // datagrams queued between the readers and the loop
-	eventsSize  = 32
-	maxPacket   = 2048
-	maxSessions = 1024 // incoming signaling sessions remembered for Answer
+	inboxSize  = 128 // datagrams queued between the readers and the loop
+	eventsSize = 32
+	maxPacket  = 2048
+	// maxSessions is the incoming signaling sessions remembered for Answer:
+	// as many as two families' nodes can hold at once, every listener full,
+	// so a flood to some keys can't evict a genuine caller to another.
+	maxSessions = 2 * dht.MaxListeners * dht.MaxSessions
 	// writeTimeout bounds how long the loop waits on a full send buffer.
 	writeTimeout = 200 * time.Millisecond
 )

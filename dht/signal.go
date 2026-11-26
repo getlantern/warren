@@ -408,6 +408,11 @@ type listener struct {
 	retry     time.Duration // publication backoff while nothing stores our record
 }
 
+// MaxSessions bounds offers in progress per listener, so a flood to one
+// key (a public invite's) fills its own share, never another key's;
+// MaxListeners times it bounds the node's.
+const MaxSessions = 64
+
 // MaxListeners bounds the keys a node listens under at once: each keeps
 // records published and holders kept alive, and their republication after
 // a rebind shares the node's lookup slots, so a node meant to stay
@@ -777,27 +782,18 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 		// After a failed re-sign maintenance retries, once a pass, so other
 		// holders' replies don't ask a failing signer again.
 		// Our address moved: every listener's holders bind to it. One
-		// re-sign a keepalive round covers every holder reporting it (each
-		// tracks its own view, as behind a symmetric NAT each sees its own
-		// mapping), so many listeners' holders don't each set one off.
+		// re-sign at once per half keepalive round; a change reported again
+		// inside that (by other holders, or a second move) leaves every
+		// listener due, and the next maintenance pass re-signs once more.
+		// Each holder tracks its own view, as behind a symmetric NAT each
+		// sees its own mapping.
 		if h.mapped.IsValid() && h.mapped != m.IP {
-			if now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval / 2)) {
-				// Re-signed for a change this round already. Other holders
-				// reporting the same new host need nothing more (by IP: behind
-				// a symmetric NAT each sees its own port); a host not seen yet
-				// (a second move) is left to the next maintenance pass, not
-				// lost.
-				if n.resignedFor == nil {
-					n.resignedFor = map[netip.Addr]bool{}
-				}
-				if !n.resignedFor[m.IP.Addr()] {
-					n.resignedFor[m.IP.Addr()] = true
-					for _, x := range n.lsts {
-						x.resignDue = true
-					}
+			if !n.resignedAt.IsZero() && now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval/2)) {
+				for _, x := range n.lsts {
+					x.resignDue = true
 				}
 			} else {
-				n.resignedAt, n.resignedFor = now, map[netip.Addr]bool{m.IP.Addr(): true}
+				n.resignedAt = now
 				for _, x := range n.lsts {
 					if !x.resignDue {
 						n.resign(now, x)
