@@ -843,16 +843,42 @@ func TestMergeItemsAcrossFamilies(t *testing.T) {
 }
 
 // TestGetMutableAgreesWithAll: with families finding different values at
-// one sequence number, GetMutable's newest is GetMutableAll's first,
-// whichever family answered first.
+// one sequence number, GetMutable's newest (newest) is GetMutableAll's
+// first (mergeItems), whichever family answered first.
 func TestGetMutableAgreesWithAll(t *testing.T) {
 	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
 	a, _ := dht.NewMutable(priv, []byte("s"), 5, dht.ImmutableValue([]byte("a")))
 	b, _ := dht.NewMutable(priv, []byte("s"), 5, dht.ImmutableValue([]byte("b")))
 	for _, order := range [][]dht.MutableItem{{a, b}, {b, a}} {
 		got := []dht.Event{dht.GetDone{Items: order[:1], Item: &order[0]}, dht.GetDone{Items: order[1:], Item: &order[1]}}
-		if mergeItems(got)[0].Sig != mergeItems([]dht.Event{got[1], got[0]})[0].Sig {
+		n, all := newest(got), mergeItems(got)
+		if n == nil || len(all) != 2 || n.Sig != all[0].Sig {
+			t.Fatal("GetMutable's newest isn't GetMutableAll's first")
+		}
+		if other := newest([]dht.Event{got[1], got[0]}); other.Sig != n.Sig {
 			t.Fatal("the newest depends on which family answered first")
 		}
+	}
+}
+
+// TestGetMutableAllOverUDP: the public reads over a real network return
+// what was put, and agree.
+func TestGetMutableAllOverUDP(t *testing.T) {
+	nodes := network(t, 16)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	key := [32]byte(priv.Public().(ed25519.PublicKey))
+	m, _ := dht.NewMutable(priv, []byte("shard"), 3, dht.ImmutableValue([]byte("entry")))
+	if res, err := nodes[7].PutMutable(ctx, m, nil); err != nil || res.Stored == 0 {
+		t.Fatalf("put: %v %+v", err, res)
+	}
+	all, err := nodes[11].GetMutableAll(ctx, key, []byte("shard"))
+	if err != nil || len(all) == 0 || all[0].Sig != m.Sig {
+		t.Fatalf("GetMutableAll: %v, %d items", err, len(all))
+	}
+	one, err := nodes[11].GetMutable(ctx, key, []byte("shard"))
+	if err != nil || one == nil || one.Sig != all[0].Sig {
+		t.Fatalf("GetMutable disagrees with GetMutableAll: %v", err)
 	}
 }
