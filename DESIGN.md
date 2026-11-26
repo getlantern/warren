@@ -898,7 +898,7 @@ and carrier allocator. The design therefore splits measurement in two:
 | 5 | Data plane | `utpshape/` (uTP-shaped obfuscation, Wireshark-verified, Don't-Fragment-aware) and `transport/hy2/` (hysteria2 over the punched socket, key-pinned TLS, password from the secret, iOS windows) built. End to end: `Connect`, then hysteria2 over uTP, then streams. Next: batched UDP I/O for servers, a lantern-box hysteria2x inbound and outbound for uTP mode |
 | 5b | IPv6 | Built: sibling DHT nodes per family as libtorrent runs them, `driver.ListenDual`, dual-stack endpoint legs racing IPv6 first. Next: snapshots for both families, IPv6 relays, and IPv6 firewalls in the simulator |
 | 6 | iOS integration, memory budget, network-change rebind | Rebind and live-session migration built (see *Network changes*). Stall detection built: a caller migrates on its own when the provider goes silent. iOS: builds for device; memory measured in the simulator; open-file budget for punch sockets; memory-pressure hooks for the host's monitor. Next: wiring into radiance and lantern-box, and device measurements (`phys_footprint`, `RLIMIT_NOFILE`) |
-| 7 | Private groups | Designed in `docs/groups-design.md`: groups of up to ~50, members reached under blinded per-period rendezvous keys by Connect-by-key (an encrypted DHT directory only hints who is online), invites that carry no group secret, members-only sessions, signed per-member logs, encrypted content swarmed piece by piece, rekey on removal, rejoin by existing key, owner-only role changes. Roster rules model-checked by `group/rostermodel`. Built: `group/keys` (derivation, Ed25519 blinding with a `Signer`, sealing, commitments) and `group/roster` (signed operations, the fold, keyring, writers; conformance-tested against the model). Next: see *Next steps* |
+| 7 | Private groups | Designed in `docs/groups-design.md`: groups of up to ~50, members reached under blinded per-period rendezvous keys by Connect-by-key (an encrypted DHT directory only hints who is online), invites that carry no group secret, members-only sessions, signed per-member logs, encrypted content swarmed piece by piece, rekey on removal, rejoin by existing key, owner-only role changes. Roster rules model-checked by `group/rostermodel`. Built: `group/keys` (derivation, Ed25519 blinding with a `Signer`, sealing, commitments), `group/roster` (signed operations, the fold, keyring, writers; conformance-tested against the model), `group/memberlog` (signed, chained, encrypted per-member logs; forks, removal cutoffs) and `group/sync` (the session exchange as a state machine). Next: see *Next steps* |
 
 ## Next steps
 
@@ -912,10 +912,14 @@ line, B runs alongside it, C waits on device time, D is maintenance.
    when written; fork detection; a removal's cutoff (only entries on the
    chain ending at the head the remover saw), with withdrawn entries
    reported; only authors the roster admits, never mirrors.
-2. **Sync, as a state machine** (`group/sync`): what two members exchange
-   on connect (roster heads and missing operations, liveness, log heads
-   and missing entries), with no networking, so phase 2 only has to carry
-   it over a session and the simulator can drive it in-process. Pure Go.
+2. **Sync, as a state machine** (`group/sync`, built): what two members
+   exchange on connect, with no networking: the IDs of the roster
+   operations each holds and the operations each lacks, then fork proofs,
+   log heads with their hashes (a differing one starts a walk down to
+   where two branches of a fork part), and entries pulled in bounded
+   batches (a removed author's from its recorded head down).
+   Phase 2 carries the messages over a session; the simulator drives two
+   in-process. Liveness moved to step 5.
 3. **Protocol review**, started now, before step 5 needs it: a human
    review of what the model doesn't cover (join and rejoin sessions,
    invite-use counting, the grace window), and an independent review of
@@ -936,7 +940,8 @@ line, B runs alongside it, C waits on device time, D is maintenance.
 5. **Sessions and the directory** in the simulator: rendezvous under
    blinded keys, admission (roster, then member-key proof in the
    session), sync sessions under the sync key, join and rejoin sessions,
-   the directory over mutable items. Drives step 2's state machine.
+   the directory over mutable items, and liveness (members each has
+   reached lately). Drives step 2's state machine.
 6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
    tree over ciphertext, announcements. Pure library, so it can be built
    alongside steps 4 and 5.

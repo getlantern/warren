@@ -1061,3 +1061,140 @@ func TestLiftReportsOnlyWhatShowed(t *testing.T) {
 	}
 	checkCounts(t, l)
 }
+
+// TestForkedLogFillsItsPrefix: a member that learns of a fork before it
+// holds the log still takes what lies below the fork point, and a fork
+// found lower down replaces the proof.
+func TestForkedLogFillsItsPrefix(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 4)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	other4, _ := Write(x.member, g, es[2], ep, key, App, []byte("other"))
+	s := NewSet(g)
+	update(t, s, x.fold(t))
+	if _, err := s.Add(es[3]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add(other4); !errors.Is(err, ErrForked) {
+		t.Fatalf("setup: %v", err)
+	}
+	if seq, _, done := s.Next(x.member.Public()); done || seq != 1 {
+		t.Fatalf("next %d, done %v: the prefix is still wanted", seq, done)
+	}
+	for _, e := range es[:3] {
+		if _, err := s.Add(e); err != nil {
+			t.Fatalf("entry %d below the fork point: %v", e.Seq, err)
+		}
+	}
+	l := s.Log(x.member.Public())
+	if n := len(l.Entries()); n != 3 {
+		t.Fatalf("%d shown, want the 3 below the fork point", n)
+	}
+	if _, _, done := s.Next(x.member.Public()); !done {
+		t.Fatal("still wanting past the fork point")
+	}
+	// A conflict at entry 2 is an earlier fork: the proof moves down.
+	other2, _ := Write(x.member, g, es[0], ep, key, App, []byte("other2"))
+	if _, err := s.Add(other2); !errors.Is(err, ErrForked) {
+		t.Fatalf("a lower fork: %v", err)
+	}
+	if p := l.Fork(); p.A.Seq != 2 || len(l.Entries()) != 1 {
+		t.Fatalf("proof at %d, %d shown", p.A.Seq, len(l.Entries()))
+	}
+	checkCounts(t, l)
+}
+
+func TestAddForkChecksTheProof(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 3)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	other3, _ := Write(x.member, g, es[1], ep, key, App, []byte("other"))
+	s := NewSet(g)
+	update(t, s, x.fold(t))
+	for name, p := range map[string]*ForkProof{
+		"linked neighbors": {A: es[0], B: es[1]},
+		"one entry twice":  {A: es[2], B: es[2]},
+		"far apart":        {A: es[0], B: other3},
+		"two authors":      {A: es[2], B: x.chain(t, x.admin, 3)[2]},
+	} {
+		if ok, err := s.AddFork(p); ok || err == nil {
+			t.Fatalf("%s taken: %v", name, err)
+		}
+	}
+	if ok, err := s.AddFork(&ForkProof{A: es[2], B: other3}); !ok || err != nil {
+		t.Fatalf("a fork at entry 3: %v %v", ok, err)
+	}
+	if ok, _ := s.AddFork(&ForkProof{A: es[2], B: other3}); ok {
+		t.Fatal("the same proof taken twice")
+	}
+	l := s.Log(x.member.Public())
+	if l.Fork() == nil || len(l.Entries()) != 0 || len(s.Withdrawn()) != 0 {
+		t.Fatal("a proof showed or withdrew something")
+	}
+	if seq, _, done := s.Next(x.member.Public()); done || seq != 1 {
+		t.Fatalf("next %d done %v: the prefix is still wanted", seq, done)
+	}
+	s.Add(es[0])
+	s.Add(es[1])
+	if n := len(l.Entries()); n != 2 {
+		t.Fatalf("%d shown below the fork point", n)
+	}
+	checkCounts(t, l)
+}
+
+// TestAddForkRefusesRemovedAuthors: a removed author can sign a second
+// history after its removal; a proof built from it isn't taken.
+func TestAddForkRefusesRemovedAuthors(t *testing.T) {
+	x := newFixture(t)
+	es := x.chain(t, x.member, 3)
+	ep, key := x.epoch(t, x.member)
+	g := x.r.Group()
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin}).Remove(x.member.Public(), 3, es[2].ID()); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSet(g)
+	update(t, s, x.fold(t))
+	for i := 2; i >= 0; i-- {
+		if _, err := s.Add(es[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forged, _ := Write(x.member, g, es[0], ep, key, App, []byte("after removal"))
+	if ok, err := s.AddFork(&ForkProof{A: es[1], B: forged}); ok || err != nil {
+		t.Fatalf("a removed author's proof: %v %v", ok, err)
+	}
+	if _, err := s.AddFork(&ForkProof{A: es[1], B: x.chain(t, x.admin, 2)[1]}); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a removed author's entry with another's: %v", err)
+	}
+	l := s.Log(x.member.Public())
+	if l.Fork() != nil || len(l.Entries()) != 3 {
+		t.Fatalf("forked %v, %d shown", l.Fork() != nil, len(l.Entries()))
+	}
+}
+
+// TestAddForkAnyEpoch: a proof is taken whatever epoch its entries name,
+// so a member receiving it after the epoch stopped counting agrees with
+// one that held it from before.
+func TestAddForkAnyEpoch(t *testing.T) {
+	x := newFixture(t)
+	f := x.fold(t)
+	stale := x.stalePair(t, f)
+	rm, err := (&roster.Writer{R: stale, Me: x.admin}).Remove(x.mirror.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := stale.Keyring(x.owner).Epochs[rm.ID()]
+	g := x.r.Group()
+	e1, _ := Write(x.owner, g, nil, rm.ID(), key, App, []byte("1"))
+	e1b, _ := Write(x.owner, g, nil, rm.ID(), key, App, []byte("1b"))
+	if _, err := x.r.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSet(g)
+	update(t, s, x.fold(t)) // rm's epoch no longer counts
+	if ok, err := s.AddFork(&ForkProof{A: e1, B: e1b}); !ok || err != nil {
+		t.Fatalf("a proof under an epoch that stopped counting: %v %v", ok, err)
+	}
+}

@@ -307,9 +307,16 @@ recovery and memory caps.
   with that key. This opens the callee to members and recently removed
   members (who hold `G` during the grace window, see *Removal*, and are
   refused once the chain is checked), and nobody else.
-- On connect the two exchange roster heads and missing operations, then
-  liveness (members each has reached lately), then log heads (*Logs*) and
-  content inventories (*Swarming*).
+- On connect the two exchange the IDs of the roster operations each holds
+  and then the operations the other lacks (32 bytes an operation, so a
+  peer one operation ahead is sent one; tens of KB for a v1 group's
+  roster, and set reconciliation if rosters grow far past that), then
+  liveness (members each has
+  reached lately), then log heads (*Logs*) and content inventories
+  (*Swarming*). Each side
+  says Bye once it has taken what it asked for, after anything it found
+  meanwhile (a fork proof), and keeps answering the other's requests; the
+  session closes, gracefully, once both have.
 - **Join sessions** (*Invites*) are separate: they are admitted under an
   invite's key, carry only a join request and its answer, and serve no
   member data.
@@ -345,11 +352,16 @@ epoch key current when written. Two kinds:
 
 Members replicate each other's logs over sessions: on connect each sends the
 head of every log it holds (sequence number and entry hash), and the other
-sends what's missing. Two different entries at the same sequence number,
+sends what's missing. A head whose hash differs from the entry the other
+shows at that number is another branch of a fork: the other walks down
+the sender's branch to where the two part, and both keep the proof at
+that point. Two different entries at the same sequence number,
 both signed by the author, are proof the author forked its log (so is an
 entry whose previous-hash contradicts the held chain): members keep the
-proof, stop accepting that log, show only its entries before the fork point
-(nobody can tell which branch is the author's), and tell the app. Any member can serve
+proof, show only its entries before the fork point (nobody can tell which
+branch is the author's), accept nothing at or past it, and tell the app;
+the proof travels with the log, and a member that learns of the fork before
+it holds the prefix still fills it in. Any member can serve
 another's log, so a member offline for a week catches up from whoever is
 around (unless a rekey happened meanwhile, see *Removal*).
 
@@ -647,8 +659,9 @@ so an app chooses where data lives and how much.
 
 1. Keys, identity, roster, logs, sync. Unit-tested. **Keys** (`group/keys`),
    the **roster** (`group/roster`, conformance-tested against
-   `group/rostermodel`) and **logs** (`group/memberlog`) are built; the
-   sync state machine is next.
+   `group/rostermodel`), **logs** (`group/memberlog`) and the **sync**
+   state machine (`group/sync`) are built. Liveness moves to phase 2,
+   with sessions: it needs time and only discovery uses it.
 2. Warren: a signer interface, multiple listeners, listener-aware
    `Authorize`, mutable puts and replica-aware reads. Then discovery,
    sessions and invites between members in the simulator.

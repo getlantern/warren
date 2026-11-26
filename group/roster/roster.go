@@ -77,6 +77,23 @@ func (r *Roster) Op(id ID) *Op {
 	return nil
 }
 
+// IDs returns the IDs of every operation the roster holds, parents before
+// children: by Lamport clock, which strictly increases along every edge,
+// then by ID.
+func (r *Roster) IDs() []ID {
+	ids := make([]ID, 0, len(r.ops))
+	for id := range r.ops {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b ID) int {
+		if c := cmp.Compare(r.ops[a].Lamport, r.ops[b].Lamport); c != 0 {
+			return c
+		}
+		return bytes.Compare(a[:], b[:])
+	})
+	return ids
+}
+
 // Has reports whether the roster holds id.
 func (r *Roster) Has(id ID) bool { return r.ops[id] != nil }
 

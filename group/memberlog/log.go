@@ -1,7 +1,9 @@
 package memberlog
 
 import (
+	"bytes"
 	"errors"
+	"slices"
 
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/roster"
@@ -9,7 +11,7 @@ import (
 
 var (
 	// ErrForked means the author's log is forked: members keep the proof
-	// and accept nothing more from it.
+	// and accept nothing at or past the fork point.
 	ErrForked = errors.New("memberlog: log forked")
 	// ErrPastCutoff means the author was removed and the entry is past the
 	// head its remover recorded.
@@ -181,19 +183,24 @@ func (l *Log) add(e *Entry, gone *[]*Entry) (bool, error) {
 	if l.removed {
 		return l.addRemoved(e, gone)
 	}
-	if l.fork != nil {
+	// A forked log still takes what lies below its fork point, the prefix
+	// every member shows, so one that learned of the fork first can catch
+	// up with those that held the prefix already.
+	if l.fork != nil && e.Seq >= min(l.fork.A.Seq, l.fork.B.Seq) {
 		return false, ErrForked
 	}
 	// Conflicts first: fork evidence needs no new slot, so the budget
 	// mustn't hide it.
+	var p *ForkProof
 	if old := l.bySeq[e.Seq]; old != nil {
-		l.fork = &ForkProof{A: old, B: e}
+		p = &ForkProof{A: old, B: e}
 	} else if prev := l.bySeq[e.Seq-1]; prev != nil && e.Prev != prev.id {
-		l.fork = &ForkProof{A: prev, B: e}
+		p = &ForkProof{A: prev, B: e}
 	} else if next := l.bySeq[e.Seq+1]; next != nil && next.Prev != e.id {
-		l.fork = &ForkProof{A: e, B: next}
+		p = &ForkProof{A: e, B: next}
 	}
-	if l.fork != nil {
+	if p != nil {
+		l.fork = p // every proof found here lies below the known point
 		l.retop(l.top+1, gone)
 		l.trim() // what the fork hid is held ahead; the proof keeps its own
 		return false, ErrForked
@@ -431,21 +438,8 @@ func (s *Set) Add(e *Entry) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if e.Group != s.group {
-		return false, ErrWrongGroup
-	}
-	if s.fold == nil {
-		return false, ErrNoRoster
-	}
-	if !s.writer(e.Author) {
-		return false, ErrNotWriter // never admitted, or a mirror
-	}
-	// A removed author's log is filled top-down from the recorded head, so
-	// an entry whose epoch stopped counting must still be taken to anchor
-	// the eligible ones below it; it stays hidden (eligible), and anchoring
-	// bounds what is held.
-	if _, removed := s.cutoffs[e.Author]; !removed && !s.epochs[e.Epoch] {
-		return false, ErrUnknownEpoch
+	if err := s.check(e); err != nil {
+		return false, err
 	}
 	l := s.logs[e.Author]
 	if l == nil {
@@ -454,4 +448,171 @@ func (s *Set) Add(e *Entry) (bool, error) {
 	}
 	s.apply(e.Author, l)
 	return l.add(e, &s.gone)
+}
+
+// AddFork takes a fork proof a peer holds: two entries the author signed
+// that can't both be on one chain. Neither is stored, so taking a proof
+// never shows an entry, and it needs no room in the log's window. A proof
+// below the one held replaces it. It reports whether the proof was taken.
+//
+// A removed author's proofs are refused: it can sign a second history
+// after its removal, which members never store (see addRemoved), so a
+// proof from a peer can't be told from one made to hide its log. A proof
+// a member held from before the removal stays (see cut).
+func (s *Set) AddFork(p *ForkProof) (bool, error) {
+	var es [2]*Entry
+	for i, e := range []*Entry{p.A, p.B} {
+		d, err := Decode(e.Encode())
+		if err != nil {
+			return false, err
+		}
+		// Not check: two entries the author signed at one sequence number
+		// prove a fork whatever epoch they name, so a member receiving the
+		// proof after an epoch stopped counting agrees with one that held
+		// it before.
+		if err := s.admits(d); err != nil {
+			return false, err
+		}
+		es[i] = d
+	}
+	a, b := es[0], es[1]
+	if b.Seq < a.Seq {
+		a, b = b, a
+	}
+	if a.Author != b.Author || a.id == b.id ||
+		(a.Seq != b.Seq && (b.Seq != a.Seq+1 || b.Prev == a.id)) {
+		return false, ErrMalformed // not a fork
+	}
+	if _, removed := s.cutoffs[a.Author]; removed {
+		return false, nil
+	}
+	l := s.logs[a.Author]
+	if l == nil {
+		l = newLog(a.Author, s.eligible)
+		s.logs[a.Author] = l
+	}
+	s.apply(a.Author, l)
+	if l.fork != nil && min(l.fork.A.Seq, l.fork.B.Seq) <= a.Seq {
+		return false, nil
+	}
+	l.fork = &ForkProof{A: a, B: b}
+	l.retop(l.top+1, &s.gone)
+	if !l.removed {
+		l.trim()
+	}
+	return true, nil
+}
+
+// check is what any entry must pass to be taken, against the current fold.
+func (s *Set) check(e *Entry) error {
+	if err := s.admits(e); err != nil {
+		return err
+	}
+	// A removed author's log is filled top-down from the recorded head, so
+	// an entry whose epoch stopped counting must still be taken to anchor
+	// the eligible ones below it; it stays hidden (eligible), and anchoring
+	// bounds what is held.
+	if _, removed := s.cutoffs[e.Author]; !removed && !s.epochs[e.Epoch] {
+		return ErrUnknownEpoch
+	}
+	return nil
+}
+
+// admits is what any entry must pass, a fork proof's included: its group,
+// and an author the roster lets write.
+func (s *Set) admits(e *Entry) error {
+	if e.Group != s.group {
+		return ErrWrongGroup
+	}
+	if s.fold == nil {
+		return ErrNoRoster
+	}
+	if !s.writer(e.Author) {
+		return ErrNotWriter // never admitted, or a mirror
+	}
+	return nil
+}
+
+// At returns a copy of the entry of author's log the app sees at seq, or
+// nil.
+func (s *Set) At(author keys.PublicKey, seq uint64) *Entry {
+	l := s.logs[author]
+	if l == nil || seq == 0 || seq > l.top {
+		return nil
+	}
+	return l.bySeq[seq].clone()
+}
+
+// Authors returns the authors whose logs the Set holds, in key order.
+func (s *Set) Authors() []keys.PublicKey {
+	out := make([]keys.PublicKey, 0, len(s.logs))
+	for a := range s.logs {
+		out = append(out, a)
+	}
+	slices.SortFunc(out, func(a, b keys.PublicKey) int { return bytes.Compare(a[:], b[:]) })
+	return out
+}
+
+// Next reports where author's log continues under the current fold: the
+// next sequence number the Set would take, and whether the log fills
+// downward (a removed author's, from its recorded head). done means it
+// takes nothing more: a forked log that has reached its fork point, a
+// removed author's chain anchored down to entry 1, or an author that may
+// not write. A live log otherwise always takes its next entry.
+func (s *Set) Next(author keys.PublicKey) (seq uint64, down, done bool) {
+	if s.fold == nil || !s.writer(author) {
+		return 0, false, true
+	}
+	l := s.logs[author]
+	if c, removed := s.cutoffs[author]; removed {
+		low := c.seq + 1
+		if l != nil {
+			low = l.low
+		}
+		return low - 1, true, low <= 1
+	}
+	if l == nil {
+		return 1, false, false
+	}
+	return l.top + 1, false, l.top >= l.limit() // a forked log fills to its fork point
+}
+
+// Serve returns copies of the entries of author's log a peer asking from
+// seq can take, in the order it takes them, within budget box bytes:
+// along the visible chain, upward or downward (a peer finding where its
+// branch of a fork parts from this one walks down), or, for a removed
+// author, downward through what it holds at or below the cutoff; at most
+// n of them.
+func (s *Set) Serve(author keys.PublicKey, seq uint64, down bool, budget, n int) []*Entry {
+	l := s.logs[author]
+	if l == nil || seq == 0 {
+		return nil
+	}
+	var out []*Entry
+	for {
+		var e *Entry
+		if down && l.removed {
+			// Anchored or not: what this side held from before the removal
+			// may be the very prefix the asker can anchor, and the asker's
+			// addRemoved checks each entry links to the one above it.
+			if seq <= l.cutSeq {
+				e = l.bySeq[seq]
+			}
+		} else if seq <= l.top {
+			e = l.bySeq[seq]
+		}
+		if e == nil || len(e.Box) > budget || len(out) == n {
+			return out
+		}
+		budget -= len(e.Box)
+		out = append(out, e.clone())
+		if down {
+			if seq == 1 {
+				return out
+			}
+			seq--
+		} else {
+			seq++
+		}
+	}
 }
