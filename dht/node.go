@@ -164,7 +164,14 @@ type Node struct {
 	sends  []Send
 	events []Event
 
-	lst *listener
+	lsts []*listener // in the order added
+	// resignedAt is when a mapping change last re-signed every listener,
+	// and resignedFor the address last acted on.
+	resignedAt  time.Time
+	resignedFor netip.AddrPort
+	// retired is removed listeners' session IDs, until they would have
+	// expired: no new offer may take one.
+	retired map[SessionID]time.Time
 	// recordSeq is the last sequence number signed per record target. It
 	// outlives the listener, so re-listening never reuses a number.
 	recordSeq map[krpc.NodeID]int64
@@ -960,12 +967,12 @@ func (n *Node) maintain(now time.Time) {
 	}
 	n.fwd.expire(now)
 	n.expireRelays(now)
-	if n.lst != nil {
-		if n.lst.resignDue {
-			n.resign(now)
+	for _, l := range n.lsts {
+		if l.resignDue {
+			n.resign(now, l)
 		}
-		n.ensureRecords(now)
-		n.keepalive(now)
+		n.ensureRecords(now, l)
+		n.keepalive(now, l)
 	}
 	if n.cfg.PartitionDetection {
 		if changed := n.health.eval(now); changed {
@@ -1009,8 +1016,8 @@ func (n *Node) maintain(now time.Time) {
 		// has one already.
 		// A failing signer was already asked this pass (resignDue is still
 		// set): don't ask again per due record.
-		if e, ok := n.recordEpoch(k); ok && !n.owned[k].fresh && (n.lst == nil || !n.lst.resignDue) {
-			n.signRecord(now, e)
+		if l, e, ok := n.owner(k); ok && !n.owned[k].fresh && !l.resignDue {
+			n.signRecord(now, l, e)
 		}
 		o := n.owned[k]
 		o.fresh = false

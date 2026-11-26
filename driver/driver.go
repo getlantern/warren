@@ -7,6 +7,7 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdh"
@@ -24,10 +25,14 @@ import (
 )
 
 const (
-	inboxSize   = 128 // datagrams queued between the readers and the loop
-	eventsSize  = 32
-	maxPacket   = 2048
-	maxSessions = 1024 // incoming signaling sessions remembered for Answer
+	inboxSize  = 128 // datagrams queued between the readers and the loop
+	eventsSize = 32
+	maxPacket  = 2048
+	// maxSessions is the incoming signaling sessions remembered for Answer,
+	// oldest evicted first: as many as two families' nodes admit while one
+	// session lives with every listener full, so a flood to some keys
+	// doesn't evict a genuine caller to another before it is answered.
+	maxSessions = 2 * dht.MaxListeners * dht.MaxSessions
 	// writeTimeout bounds how long the loop waits on a full send buffer.
 	writeTimeout = 200 * time.Millisecond
 )
@@ -743,51 +748,127 @@ func (n *Node) Snapshot(ctx context.Context) ([]byte, error) {
 }
 
 // Listen makes us reachable for signaling under priv's key on every node, so
-// callers of either family can reach us. Offers arrive as dht.Incoming on
-// Events; reply with Answer.
+// callers of either family can reach us, replacing every key listened
+// under before. Offers arrive as dht.Incoming on Events; reply with Answer.
 func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
-	// One signaling key for every family, so their records are identical.
+	return n.listen(ctx, priv, true)
+}
+
+// AddListener makes us reachable under priv's key as well as any listened
+// under already, on every node; dht.Incoming.Listener says which key an
+// offer called.
+func (n *Node) AddListener(ctx context.Context, priv crypto.Signer) error {
+	return n.listen(ctx, priv, false)
+}
+
+// RemoveListener stops listening under pub on every node, leaving any
+// other key.
+func (n *Node) RemoveListener(ctx context.Context, pub [32]byte) error {
+	_, err := n.each(ctx, func(_ int, d *dht.Node, _ time.Time) error {
+		d.RemoveListener(pub)
+		return nil
+	})
+	return err
+}
+
+// listen listens under priv on every node with one signaling key, so their
+// records are identical, replacing every key or only priv's. It runs on
+// one turn of the loop, and if any node fails while another succeeded it
+// undoes the change on those that succeeded, so siblings never publish
+// different keys.
+func (n *Node) listen(ctx context.Context, priv crypto.Signer, replaceAll bool) error {
+	pub, err := dht.SignerKey(priv)
+	if err != nil {
+		return err
+	}
 	x, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
-	// All on one turn of the loop, so no family serves a new identity while
-	// another's signer failure is still being undone.
 	res := make(chan error, 1)
 	if err := n.do(ctx, func(now time.Time) {
-		type was struct {
-			priv crypto.Signer
-			x    *ecdh.PrivateKey
-			ok   bool
-		}
-		prev := make([]was, len(n.fams))
+		prev := make([][]dht.Listener, len(n.fams))
 		errs := make([]error, len(n.fams))
 		for i, fm := range n.fams {
-			prev[i].priv, prev[i].x, prev[i].ok = fm.node.Listener()
-			errs[i] = fm.node.ListenKey(now, priv, x)
-		}
-		// A family whose signer failed kept its old identity while the
-		// others moved: move them back, so siblings never publish different
-		// identities. (A family failing for another reason, a family down,
-		// leaves the rest listening, as before.)
-		i := slices.IndexFunc(errs, func(e error) bool { return errors.Is(e, dht.ErrSigner) })
-		if i >= 0 && slices.Contains(errs, nil) {
-			for j, fm := range n.fams {
-				if errs[j] != nil {
-					continue
-				}
-				if !prev[j].ok || fm.node.ListenKey(now, prev[j].priv, prev[j].x) != nil {
-					fm.node.Unlisten()
-				}
+			prev[i] = fm.node.Listeners()
+			if replaceAll {
+				errs[i] = fm.node.ListenKey(now, priv, x)
+			} else {
+				errs[i] = fm.node.AddListenerKey(now, priv, x)
 			}
-			res <- errs[i]
+		}
+		i := slices.IndexFunc(errs, func(e error) bool { return e != nil })
+		if i < 0 {
+			res <- nil
 			return
 		}
-		res <- anyOK(errs)
+		if !slices.Contains(errs, nil) {
+			res <- errs[i] // nothing changed anywhere
+			return
+		}
+		for j, fm := range n.fams {
+			if errs[j] != nil {
+				continue
+			}
+			if replaceAll {
+				restoreAll(now, fm.node, prev[j])
+			} else {
+				undoAdd(now, fm.node, pub, prev[j])
+			}
+		}
+		if dropped := n.reconcile(); len(dropped) > 0 {
+			res <- errors.Join(errs[i], fmt.Errorf("driver: undoing it, could not keep listening under %d key(s), now dropped everywhere: %x", len(dropped), dropped))
+			return
+		}
+		res <- errs[i]
 	}); err != nil {
 		return err
 	}
 	return <-res
+}
+
+// restoreAll puts d's listeners back as they were before a Listen.
+func restoreAll(now time.Time, d *dht.Node, prev []dht.Listener) {
+	d.Unlisten()
+	for _, l := range prev {
+		_ = d.AddListenerKey(now, l.Signer, l.SignalKey)
+	}
+}
+
+// undoAdd takes back an AddListener of pub on d, leaving its other
+// listeners (their sessions, holders and records) untouched, and puts back
+// a listener the add replaced under the same key.
+func undoAdd(now time.Time, d *dht.Node, pub [32]byte, prev []dht.Listener) {
+	d.RemoveListener(pub)
+	for _, l := range prev {
+		if l.Key == pub {
+			_ = d.AddListenerKey(now, l.Signer, l.SignalKey)
+		}
+	}
+}
+
+// reconcile drops any key not every node listens under, so after an undo
+// whose re-listening failed somewhere (a signer that won't sign again) the
+// siblings still publish the same keys.
+// It returns the keys dropped.
+func (n *Node) reconcile() [][32]byte {
+	count := map[[32]byte]int{}
+	for _, fm := range n.fams {
+		for _, l := range fm.node.Listeners() {
+			count[l.Key]++
+		}
+	}
+	var dropped [][32]byte
+	for k, c := range count {
+		if c < len(n.fams) {
+			dropped = append(dropped, k)
+			for _, fm := range n.fams {
+				fm.node.RemoveListener(k)
+			}
+		}
+	}
+	slices.SortFunc(dropped, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
+	return dropped
 }
 
 // Answer replies to an offer through the node that delivered it.

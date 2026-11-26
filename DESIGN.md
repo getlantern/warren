@@ -928,7 +928,9 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       certificate (built: they take a `crypto.Signer`, which an
       `ed25519.PrivateKey` already is; `keys.CryptoSigner` adapts a
       blinded key);
-   2. several listeners per endpoint, and `Authorize` told the listener key;
+   2. several listeners per endpoint, and `Authorize` told the listener key
+      (built: `AddListener`/`RemoveListener`, `Conn.LocalKey`,
+      `Config.AuthorizeListener`; `Listen` unchanged);
    3. mutable-item puts from the endpoint, and reads that return every
       distinct value the replicas hold.
 5. **Sessions and the directory** in the simulator: rendezvous under

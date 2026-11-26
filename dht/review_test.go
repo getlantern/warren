@@ -109,13 +109,13 @@ func TestAnswerThroughUnadoptedReplica(t *testing.T) {
 	}
 	n.Drain()
 	var target krpc.NodeID
-	for _, tg := range n.lst.records {
+	for _, tg := range n.lsts[0].records {
 		target = tg
 	}
 	// Build an offer exactly as a caller does.
 	e, _ := ecdhX25519(n.randBytes(32))
-	shared, _ := e.ECDH(n.lst.x.PublicKey())
-	offerKey, _, _ := signalKeys(shared, e.PublicKey().Bytes(), n.lst.x.PublicKey().Bytes())
+	shared, _ := e.ECDH(n.lsts[0].x.PublicKey())
+	offerKey, _, _ := signalKeys(shared, e.PublicKey().Bytes(), n.lsts[0].x.PublicKey().Bytes())
 	sealed := append(e.PublicKey().Bytes(), n.seal(offerKey, []byte("hi"))...)
 	caller := ed25519.NewKeyFromSeed(append(make([]byte, 31), 1))
 	m, _ := NewMutable(caller, offerSalt(n.randBytes(16), target), t0.Unix(), bencodeBytes(sealed))
@@ -162,7 +162,7 @@ func TestListenReplacesIdentity(t *testing.T) {
 	b := ed25519.NewKeyFromSeed(append(make([]byte, 31), 9))
 	n.Listen(t0, a)
 	var old krpc.NodeID
-	for _, tg := range n.lst.records {
+	for _, tg := range n.lsts[0].records {
 		old = tg
 	}
 	n.Listen(t0, b)
@@ -178,12 +178,12 @@ func TestListenReplacesIdentity(t *testing.T) {
 func buildOffer(t *testing.T, n *Node) *MutableItem {
 	t.Helper()
 	var target krpc.NodeID
-	for _, tg := range n.lst.records {
+	for _, tg := range n.lsts[0].records {
 		target = tg
 	}
 	e, _ := ecdhX25519(n.randBytes(32))
-	shared, _ := e.ECDH(n.lst.x.PublicKey())
-	offerKey, _, _ := signalKeys(shared, e.PublicKey().Bytes(), n.lst.x.PublicKey().Bytes())
+	shared, _ := e.ECDH(n.lsts[0].x.PublicKey())
+	offerKey, _, _ := signalKeys(shared, e.PublicKey().Bytes(), n.lsts[0].x.PublicKey().Bytes())
 	sealed := append(e.PublicKey().Bytes(), n.seal(offerKey, []byte("hi"))...)
 	m, _ := NewMutable(ed25519.NewKeyFromSeed(append(make([]byte, 31), 1)), offerSalt(n.randBytes(16), target), t0.Unix(), bencodeBytes(sealed))
 	return &m
@@ -230,10 +230,10 @@ func TestReplaysCannotCrowdOutHolder(t *testing.T) {
 	n.Drain()
 	holderAddr := addr(77)
 	var target krpc.NodeID
-	for _, tg := range n.lst.records {
+	for _, tg := range n.lsts[0].records {
 		target = tg
 	}
-	n.lst.holders = append(n.lst.holders, &holder{addr: holderAddr, target: target, token: []byte("htok")})
+	n.lsts[0].holders = append(n.lsts[0].holders, &holder{addr: holderAddr, target: target, token: []byte("htok")})
 	m := buildOffer(t, n)
 	n.acceptOffer(t0, addr(50), m)
 	_, events := n.Drain()
@@ -260,7 +260,7 @@ func TestRelistenAdvancesSequence(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(88)), Rand: rng(89)})
 	k := ed25519.NewKeyFromSeed(make([]byte, 32))
 	seqOf := func() (krpc.NodeID, int64, string) {
-		for _, tg := range n.lst.records {
+		for _, tg := range n.lsts[0].records {
 			o := n.owned[tg]
 			return tg, o.rec.mut.Seq, string(o.rec.mut.V)
 		}
@@ -289,19 +289,19 @@ func TestRecordSeqPruneKeepsLiveEntries(t *testing.T) {
 	n := New(Config{ID: outsiderID(rng(90)), Rand: rng(91)})
 	n.Listen(t0, ed25519.NewKeyFromSeed(make([]byte, 32)))
 	var epoch int64
-	for e := range n.lst.records {
+	for e := range n.lsts[0].records {
 		epoch = e
 	}
-	prev, _ := n.signRecord(t0, epoch-1)
+	prev, _ := n.signRecord(t0, n.lsts[0], epoch-1)
 	for range 5 {
-		n.signRecord(t0, epoch-1) // several re-signs in one second: ahead of the clock
+		n.signRecord(t0, n.lsts[0], epoch-1) // several re-signs in one second: ahead of the clock
 	}
 	ahead := n.recordSeq[prev]
 	for i := range 2 * maxRecordSeqs { // stale entries fill the table
 		n.recordSeq[krpc.NodeID{byte(i), byte(i >> 8), 0xee}] = t0.Unix() - 100
 	}
-	n.signRecord(t0, epoch) // triggers the prune
-	n.signRecord(t0, epoch-1)
+	n.signRecord(t0, n.lsts[0], epoch) // triggers the prune
+	n.signRecord(t0, n.lsts[0], epoch-1)
 	if got := n.recordSeq[prev]; got <= ahead {
 		t.Fatalf("previous-epoch record re-signed at seq %d, not above its live %d", got, ahead)
 	}
@@ -377,7 +377,7 @@ func TestReboundResignsRecords(t *testing.T) {
 	}
 	n.reflections = []Reflection{{From: addr(1), Mapped: addr(2)}}
 	seqs := map[krpc.NodeID]int64{}
-	for _, tgt := range n.lst.records {
+	for _, tgt := range n.lsts[0].records {
 		seqs[tgt] = n.owned[tgt].rec.mut.Seq
 	}
 	n.Rebound(t0.Add(time.Second))
@@ -430,25 +430,25 @@ func TestReboundDropsStaleTokensAndPublications(t *testing.T) {
 	if err := n.Listen(t0, ed25519.NewKeyFromSeed(make([]byte, 32))); err != nil {
 		t.Fatal(err)
 	}
-	n.lst.holders = []*holder{{addr: addr(2), token: []byte("old")}}
-	n.lst.sessions[SessionID{1}] = &session{expires: t0.Add(time.Hour), tokens: map[netip.AddrPort][]byte{addr(3): []byte("old")}}
+	n.lsts[0].holders = []*holder{{addr: addr(2), token: []byte("old")}}
+	n.lsts[0].sessions[SessionID{1}] = &session{expires: t0.Add(time.Hour), tokens: map[netip.AddrPort][]byte{addr(3): []byte("old")}}
 	var target krpc.NodeID
-	for _, tg := range n.lst.records {
+	for _, tg := range n.lsts[0].records {
 		target = tg
 	}
 	oldPub := &lookup{gen: n.gen, target: target, acked: []ackedReplica{{addr: addr(4), token: []byte("old")}}}
 	n.Rebound(t0.Add(time.Second))
-	for _, h := range n.lst.holders {
+	for _, h := range n.lsts[0].holders {
 		if h.token != nil {
 			t.Fatalf("holder %v kept a token bound to the old address", h.addr)
 		}
 	}
-	if n.lst.sessions[SessionID{1}].tokens != nil {
+	if n.lsts[0].sessions[SessionID{1}].tokens != nil {
 		t.Fatal("a session kept tokens bound to the old address")
 	}
-	n.lst.holders = nil
+	n.lsts[0].holders = nil
 	n.recordStored(t0.Add(2*time.Second), oldPub)
-	if len(n.lst.holders) != 0 {
+	if len(n.lsts[0].holders) != 0 {
 		t.Fatal("a publication from before the rebind installed its holders")
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -644,12 +645,184 @@ func TestListenNeverSplitsIdentities(t *testing.T) {
 	}
 	keys, listening := map[[32]byte]bool{}, 0
 	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
-		if pk, ok := d.Listening(); ok {
-			keys[pk] = true
+		for _, l := range d.Listeners() {
+			keys[l.Key] = true
 			listening++
 		}
 	})
 	if listening != 2 || len(keys) != 1 || !keys[[32]byte(old.Public().(ed25519.PublicKey))] {
 		t.Fatalf("%d families listening under %d keys: want both, under the old one", listening, len(keys))
+	}
+}
+
+// TestAddListenerSplitRestores: a signer failing for one family on
+// AddListener puts the other family's listeners back as they were.
+func TestAddListenerSplitRestores(t *testing.T) {
+	n, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	defer n.Close()
+	if len(n.Addrs()) != 2 {
+		t.Skip("only one family bound")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a := ed25519.NewKeyFromSeed(make([]byte, 32))
+	b := ed25519.NewKeyFromSeed(append(make([]byte, 31), 1))
+	for _, k := range []ed25519.PrivateKey{a, b} {
+		if err := n.AddListener(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, c, _ := ed25519.GenerateKey(rand.Reader)
+	if err := n.AddListener(ctx, &budget{k: c, n: 1}); !errors.Is(err, dht.ErrSigner) {
+		t.Fatalf("a signer failing for one family: %v", err)
+	}
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		ls := d.Listeners()
+		if len(ls) != 2 || ls[0].Key != [32]byte(a.Public().(ed25519.PublicKey)) || ls[1].Key != [32]byte(b.Public().(ed25519.PublicKey)) {
+			t.Errorf("a family's listeners after the split: %d", len(ls))
+		}
+	})
+	if err := n.RemoveListener(ctx, [32]byte(a.Public().(ed25519.PublicKey))); err != nil {
+		t.Fatal(err)
+	}
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		if ls := d.Listeners(); len(ls) != 1 {
+			t.Errorf("%d listeners after removing one", len(ls))
+		}
+	})
+}
+
+// countSigns counts Sign calls on k.
+type countSigns struct {
+	k     ed25519.PrivateKey
+	signs int
+}
+
+func (c *countSigns) Public() crypto.PublicKey { return c.k.Public() }
+func (c *countSigns) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	c.signs++
+	return c.k.Sign(r, msg, opts)
+}
+
+func dualNode(t *testing.T) *Node {
+	t.Helper()
+	n, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	t.Cleanup(func() { n.Close() })
+	if len(n.Addrs()) != 2 {
+		t.Skip("only one family bound")
+	}
+	return n
+}
+
+// TestFailedAddLeavesOthersAlone: undoing an AddListener that failed on one
+// family touches only the new key: the other listeners aren't rebuilt (or
+// re-signed).
+func TestFailedAddLeavesOthersAlone(t *testing.T) {
+	n := dualNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a := &countSigns{k: ed25519.NewKeyFromSeed(make([]byte, 32))}
+	if err := n.AddListener(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	before := a.signs
+	_, c, _ := ed25519.GenerateKey(rand.Reader)
+	if err := n.AddListener(ctx, &budget{k: c, n: 1}); !errors.Is(err, dht.ErrSigner) {
+		t.Fatalf("a signer failing for one family: %v", err)
+	}
+	if a.signs != before {
+		t.Fatalf("an untouched listener was re-signed %d times by the undo", a.signs-before)
+	}
+}
+
+// TestAddUndoneOnAnyError: a family refusing an AddListener for a reason
+// other than its signer (the listener cap) still undoes it elsewhere, so
+// the call fails rather than leaving the families split.
+func TestAddUndoneOnAnyError(t *testing.T) {
+	n := dualNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	first := true
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		if first { // fill one family to the cap
+			first = false
+			for i := range dht.MaxListeners {
+				seed := make([]byte, 32)
+				seed[0], seed[1] = 7, byte(i)
+				d.AddListener(time.Now(), ed25519.NewKeyFromSeed(seed))
+			}
+		}
+	})
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	if err := n.AddListener(ctx, k); !errors.Is(err, dht.ErrTooManyListeners) {
+		t.Fatalf("an add refused by one family: %v", err)
+	}
+	pub := [32]byte(k.Public().(ed25519.PublicKey))
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		for _, l := range d.Listeners() {
+			if l.Key == pub {
+				t.Error("a family listens under a key the other refused")
+			}
+		}
+	})
+}
+
+// TestReconcileDropsUnsharedKeys: a key only some families listen under
+// is dropped from all.
+func TestReconcileDropsUnsharedKeys(t *testing.T) {
+	n := dualNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	shared := ed25519.NewKeyFromSeed(make([]byte, 32))
+	if err := n.AddListener(ctx, shared); err != nil {
+		t.Fatal(err)
+	}
+	first := true
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		if first {
+			first = false
+			d.AddListener(time.Now(), ed25519.NewKeyFromSeed(append(make([]byte, 31), 5)))
+		}
+	})
+	n.do(ctx, func(time.Time) { n.reconcile() })
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		if ls := d.Listeners(); len(ls) != 1 || ls[0].Key != [32]byte(shared.Public().(ed25519.PublicKey)) {
+			t.Errorf("%d listeners after reconcile", len(ls))
+		}
+	})
+}
+
+// TestUndoReconciles: a restore whose re-listening fails on one family (a
+// previous listener's signer that won't sign again) still leaves both
+// families with the same keys.
+func TestUndoReconciles(t *testing.T) {
+	n := dualNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a := &budget{k: ed25519.NewKeyFromSeed(make([]byte, 32)), n: 2} // one add on two families
+	if err := n.AddListener(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	_, c, _ := ed25519.GenerateKey(rand.Reader)
+	err := n.Listen(ctx, &budget{k: c, n: 1})
+	if !errors.Is(err, dht.ErrSigner) || !strings.Contains(err.Error(), "dropped everywhere") {
+		t.Fatalf("a failed restore should name what it dropped: %v", err)
+	}
+	var sets [][][32]byte
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		var ks [][32]byte
+		for _, l := range d.Listeners() {
+			ks = append(ks, l.Key)
+		}
+		sets = append(sets, ks)
+	})
+	if len(sets) != 2 || len(sets[0]) != len(sets[1]) {
+		t.Fatalf("families listen under different keys: %d and %d", len(sets[0]), len(sets[1]))
 	}
 }
