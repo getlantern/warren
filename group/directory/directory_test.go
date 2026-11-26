@@ -43,12 +43,13 @@ func rendezvous(m *keys.Identity, period uint64) keys.PublicKey {
 // put landing on the replicas puts chooses (all, by default): a non-atomic
 // compare-and-swap.
 type replicas struct {
-	n     int
-	held  []map[string]dht.MutableItem
-	puts  func() []int
-	after func() // runs after each put: a concurrent writer
-	gets  int
-	onGet func(n int) // runs before the n-th get answers
+	n      int
+	held   []map[string]dht.MutableItem
+	puts   func() []int
+	after  func() // runs after each put: a concurrent writer
+	gets   int
+	onGet  func(n int)  // runs before the n-th get answers
+	hidden map[int]bool // replicas a get doesn't reach
 }
 
 func newReplicas(n int) *replicas {
@@ -67,7 +68,10 @@ func (r *replicas) GetMutableAll(_ context.Context, key [32]byte, salt []byte) (
 		r.onGet(r.gets)
 	}
 	var out []dht.MutableItem
-	for _, h := range r.held {
+	for i, h := range r.held {
+		if r.hidden[i] {
+			continue
+		}
 		if it, ok := h[target(key, salt)]; ok && !slices.ContainsFunc(out, func(x dht.MutableItem) bool { return x.Sig == it.Sig }) {
 			out = append(out, it)
 		}
@@ -456,5 +460,24 @@ func TestRetryKeepsReadBack(t *testing.T) {
 	got, _ := d.Read(context.Background(), p, members(a, b, c))
 	if _, ok := got[b.Public()]; !ok {
 		t.Fatal("an entry the writer saw in its read-back was lost on the retry")
+	}
+}
+
+// TestRetryPutsAboveReadBack: a writer whose read-back saw a newer value
+// puts above it on the retry, even when that retry's read reaches only a
+// stale replica.
+func TestRetryPutsAboveReadBack(t *testing.T) {
+	r := newReplicas(2)
+	a, b := member(1), member(2)
+	r.puts = func() []int { return []int{1} }
+	r.after = func() {
+		v, _ := Seal(g, p, 0, []Entry{{Key: rendezvous(b, p), Seen: now}})
+		m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 100, v)
+		r.held[1][target(m.Key, m.Salt)] = m
+	}
+	r.onGet = func(n int) { r.hidden = map[int]bool{1: n == 3 || n == 5} } // every retry's read misses replica 1
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	if err := d.Write(context.Background(), p, members(a, b), []Entry{{Key: rendezvous(a, p), Seen: now}}); err != nil {
+		t.Fatalf("a retry below the sequence number its read-back saw: %v", err)
 	}
 }

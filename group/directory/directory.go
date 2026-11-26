@@ -298,15 +298,18 @@ func (d *Directory) Write(ctx context.Context, p uint64, members []keys.PublicKe
 func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine []Entry, byRendezvous map[keys.PublicKey]keys.PublicKey) error {
 	key := d.Group.DirectoryKey(p)
 	salt := d.Group.DirectorySalt(p, shard)
-	// known is everything read across rounds: a retry repairs what a
-	// concurrent writer dropped, not just this writer's own entries.
+	// known is everything read across rounds, and hi the highest sequence
+	// number seen (read-backs included): a retry repairs what a
+	// concurrent writer dropped, and puts above the newest value seen even
+	// when its next read reaches only stale replicas.
 	var known []Entry
+	var hi int64
 	for range writeTries {
 		cur, seq, err := d.readShard(ctx, p, shard, byRendezvous)
-		if err != nil && len(cur) == 0 && seq == 0 {
+		if err != nil && len(cur) == 0 && seq == 0 && hi == 0 {
 			return err
 		}
-		if seq == math.MaxInt64 {
+		if hi = max(hi, seq); hi == math.MaxInt64 {
 			return ErrPinned
 		}
 		known = merge(known, cur)
@@ -314,18 +317,18 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 		if err != nil {
 			return err
 		}
-		m, err := dht.NewMutable(key, salt, seq+1, v)
+		m, err := dht.NewMutable(key, salt, hi+1, v)
 		if err != nil {
 			return err
 		}
 		if _, err := d.Store.PutMutable(ctx, m, nil); err != nil {
 			return err
 		}
-		back, _, err := d.readShard(ctx, p, shard, byRendezvous)
+		back, backSeq, err := d.readShard(ctx, p, shard, byRendezvous)
 		if err != nil {
 			return err
 		}
-		known = merge(known, back)
+		known, hi = merge(known, back), max(hi, backSeq)
 		if present(back, mine) {
 			return nil
 		}
