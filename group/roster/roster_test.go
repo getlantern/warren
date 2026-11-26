@@ -826,16 +826,27 @@ func TestCloneLeavesOriginal(t *testing.T) {
 	if _, err := (&Writer{R: c, Me: owner}).Rekey(); err != nil {
 		t.Fatal(err)
 	}
-	if r.Len() != 1 || c.Len() != 2 {
+	if r.Len() != 1 || c.Len() != 2 { // checked before the admin's ops below
 		t.Fatalf("lengths %d and %d", r.Len(), c.Len())
 	}
 	if _, err := c.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	// Ops by an admin give the fold views to cache.
+	admin := keys.IdentityFromSeed([32]byte{2})
+	if _, err := (&Writer{R: r, Me: owner}).Add(admin.Public(), "a", Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Add(keys.IdentityFromSeed([32]byte{3}).Public(), "m", Member, keys.PublicKey{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Fold(); err != nil {
 		t.Fatal(err)
 	}
 	before := len(r.views)
+	if before == 0 {
+		t.Fatal("setup: no views cached to share")
+	}
 	c2 := r.Clone()
 	if len(c2.views) != before {
 		t.Fatalf("the clone started with %d of %d cached views", len(c2.views), before)
