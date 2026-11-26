@@ -832,7 +832,21 @@ func TestCloneLeavesOriginal(t *testing.T) {
 	if _, err := c.Fold(); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.views) != 0 && len(r.views) == len(c.views) {
+	if _, err := r.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	before := len(r.views)
+	c2 := r.Clone()
+	if len(c2.views) != before {
+		t.Fatalf("the clone started with %d of %d cached views", len(c2.views), before)
+	}
+	if _, err := (&Writer{R: c2, Me: owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.views) != before {
 		t.Fatal("folding the clone wrote the original's cache")
 	}
 }

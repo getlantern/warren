@@ -311,6 +311,15 @@ func (s *session) admit(_ []roster.ID, ops []*roster.Op) (keys.PublicKey, error)
 	if !h.key.Verify(proof(s.cfg.Secret, !s.cfg.Caller), h.sig) {
 		return h.key, ErrBadProof
 	}
+	// Only operations this side lacks need a copy to fold on; a chain of
+	// ones already held (a replayed hello) costs nothing more.
+	var fresh []*roster.Op
+	for _, o := range ops {
+		if !s.cfg.Roster.Has(o.ID()) {
+			fresh = append(fresh, o)
+		}
+	}
+	ops = fresh
 	r := s.cfg.Roster
 	if len(ops) > 0 {
 		r = r.Clone()
