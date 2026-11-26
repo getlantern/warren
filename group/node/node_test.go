@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	crand "crypto/rand"
+	"errors"
 	"net"
 	"net/netip"
 	"testing"
@@ -160,8 +161,21 @@ func TestMembersSyncOverNetwork(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Ticks alongside the session, which the race detector checks.
+	ticking := make(chan struct{})
+	go func() {
+		defer close(ticking)
+		for range 20 {
+			_ = b.Tick(ctx)
+			_ = a.Tick(ctx)
+		}
+	}()
 	if err := a.Call(ctx, x.m2.Public()); err != nil {
 		t.Fatal(err)
+	}
+	<-ticking
+	if err := b.Call(ctx, x.m1.Public()); err != nil {
+		t.Fatalf("a second session, the other way: %v", err)
 	}
 	b.mu.Lock()
 	l := b.cfg.Logs.Log(x.m1.Public())
@@ -173,8 +187,76 @@ func TestMembersSyncOverNetwork(t *testing.T) {
 	if _, ok := a.Seen()[x.m2.Public()]; !ok {
 		t.Fatal("the caller didn't record reaching the callee")
 	}
-	if _, ok := b.Seen()[x.m1.Public()]; !ok {
-		t.Fatal("the callee didn't record being reached")
+	// The callee records the session after its side returns, which can be
+	// just after the caller's.
+	eventually(t, "the callee didn't record being reached", func() bool {
+		_, ok := b.Seen()[x.m1.Public()]
+		return ok
+	})
+}
+
+func eventually(t *testing.T, msg string, ok func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !ok(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+	}
+}
+
+// TestMutualCallsFailFast: two members calling each other at once don't
+// each wait on the other's session until the session times out.
+func TestMutualCallsFailFast(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r)
+	for range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		errs := make(chan error, 2)
+		start := time.Now()
+		go func() { errs <- a.Call(ctx, x.m2.Public()) }()
+		go func() { errs <- b.Call(ctx, x.m1.Public()) }()
+		<-errs
+		<-errs
+		cancel()
+		if d := time.Since(start); d > 10*time.Second {
+			t.Fatalf("mutual calls took %v; they waited on each other", d)
+		}
+	}
+}
+
+// TestBusyCalleeAnswers: a callee in another session answers busy, and the
+// caller gives up at once rather than waiting out its session or trying
+// again under the sync key.
+func TestBusyCalleeAnswers(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b.active.Store(true) // as if in another session
+	start := time.Now()
+	err := a.Call(ctx, x.m2.Public())
+	b.active.Store(false)
+	if d := time.Since(start); d > a.cfg.CallTimeout {
+		t.Fatalf("the busy call took %v", d)
+	}
+	// A caller in another session gives up too, once connected.
+	a.active.Store(true)
+	p := keys.PeriodOf(time.Now())
+	callee := x.m2.Rendezvous(x.g, p).Public()
+	answered, err2 := a.callAs(ctx, x.m1.Rendezvous(x.g, p), callee)
+	a.active.Store(false)
+	if !answered || !errors.Is(err2, ErrBusy) {
+		t.Fatalf("a busy caller: answered=%v err=%v, want ErrBusy", answered, err2)
+	}
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("got %v, want ErrBusy", err)
+	}
+	if u, ok := err.(interface{ Unwrap() []error }); ok && len(u.Unwrap()) != 1 {
+		t.Fatalf("an answered call was tried again: %v", err)
 	}
 }
 
@@ -200,9 +282,8 @@ func TestNewMemberViaSyncKey(t *testing.T) {
 	if f.Roles[newcomer.Public()] != roster.Member {
 		t.Fatal("the callee didn't learn of the newcomer")
 	}
-	if !b.admits(newcomer.Rendezvous(x.g, keys.PeriodOf(time.Now())).Public()) {
-		t.Fatal("the callee doesn't yet admit the newcomer's rendezvous key")
-	}
+	rv := newcomer.Rendezvous(x.g, keys.PeriodOf(time.Now())).Public()
+	eventually(t, "the callee doesn't admit the newcomer's rendezvous key", func() bool { return b.admits(rv) })
 }
 
 // TestStrangerRefused: a key the roster doesn't hold reaches no session.
@@ -272,6 +353,13 @@ func TestTickRotates(t *testing.T) {
 	if n.listensUnder(key(p)) || !n.listensUnder(key(p+2)) || !n.listensUnder(key(p+3)) {
 		t.Fatal("Tick didn't rotate the listeners")
 	}
+	now = now.Add(-2 * time.Hour) // the clock is corrected back
+	if err := n.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !n.listensUnder(key(p)) || n.listensUnder(key(p+2)) || n.listensUnder(key(p+3)) {
+		t.Fatal("Tick kept listening for periods the clock left")
+	}
 }
 
 // TestAdmits: listeners admit members' rendezvous keys for the previous,
@@ -324,10 +412,11 @@ func TestJoinFailureLeavesNothing(t *testing.T) {
 	x := newGroup(t)
 	h := host(t, seed)
 	c := copyRoster(t, x.r)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = h.Endpoint().Close() // so the join can't listen
 	if _, err := h.Join(ctx, Config{Me: x.m1, Group: x.g, Roster: c, Logs: memberlog.NewSet(c.Group())}); err == nil {
-		t.Fatal("a cancelled join still listened")
+		t.Fatal("a join on a closed endpoint still listened")
 	}
 	h.mu.Lock()
 	left := len(h.groups)

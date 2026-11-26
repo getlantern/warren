@@ -28,14 +28,26 @@ import (
 // streamName is the hysteria2 destination a session stream asks for.
 const streamName = "warren-group:1"
 
-// preamble is the byte a caller writes as soon as it opens the stream: a
-// hysteria2 server isn't handed a stream until its client writes, and a
-// sync-key caller writes nothing of the session until it has the callee's
-// hello.
-const preamble = 'g'
+// A caller writes preamble as soon as it opens the stream: a hysteria2
+// server isn't handed a stream until its client writes, and a sync-key
+// caller writes nothing of the session until it has the callee's hello.
+// The callee answers go, or busy if it's in another session (see
+// Node.active).
+// It answers rather than just closing, since a close can be lost with the
+// connection's teardown and leave the caller waiting out its session.
+const (
+	preamble = 'g'
+	answerGo = 'y'
+	busy     = 'b'
+)
 
-// ErrNotMember means a member the roster doesn't hold was called.
-var ErrNotMember = errors.New("node: not a member")
+var (
+	// ErrNotMember means a member the roster doesn't hold was called.
+	ErrNotMember = errors.New("node: not a member")
+	// ErrBusy means the group was in another session when its call
+	// connected.
+	ErrBusy = errors.New("node: in another session")
+)
 
 // Host owns a warren endpoint and routes its listeners and connections to
 // the groups joined on it.
@@ -45,6 +57,7 @@ type Host struct {
 	groups []*Node
 	cancel context.CancelFunc
 	done   chan struct{}
+	serves sync.WaitGroup
 }
 
 // NewHost starts an endpoint from cfg, deciding admission itself: cfg's
@@ -66,11 +79,13 @@ func NewHost(cfg endpoint.Config) (*Host, error) {
 // Endpoint is the host's endpoint, for bootstrapping its DHT.
 func (h *Host) Endpoint() *endpoint.Endpoint { return h.ep }
 
-// Close stops every group and the endpoint.
+// Close stops every group and the endpoint, and waits for inbound
+// sessions to end, so the rosters and logs are the caller's again.
 func (h *Host) Close() error {
 	h.cancel()
 	err := h.ep.Close()
 	<-h.done
+	h.serves.Wait()
 	return err
 }
 
@@ -103,7 +118,11 @@ func (h *Host) accept(ctx context.Context) {
 			_ = c.Close()
 			continue
 		}
-		go n.serve(ctx, c)
+		h.serves.Add(1)
+		go func() {
+			defer h.serves.Done()
+			n.serve(ctx, c)
+		}()
 	}
 }
 
@@ -126,13 +145,21 @@ type Config struct {
 type Node struct {
 	h   *Host
 	cfg Config
-	// mu holds the roster and logs, which aren't safe for concurrent use:
-	// one session at a time per group.
+	// mu holds the roster, logs and admission set; a session holds it
+	// throughout, and other readers only briefly.
 	mu sync.Mutex
+	// active is set while a session runs: one at a time per group. No
+	// session waits for another: a call in that finds one running is
+	// answered busy, and a call out gives up with ErrBusy. A session that
+	// waited could hold up its peer's, and two members calling each other
+	// could each end up waiting on the other until the session timed out.
+	active atomic.Bool
 
 	lmu       sync.Mutex
 	listening map[uint64]keys.Signer // period → the rendezvous key listened under
 	admit     atomic.Pointer[map[keys.PublicKey]bool]
+
+	shards uint32 // the genesis op's, fixed for the group's life
 
 	smu  sync.Mutex
 	seen map[keys.PublicKey]time.Time // member → last session with it
@@ -147,7 +174,8 @@ func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	if cfg.SessionTimeout == 0 {
 		cfg.SessionTimeout = time.Minute
 	}
-	n := &Node{h: h, cfg: cfg, listening: map[uint64]keys.Signer{}, seen: map[keys.PublicKey]time.Time{}}
+	n := &Node{h: h, cfg: cfg, listening: map[uint64]keys.Signer{}, seen: map[keys.PublicKey]time.Time{},
+		shards: cfg.Roster.Op(cfg.Roster.Group()).Shards}
 	h.mu.Lock()
 	h.groups = append(h.groups, n)
 	h.mu.Unlock()
@@ -188,6 +216,21 @@ func (n *Node) now() time.Time {
 // Run it every few minutes (and after a roster change from outside a
 // session).
 func (n *Node) Tick(ctx context.Context) error {
+	if err := n.rotate(ctx); err != nil {
+		return err
+	}
+	// After lmu is released: refresh waits for mu, which a session holds,
+	// and the host's admission and routing take lmu.
+	n.mu.Lock()
+	n.refresh()
+	n.mu.Unlock()
+	return nil
+}
+
+// rotate listens under this and the next period's rendezvous keys and
+// drops the rest, keeping the previous period's for a call across the
+// boundary.
+func (n *Node) rotate(ctx context.Context) error {
 	p := keys.PeriodOf(n.now())
 	n.lmu.Lock()
 	defer n.lmu.Unlock()
@@ -202,13 +245,12 @@ func (n *Node) Tick(ctx context.Context) error {
 		n.listening[q] = s
 	}
 	for q, s := range n.listening {
-		if q+1 < p { // keep the previous period's for a call across the boundary
+		if q+1 < p || q > p+1 { // q > p+1: the clock went back
 			if n.h.ep.RemoveListener(ctx, s.Public()) == nil { // else the next Tick retries
 				delete(n.listening, q)
 			}
 		}
 	}
-	n.refresh()
 	return nil
 }
 
@@ -230,16 +272,16 @@ func (n *Node) signerFor(key keys.PublicKey) keys.Signer {
 
 // refresh rebuilds the set of caller keys the listeners admit: members'
 // rendezvous keys for the previous, current and next period, and the sync
-// keys for calling each of ours. The roster is read under mu.
+// keys for calling each of ours. mu held, so a set built from an older
+// roster can't replace a newer one.
 func (n *Node) refresh() {
-	n.mu.Lock()
 	f, err := n.cfg.Roster.Fold()
-	n.mu.Unlock()
+	admit := map[keys.PublicKey]bool{}
 	if err != nil {
+		n.admit.Store(&admit) // fail closed: a stale set may hold a removed member
 		return
 	}
 	p := keys.PeriodOf(n.now())
-	admit := map[keys.PublicKey]bool{}
 	for _, q := range []uint64{p - 1, p, p + 1} {
 		for m := range f.Roles {
 			if m == n.cfg.Me.Public() {
@@ -284,6 +326,18 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 			if _, err := io.ReadFull(stream, b[:]); err != nil || b[0] != preamble {
 				return
 			}
+			if !n.begin() {
+				// In a session already. Hold the stream until the caller
+				// hangs up, so the answer isn't lost with the teardown.
+				if _, err := stream.Write([]byte{busy}); err == nil {
+					_, _ = io.Copy(io.Discard, stream)
+				}
+				return
+			}
+			if _, err := stream.Write([]byte{answerGo}); err != nil {
+				n.end()
+				return
+			}
 			_, _ = n.session(ctx, stream, c, false)
 		})
 	})
@@ -297,15 +351,28 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 	}
 }
 
-// session runs one session on stream, holding the group's lock, and
-// records the peer as reached when it ends well.
-func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, caller bool) (keys.PublicKey, error) {
+// begin starts a session unless one is running; see active.
+func (n *Node) begin() bool {
+	if !n.active.CompareAndSwap(false, true) {
+		return false
+	}
 	n.mu.Lock()
+	return true
+}
+
+func (n *Node) end() {
+	n.mu.Unlock()
+	n.active.Store(false)
+}
+
+// session runs one session on stream, begun, which it ends, and records
+// the peer as reached when it ends well.
+func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, caller bool) (keys.PublicKey, error) {
+	defer n.end()
 	peer, err := session.Run(ctx, stream, session.Config{
 		Me: n.cfg.Me, Group: n.cfg.Group, Roster: n.cfg.Roster, Logs: n.cfg.Logs,
 		Secret: c.Secret, Caller: caller, Local: c.LocalKey, Peer: c.PeerKey, Now: n.now(),
 	})
-	n.mu.Unlock()
 	if err == nil {
 		n.smu.Lock()
 		n.seen[peer] = n.now()
@@ -318,7 +385,8 @@ func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, c
 // Call reaches member and syncs with it: under this period's rendezvous
 // key first, and if the member doesn't answer (it may not know us yet, and
 // a listener stays silent to a caller it doesn't admit), under the sync
-// key for calling it.
+// key for calling it. A member that answers and then fails the session
+// isn't called again.
 func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
 	n.mu.Lock()
 	f, err := n.cfg.Roster.Fold()
@@ -336,43 +404,69 @@ func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
 	}
 	var errs []error
 	for _, as := range []keys.Signer{n.cfg.Me.Rendezvous(n.cfg.Group, p), n.cfg.Group.SyncKey(p, callee)} {
-		err := n.callAs(ctx, as, callee)
+		answered, err := n.callAs(ctx, as, callee)
 		if err == nil {
 			return nil
 		}
 		errs = append(errs, err)
-		if ctx.Err() != nil {
+		if answered || ctx.Err() != nil {
 			break
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey) error {
+// callAs calls callee under as, reporting whether it answered.
+func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey) (bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, n.cfg.CallTimeout)
 	defer cancel()
 	c, err := n.h.ep.Connect(cctx, keys.CryptoSigner(as), callee)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = c.Close() }()
 	sctx, scancel := context.WithTimeout(ctx, n.cfg.SessionTimeout)
 	defer scancel()
 	cl, err := hy2.Dial(sctx, c, c.Remote, c.PeerKey, hy2.FromSecret(c.Secret, hy2.ObfsUTP))
 	if err != nil {
-		return err
+		return true, err
 	}
 	defer func() { _ = cl.Close() }()
 	stream, err := cl.DialConn(sctx, streamName)
 	if err != nil {
-		return err
+		return true, err
 	}
 	defer stream.Close()
+	if !n.begin() {
+		return true, ErrBusy // see active
+	}
+	if err := n.answer(stream); err != nil {
+		n.end()
+		return true, err
+	}
+	_, err = n.session(sctx, stream, c, true)
+	return true, err
+}
+
+// answer writes the preamble and reads the callee's answer, waiting no
+// longer than a call.
+func (n *Node) answer(stream net.Conn) error {
 	if _, err := stream.Write([]byte{preamble}); err != nil {
 		return err
 	}
-	_, err = n.session(sctx, stream, c, true)
-	return err
+	t := time.AfterFunc(n.cfg.CallTimeout, func() { _ = stream.Close() })
+	defer t.Stop()
+	var b [1]byte
+	if _, err := io.ReadFull(stream, b[:]); err != nil {
+		return err
+	}
+	switch b[0] {
+	case answerGo:
+		return nil
+	case busy:
+		return ErrBusy
+	}
+	return errors.New("node: bad answer")
 }
 
 // Seen is when each member was last reached in a session.
@@ -422,7 +516,7 @@ func (n *Node) SyncAll(ctx context.Context) error {
 
 // dir is the group's directory, on the host's DHT.
 func (n *Node) dir() *directory.Directory {
-	return &directory.Directory{Group: n.cfg.Group, Shards: n.cfg.Roster.Op(n.cfg.Roster.Group()).Shards, Store: n.h.ep.DHT(), Now: n.now}
+	return &directory.Directory{Group: n.cfg.Group, Shards: n.shards, Store: n.h.ep.DHT(), Now: n.now}
 }
 
 func (n *Node) members() ([]keys.PublicKey, error) {
