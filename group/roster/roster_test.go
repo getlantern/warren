@@ -865,3 +865,30 @@ func TestCloneLeavesOriginal(t *testing.T) {
 		t.Fatal("folding the clone wrote the original's cache")
 	}
 }
+
+// TestClosureOneWalk: the closure of heads is them and their ancestors,
+// unknown ones skipped, the same however often a head repeats.
+func TestClosureOneWalk(t *testing.T) {
+	owner := keys.IdentityFromSeed([32]byte{1})
+	r, err := Found(owner, "g", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := (&Writer{R: r, Me: owner}).Rekey(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	head := r.Heads()[0]
+	one := r.Closure([]ID{head})
+	if len(one) != r.Len() {
+		t.Fatalf("closure of the head: %d of %d", len(one), r.Len())
+	}
+	many := make([]ID, 4096)
+	for i := range many {
+		many[i] = head
+	}
+	if got := r.Closure(append(many, ID{9})); len(got) != len(one) || got[ID{9}] {
+		t.Fatal("repeated or unknown heads changed the closure")
+	}
+}

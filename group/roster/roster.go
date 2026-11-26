@@ -170,6 +170,31 @@ func (r *Roster) Heads() []ID {
 	return hs
 }
 
+// Closure returns the operations among ids the roster holds, with all
+// their ancestors: one walk with one visited set, so ids sharing history,
+// or repeating, cost no more than the roster's size.
+func (r *Roster) Closure(ids []ID) map[ID]bool {
+	seen := map[ID]bool{}
+	var stack []ID
+	push := func(id ID) {
+		if !seen[id] && r.ops[id] != nil {
+			seen[id] = true
+			stack = append(stack, id)
+		}
+	}
+	for _, id := range ids {
+		push(id)
+	}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, p := range r.ops[id].Parents {
+			push(p)
+		}
+	}
+	return seen
+}
+
 // History returns id's strict causal ancestors, or nil if the roster
 // doesn't hold id. It walks the whole history; authority checks ask the
 // narrower descends.

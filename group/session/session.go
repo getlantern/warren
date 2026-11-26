@@ -439,15 +439,7 @@ func decodeHello(b []byte) (hello, error) {
 // this side holds outside their history, parents first, which includes
 // whatever admitted this side.
 func (s *session) chainFor(heads []roster.ID) []*roster.Op {
-	theirs := map[roster.ID]bool{}
-	for _, h := range heads {
-		if s.cfg.Roster.Has(h) {
-			theirs[h] = true
-			for id := range s.cfg.Roster.History(h) {
-				theirs[id] = true
-			}
-		}
-	}
+	theirs := s.cfg.Roster.Closure(heads) // one walk, however many heads share history
 	var ops []*roster.Op
 	for _, id := range s.cfg.Roster.IDs() {
 		if !theirs[id] && id != s.cfg.Roster.Group() {
