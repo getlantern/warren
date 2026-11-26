@@ -105,7 +105,8 @@ type Conn struct {
 	// connection to another path.
 	Remote netip.AddrPort
 	// PeerKey is the provider's key for an outbound connection, the
-	// caller's verified key for an inbound one.
+	// caller's verified key for an inbound one. Like every field here it
+	// is set when the connection is made and read-only after.
 	PeerKey [32]byte
 	// LocalKey is our key: the identity that signed an outbound
 	// connection's offer, or the listener key an inbound one called.
@@ -122,7 +123,7 @@ type Conn struct {
 	resume   [16]byte
 	outbound bool
 	identity crypto.Signer // signs resume offers; outbound only
-	slot     connKey       // its registry slot
+	regKey   connKey       // its registry slot
 	// migrateSlot serializes migrations of this connection: a newer one
 	// waits for one in flight and then runs, so the latest network change
 	// always gets the last word (a one-slot semaphore, so a waiter can give
@@ -785,9 +786,8 @@ type connKey struct {
 	resume [16]byte
 }
 
-// key is the connection's slot, fixed when it was made: PeerKey and
-// LocalKey are exported, and a caller changing one mustn't strand it.
-func (c *Conn) key() connKey { return c.slot }
+// key is the connection's registry slot, fixed when it was made.
+func (c *Conn) key() connKey { return c.regKey }
 
 // punched is a freshly punched path: its socket and the peer's address.
 type punched struct {
@@ -807,7 +807,7 @@ func (e *Endpoint) newConn(pd punched, peer, local [32]byte, secret []byte, iden
 		p: newPath(pd.sock, pd.remote), e: e, resume: resumeID(secret),
 		outbound: identity != nil, identity: identity, created: time.Now(),
 	}
-	c.slot = connKey{peer, local, c.resume}
+	c.regKey = connKey{peer, local, c.resume}
 	e.connsMu.Lock()
 	if e.refusing.Load() {
 		// Refusing began while this connection punched: the host is

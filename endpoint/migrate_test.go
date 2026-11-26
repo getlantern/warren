@@ -172,10 +172,18 @@ func TestRegistrySlotPerListener(t *testing.T) {
 	if e.resumable(cb.resume, caller, lb) != cb {
 		t.Fatal("forgetting one key's connection dropped the other's slot")
 	}
-	cb.LocalKey = [32]byte{0xc} // the app relabels it: its slot must still go
 	e.forget(cb)
 	if e.resumable(cb.resume, caller, lb) != nil {
-		t.Fatal("a relabeled connection's slot outlived it")
+		t.Fatal("a forgotten connection's slot outlived it")
+	}
+	// Outbound connections too: one per (provider, our identity, secret).
+	out := e.newConn(punched{sock: &net.UDPConn{}}, [32]byte{9}, la, secret, key("me"))
+	if e.outConns[out.key()] != out {
+		t.Fatal("an outbound connection got no slot")
+	}
+	e.forget(out)
+	if len(e.outConns) != 0 {
+		t.Fatal("a forgotten outbound connection kept its slot")
 	}
 }
 
