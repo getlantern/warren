@@ -160,11 +160,11 @@ func TestFloodedListenerLeavesOthers(t *testing.T) {
 	n.AddListener(t0, seededKey(1))
 	n.AddListener(t0, seededKey(2))
 	n.Drain()
-	for i := range maxSessions + 10 {
+	for i := range MaxSessions + 10 {
 		n.acceptOffer(t0, addr(40), offerTo(n, n.lsts[0], seededKey(byte(10+i%200)), "flood"))
 	}
-	if c := len(n.lsts[0].sessions); c != maxSessions {
-		t.Fatalf("%d sessions on the flooded key, want the cap, %d", c, maxSessions)
+	if c := len(n.lsts[0].sessions); c != MaxSessions {
+		t.Fatalf("%d sessions on the flooded key, want the cap, %d", c, MaxSessions)
 	}
 	n.Drain()
 	n.acceptOffer(t0, addr(41), offerTo(n, n.lsts[1], seededKey(250), "member"))
@@ -337,7 +337,7 @@ func TestRetryAtCapGetsAnswer(t *testing.T) {
 	if err := n.Answer(t0, in.Session, []byte("ok")); err != nil {
 		t.Fatal(err)
 	}
-	for i := range maxSessions {
+	for i := range MaxSessions {
 		n.acceptOffer(t0, addr(41), offerTo(n, l, seededKey(byte(20+i)), "flood"))
 	}
 	n.Drain()
@@ -369,7 +369,7 @@ func TestMoveReportedByManyBounded(t *testing.T) {
 		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: netip.AddrPortFrom(netip.MustParseAddr("198.51.100.7"), uint16(40001+i))})
 	}
 	n.maintain(t0.Add(2 * time.Second))
-	if c.signs > 2*len(l.records) {
+	if c.signs < len(l.records) || c.signs > 2*len(l.records) {
 		t.Fatalf("%d signs for one move reported by 4 holders", c.signs)
 	}
 }
@@ -390,5 +390,41 @@ func TestMoveNearZeroClock(t *testing.T) {
 	n.keepaliveReply(time.Time{}.Add(time.Second), h, &krpc.Msg{IP: netip.MustParseAddrPort("192.0.2.9:2000")})
 	if n.recordSeq[target] <= seq {
 		t.Fatal("the first move, near the zero clock, wasn't re-signed at once")
+	}
+}
+
+// TestSameAddressSpreadOverPasses: one new address reported by holders
+// across several maintenance passes is re-signed for once, beyond what the
+// same passes sign anyway (publication retries, with no network here).
+func TestSameAddressSpreadOverPasses(t *testing.T) {
+	first := 0
+	run := func(report bool) int {
+		n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+		c := &counting{failing: failing{k: seededKey(1)}}
+		n.AddListener(t0, c)
+		l := n.lsts[0]
+		var target krpc.NodeID
+		for _, tg := range l.records {
+			target = tg
+		}
+		c.signs = 0
+		moved := netip.MustParseAddrPort("198.51.100.7:4000")
+		for i := range 6 {
+			at := t0.Add(time.Duration(1+5*i) * time.Second)
+			if report {
+				h := &holder{addr: addr(60 + i), target: target, mapped: netip.MustParseAddrPort("192.0.2.1:1000")}
+				l.holders = append(l.holders, h)
+				n.keepaliveReply(at, h, &krpc.Msg{IP: moved, R: krpc.Return{V: []byte("1:v")}}) // the holder still has our record
+				if i == 0 {
+					first = c.signs
+				}
+			}
+			n.maintain(at.Add(time.Second))
+		}
+		return c.signs
+	}
+	base, got := run(false), run(true)
+	if first != 1 || got > base+1 {
+		t.Fatalf("%d signs at the first report (want 1); %d over 6 passes, %d without the move", first, got, base)
 	}
 }

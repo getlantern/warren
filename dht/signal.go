@@ -115,10 +115,8 @@ const (
 	pendingAnswerTTL  = 30 * time.Second
 	maxBindings       = 512
 	maxPendingAnswers = 256
-	// maxSessions bounds offers in progress per listener, so a flood to one
-	// key (a public invite's) fills its own share, never another key's;
-	// MaxListeners times it bounds the node's.
-	maxSessions       = 64
+	// maxResignedFor bounds the new addresses remembered as re-signed for.
+	maxResignedFor    = 64
 	maxHolders        = 4
 	holderMaxFailures = 2
 )
@@ -781,13 +779,18 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 	if m.IP.IsValid() {
 		// After a failed re-sign maintenance retries, once a pass, so other
 		// holders' replies don't ask a failing signer again.
-		// Our address moved: every listener's holders bind to it. One
-		// re-sign at once per half keepalive round; a change reported again
-		// inside that (by other holders, or a second move) leaves every
-		// listener due, and the next maintenance pass re-signs once more.
-		// Each holder tracks its own view, as behind a symmetric NAT each
-		// sees its own mapping.
-		if h.mapped.IsValid() && h.mapped != m.IP {
+		// Our address moved: every listener's holders bind to it. Each new
+		// address is acted on once (other holders reporting it need
+		// nothing): at once, unless a re-sign ran within half a keepalive
+		// round, else every listener is left due for the next maintenance
+		// pass. A move is never lost, and however many holders report it
+		// (behind a symmetric NAT each sees its own port) it costs a few
+		// full re-signs, not one per holder.
+		if h.mapped.IsValid() && h.mapped != m.IP && !n.resignedFor[m.IP] {
+			if n.resignedFor == nil || len(n.resignedFor) >= maxResignedFor {
+				n.resignedFor = map[netip.AddrPort]bool{}
+			}
+			n.resignedFor[m.IP] = true
 			if !n.resignedAt.IsZero() && now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval/2)) {
 				for _, x := range n.lsts {
 					x.resignDue = true
@@ -866,7 +869,7 @@ find:
 		}
 		return true
 	}
-	if len(l.sessions) >= maxSessions {
+	if len(l.sessions) >= MaxSessions {
 		return true
 	}
 	// The caller picks the session ID (the salt's first half): one already
