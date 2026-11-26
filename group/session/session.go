@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/getlantern/warren/bencode"
@@ -34,6 +35,9 @@ var (
 	ErrTransportKey = errors.New("session: transport key doesn't match the member")
 	// ErrFrame means a malformed or oversized frame.
 	ErrFrame = errors.New("session: malformed frame")
+	// ErrBacklog means the peer let more than maxQueued bytes of this
+	// side's frames pile up unread.
+	ErrBacklog = errors.New("session: peer isn't reading")
 	// ErrChainTooLarge means a sync session's add chain is past what a
 	// callee takes from a peer it hasn't admitted yet.
 	ErrChainTooLarge = errors.New("session: add chain too large")
@@ -55,6 +59,12 @@ const (
 	frameChain = 'c'
 	frameSync  = 's'
 )
+
+// maxQueued bounds the bytes of frames waiting to be written: sending
+// never blocks the reader (two sides answering each other's bursts can't
+// deadlock), and a peer that never reads can't make it grow without
+// bound. Tests lower it.
+var maxQueued = 64 << 20
 
 var (
 	// chainChunk is the operation bytes one chain frame carries; tests
@@ -89,7 +99,7 @@ type Config struct {
 // (so neither direction is left blocked); after a success conn is the
 // caller's to close.
 func Run(ctx context.Context, conn io.ReadWriteCloser, cfg Config) (keys.PublicKey, error) {
-	s := &session{cfg: cfg, conn: conn, out: make(chan []byte, 256), werr: make(chan error, 1)}
+	s := newSession(cfg, conn)
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -101,10 +111,13 @@ func Run(ctx context.Context, conn io.ReadWriteCloser, cfg Config) (keys.PublicK
 	}()
 	go s.write()
 	peer, err := s.run()
+	if s.backlogged() {
+		err = ErrBacklog // the close it caused is what failed the rest
+	}
 	if err != nil {
 		conn.Close() // unblocks a writer the peer stopped reading
 	}
-	close(s.out)
+	s.finish()
 	if werr := <-s.werr; err == nil {
 		err = werr
 	}
@@ -117,31 +130,87 @@ func Run(ctx context.Context, conn io.ReadWriteCloser, cfg Config) (keys.PublicK
 type session struct {
 	cfg  Config
 	conn io.ReadWriteCloser
-	out  chan []byte
 	werr chan error
+
+	mu       sync.Mutex
+	queue    [][]byte // frames to write, in order
+	queued   int      // their bytes
+	done     bool     // no more frames: write what's queued and stop
+	overflow bool     // the queue passed maxQueued
+	wake     chan struct{}
 	// peerHello is the peer's hello, read and decoded; its proof is
 	// checked in admit, once its member key can be.
 	peerHello hello
 }
 
-// write sends queued frames in order, so this side never blocks reading
-// on the peer reading.
-func (s *session) write() {
-	var err error
-	for f := range s.out {
-		if err == nil {
-			if _, err = s.conn.Write(f); err != nil {
-				s.conn.Close() // unblocks the reader: the session has failed
-			}
-		}
-	}
-	s.werr <- err
+func newSession(cfg Config, conn io.ReadWriteCloser) *session {
+	return &session{cfg: cfg, conn: conn, werr: make(chan error, 1), wake: make(chan struct{}, 1)}
 }
 
+// write sends queued frames in order, from its own goroutine, so this
+// side never blocks reading on the peer reading.
+func (s *session) write() {
+	var err error
+	for {
+		s.mu.Lock()
+		batch, done := s.queue, s.done
+		s.queue, s.queued = nil, 0
+		s.mu.Unlock()
+		for _, f := range batch {
+			if err == nil {
+				if _, err = s.conn.Write(f); err != nil {
+					s.conn.Close() // unblocks the reader: the session has failed
+				}
+			}
+		}
+		if len(batch) == 0 {
+			if done {
+				s.werr <- err
+				return
+			}
+			<-s.wake
+		}
+	}
+}
+
+// send queues a frame without blocking. Past maxQueued bytes unwritten the
+// session fails, closing the connection.
 func (s *session) send(kind byte, body []byte) {
 	f := binary.BigEndian.AppendUint32(nil, uint32(len(body)+1))
-	f = append(f, kind)
-	s.out <- append(f, body...)
+	f = append(append(f, kind), body...)
+	s.mu.Lock()
+	if s.queued+len(f) > maxQueued {
+		s.overflow = true
+		s.mu.Unlock()
+		s.conn.Close()
+		return
+	}
+	s.queue = append(s.queue, f)
+	s.queued += len(f)
+	s.mu.Unlock()
+	s.signal()
+}
+
+func (s *session) signal() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// finish tells the writer no more frames come: it writes what's queued
+// and stops.
+func (s *session) finish() {
+	s.mu.Lock()
+	s.done = true
+	s.mu.Unlock()
+	s.signal()
+}
+
+func (s *session) backlogged() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.overflow
 }
 
 func (s *session) read() (byte, []byte, error) {
@@ -220,11 +289,13 @@ func (s *session) run() (keys.PublicKey, error) {
 		if err != nil {
 			return peer, err
 		}
-		s.sendChain(s.chainFor(heads))
-		s.sendHello()
+		// We know the callee: admit it before sending it anything, so a
+		// peer that isn't it learns nothing of the roster.
 		if peer, err = s.admit(nil); err != nil {
 			return peer, err
 		}
+		s.sendChain(s.chainFor(heads))
+		s.sendHello()
 	} else {
 		s.sendHello()
 		// Only a sync session's callee takes an add chain before the hello.

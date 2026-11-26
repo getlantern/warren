@@ -263,7 +263,7 @@ func TestCapturedProofCantBeReplayed(t *testing.T) {
 		done <- err
 	}()
 	// The replayer reads the callee's hello and sends m1's key and proof.
-	s := &session{conn: a}
+	s := newSession(Config{}, a)
 	if _, _, err := s.read(); err != nil {
 		t.Fatal(err)
 	}
@@ -395,10 +395,10 @@ func TestSendChainSplits(t *testing.T) {
 		}
 	}
 	chainChunk = 1
-	s := &session{out: make(chan []byte, 64)}
+	s := newSession(Config{}, nil)
 	s.sendChain(ops)
-	if len(s.out) != len(ops) {
-		t.Fatalf("%d frames for %d operations, one each at this chunk size", len(s.out), len(ops))
+	if len(s.queue) != len(ops) {
+		t.Fatalf("%d frames for %d operations, one each at this chunk size", len(s.queue), len(ops))
 	}
 }
 
@@ -411,10 +411,10 @@ func TestSendChainFitsFrames(t *testing.T) {
 	for i := range ops {
 		ops[i] = op
 	}
-	s := &session{out: make(chan []byte, 64)}
+	s := newSession(Config{}, nil)
 	s.sendChain(ops)
-	for len(s.out) > 0 {
-		if f := <-s.out; len(f)-4 > maxFrame {
+	for _, f := range s.queue {
+		if len(f)-4 > maxFrame {
 			t.Fatalf("a %d-byte chain frame, past the %d limit", len(f)-4, maxFrame)
 		}
 	}
@@ -439,8 +439,8 @@ func TestFailedSyncKeepsLogsCurrent(t *testing.T) {
 		done <- err
 	}()
 	// m1, admitted properly, then a batch with More and a drop.
-	peer := &session{conn: a, cfg: Config{Me: x.m1, Roster: x.r, Secret: secret, Caller: true,
-		Local: x.rendezvous(x.m1), Peer: x.rendezvous(x.owner)}}
+	peer := newSession(Config{Me: x.m1, Roster: x.r, Secret: secret, Caller: true,
+		Local: x.rendezvous(x.m1), Peer: x.rendezvous(x.owner)}, a)
 	go func() {
 		for {
 			if _, _, err := peer.read(); err != nil {
@@ -467,5 +467,92 @@ func TestFailedSyncKeepsLogsCurrent(t *testing.T) {
 	}
 	if _, down, _ := c.logs.Next(x.m2.Public()); !down {
 		t.Fatal("the logs didn't follow a removal the roster took before the drop")
+	}
+}
+
+// TestSendNeverBlocks: frames queue without blocking while the peer isn't
+// reading, so two sides answering each other's bursts can't deadlock.
+func TestSendNeverBlocks(t *testing.T) {
+	a, b := net.Pipe() // nobody reads b
+	defer a.Close()
+	defer b.Close()
+	s := newSession(Config{}, a)
+	go s.write()
+	done := make(chan struct{})
+	go func() {
+		for range 5000 {
+			s.send(frameSync, make([]byte, 100))
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("send blocked on a peer that isn't reading")
+	}
+	if s.backlogged() {
+		t.Fatal("half a megabyte queued counted as a backlog")
+	}
+}
+
+// TestBacklogFails: past maxQueued bytes unread, the session fails and
+// closes the connection rather than queue without bound.
+func TestBacklogFails(t *testing.T) {
+	defer func(q int) { maxQueued = q }(maxQueued)
+	maxQueued = 1000
+	a, b := net.Pipe()
+	defer b.Close()
+	s := newSession(Config{}, a)
+	for range 20 {
+		s.send(frameSync, make([]byte, 100))
+	}
+	if !s.backlogged() {
+		t.Fatal("a queue past the cap wasn't failed")
+	}
+	if _, err := a.Write([]byte{0}); err == nil {
+		t.Fatal("the connection stayed open past the cap")
+	}
+}
+
+// TestSyncCallerChecksCalleeFirst: a sync-key caller sends nothing of the
+// roster to a callee whose hello doesn't verify.
+func TestSyncCallerChecksCalleeFirst(t *testing.T) {
+	x := newGroup(t)
+	n := x.member(t, x.m1, x.r)
+	syncKey := x.g.SyncKey(keys.PeriodOf(now), x.rendezvous(x.m2))
+	a, b := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), a, Config{Me: n.id, Group: x.g, Roster: n.r, Logs: n.logs, Secret: []byte("secret"),
+			Caller: true, Local: syncKey.Public(), Peer: x.rendezvous(x.m2), Now: now})
+		done <- err
+	}()
+	// A callee posing as m2, with a proof that doesn't verify.
+	pub := x.m2.Public()
+	hello := bencode.Append(nil, bencode.Value{Kind: bencode.Dict, Dict: []bencode.Pair{
+		{Key: []byte("h"), Value: bencode.Value{Kind: bencode.List}},
+		{Key: []byte("k"), Value: bencode.Value{Kind: bencode.String, Str: pub[:]}},
+		{Key: []byte("s"), Value: bencode.Value{Kind: bencode.String, Str: make([]byte, 64)}},
+	}})
+	b.Write(append(append(binary.BigEndian.AppendUint32(nil, uint32(len(hello)+1)), frameHello), hello...))
+	gotc := make(chan []byte, 1)
+	go func() {
+		var got []byte
+		buf := make([]byte, 1<<16)
+		for {
+			k, err := b.Read(buf)
+			got = append(got, buf[:k]...)
+			if err != nil {
+				gotc <- got
+				return
+			}
+		}
+	}()
+	if err := <-done; !errors.Is(err, ErrBadProof) {
+		t.Fatalf("a callee with a bad proof: %v", err)
+	}
+	b.Close()
+	if got := <-gotc; len(got) > 0 {
+		t.Fatalf("the caller sent %d bytes to a callee it hadn't admitted", len(got))
 	}
 }
