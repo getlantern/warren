@@ -948,7 +948,10 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       connection secret, the roster, the transport key matching the
       member, a sync-key caller's add chain), then `group/sync` to the
       end, over any byte stream;
-   2. `group/directory`: sealed shards, merged across replicas;
+   2. `group/directory` (built): sealed shards, per period, of rendezvous
+      keys and last-seen times; a reader merges every distinct value
+      across replicas and keeps only members' keys, a writer reads back
+      and merges again if a concurrent writer displaced it;
    3. `group/node`: the runtime on an endpoint (listening under rendezvous
       keys, calling members, liveness), tested over loopback networks;
    4. join and rejoin sessions, with invites.
