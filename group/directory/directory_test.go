@@ -326,3 +326,42 @@ func TestPinnedShard(t *testing.T) {
 		t.Fatalf("writing a pinned shard: %v", err)
 	}
 }
+
+// TestPlantedFutureDoesntHideValid: a member's valid sighting on one
+// replica survives a planted future one for the same key on another.
+func TestPlantedFutureDoesntHideValid(t *testing.T) {
+	r := newReplicas(2)
+	a := member(1)
+	for i, seen := range []time.Time{now, now.Add(time.Hour)} {
+		v, _ := Seal(g, p, 0, []Entry{{Key: rendezvous(a, p), Seen: seen}})
+		m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 1, v)
+		r.held[i][target(m.Key, m.Salt)] = m
+	}
+	got, _ := (&Directory{Group: g, Shards: 1, Store: r, Now: clock}).Read(context.Background(), p, members(a))
+	if !got[a.Public()].Equal(now) {
+		t.Fatal("a planted future sighting hid a valid one")
+	}
+}
+
+// TestOverflowAtOneSecondWritesOnce: more entries than a shard holds, all
+// at one second, are evicted by key as Seal does, and the write doesn't
+// mistake that for a concurrent writer.
+func TestOverflowAtOneSecondWritesOnce(t *testing.T) {
+	r := newReplicas(1)
+	puts := 0
+	r.puts = func() []int { puts++; return []int{0} }
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	var ids []*keys.Identity
+	var es []Entry
+	for i := range MaxEntries + 4 {
+		id := member(byte(i + 1))
+		ids = append(ids, id)
+		es = append(es, Entry{Key: rendezvous(id, p), Seen: now})
+	}
+	if err := d.Write(context.Background(), p, members(ids...), es); err != nil {
+		t.Fatal(err)
+	}
+	if puts != 1 {
+		t.Fatalf("%d puts for one uncontested write", puts)
+	}
+}

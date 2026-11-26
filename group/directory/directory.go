@@ -209,10 +209,13 @@ func (d *Directory) rendezvousOf(p uint64, members []keys.PublicKey) map[keys.Pu
 	return m
 }
 
-// readShard returns every entry any replica of shard holds in period p,
-// merged, and the highest sequence number seen. Values that don't open
-// (not sealed by a holder of G for this slot) are skipped.
-func (d *Directory) readShard(ctx context.Context, p uint64, shard uint32) ([]Entry, int64, error) {
+// readShard returns every valid entry any replica of shard holds in
+// period p, merged, and the highest sequence number seen. Each replica's
+// entries are validated before the merge, so a planted entry (a future
+// time) can't displace a member's valid sighting from another replica.
+// Values that don't open (not sealed by a holder of G for this slot) are
+// skipped.
+func (d *Directory) readShard(ctx context.Context, p uint64, shard uint32, byRendezvous map[keys.PublicKey]keys.PublicKey) ([]Entry, int64, error) {
 	key := d.Group.DirectoryKey(p)
 	items, err := d.Store.GetMutableAll(ctx, [32]byte(key.Public().(ed25519.PublicKey)), d.Group.DirectorySalt(p, shard))
 	var lists [][]Entry
@@ -220,7 +223,7 @@ func (d *Directory) readShard(ctx context.Context, p uint64, shard uint32) ([]En
 	for _, it := range items {
 		seq = max(seq, it.Seq)
 		if es, oerr := Open(d.Group, p, shard, it.V); oerr == nil {
-			lists = append(lists, es)
+			lists = append(lists, d.valid(es, byRendezvous))
 		}
 	}
 	return merge(lists...), seq, err
@@ -235,11 +238,11 @@ func (d *Directory) Read(ctx context.Context, p uint64, members []keys.PublicKey
 	out := map[keys.PublicKey]time.Time{}
 	var errs []error
 	for shard := range max(d.Shards, 1) {
-		es, _, err := d.readShard(ctx, p, shard)
+		es, _, err := d.readShard(ctx, p, shard, byRendezvous)
 		if err != nil {
 			errs = append(errs, err)
 		}
-		for _, e := range d.valid(es, byRendezvous) {
+		for _, e := range es {
 			if m, ok := byRendezvous[e.Key]; ok && e.Seen.After(out[m]) {
 				out[m] = e.Seen
 			}
@@ -273,14 +276,14 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 	key := d.Group.DirectoryKey(p)
 	salt := d.Group.DirectorySalt(p, shard)
 	for range writeTries {
-		cur, seq, err := d.readShard(ctx, p, shard)
+		cur, seq, err := d.readShard(ctx, p, shard, byRendezvous)
 		if err != nil && len(cur) == 0 && seq == 0 {
 			return err
 		}
 		if seq == math.MaxInt64 {
 			return ErrPinned
 		}
-		v, err := Seal(d.Group, p, shard, merge(d.valid(cur, byRendezvous), mine))
+		v, err := Seal(d.Group, p, shard, merge(cur, mine))
 		if err != nil {
 			return err
 		}
@@ -291,33 +294,33 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 		if _, err := d.Store.PutMutable(ctx, m, nil); err != nil {
 			return err
 		}
-		back, _, err := d.readShard(ctx, p, shard)
+		back, _, err := d.readShard(ctx, p, shard, byRendezvous)
 		if err != nil {
 			return err
 		}
-		if present(d.valid(back, byRendezvous), mine) {
+		if present(back, mine) {
 			return nil
 		}
 	}
 	return errDisplaced
 }
 
-// present reports whether every one of mine is in got, at least as recent
-// (or displaced only because the shard is full of newer entries).
+// present reports whether every one of mine is in got, at least as
+// recent, unless Seal's own capacity policy (newest first, by time then
+// key) would leave it out of a shard holding got and mine: a displaced
+// entry means a concurrent writer, an evicted one doesn't.
 func present(got, mine []Entry) bool {
 	at := map[keys.PublicKey]time.Time{}
 	for _, e := range got {
 		at[e.Key] = e.Seen
 	}
-	var oldest time.Time
-	if kept := newest(got); len(got) >= MaxEntries {
-		oldest = kept[len(kept)-1].Seen // got, a union of replicas, may hold more than a shard does
+	kept := map[keys.PublicKey]bool{}
+	for _, e := range newest(merge(got, mine)) {
+		kept[e.Key] = true
 	}
 	for _, e := range mine {
-		if t, ok := at[e.Key]; !ok || t.Before(e.Seen) {
-			if len(got) < MaxEntries || !e.Seen.Before(oldest) {
-				return false
-			}
+		if t, ok := at[e.Key]; (!ok || t.Before(e.Seen)) && kept[e.Key] {
+			return false
 		}
 	}
 	return true
