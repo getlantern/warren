@@ -284,3 +284,29 @@ func TestSignerFailedNamesListener(t *testing.T) {
 	}
 	t.Fatal("no SignerFailed")
 }
+
+// TestSecondMoveInRoundNotLost: a second address change inside the
+// re-sign window is re-signed by the next maintenance pass.
+func TestSecondMoveInRoundNotLost(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	l := n.lsts[0]
+	var target krpc.NodeID
+	for _, tg := range l.records {
+		target = tg
+	}
+	h1 := &holder{addr: addr(60), target: target, mapped: netip.MustParseAddrPort("192.0.2.1:1000")}
+	h2 := &holder{addr: addr(61), target: target, mapped: netip.MustParseAddrPort("192.0.2.9:2000")}
+	l.holders = append(l.holders, h1, h2)
+	n.keepaliveReply(t0.Add(time.Second), h1, &krpc.Msg{IP: netip.MustParseAddrPort("192.0.2.9:2000")})
+	seq := n.recordSeq[target]
+	// A second move, seconds later: inside the window.
+	n.keepaliveReply(t0.Add(2*time.Second), h2, &krpc.Msg{IP: netip.MustParseAddrPort("198.51.100.7:3000")})
+	if !l.resignDue {
+		t.Fatal("a second move inside the window was dropped")
+	}
+	n.maintain(t0.Add(3 * time.Second))
+	if n.recordSeq[target] <= seq {
+		t.Fatal("maintenance didn't re-sign for the second move")
+	}
+}

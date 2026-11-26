@@ -776,11 +776,19 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 		// re-sign a keepalive round covers every holder reporting it (each
 		// tracks its own view, as behind a symmetric NAT each sees its own
 		// mapping), so many listeners' holders don't each set one off.
-		if h.mapped.IsValid() && h.mapped != m.IP && !now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval/2)) {
-			n.resignedAt = now
-			for _, x := range n.lsts {
-				if !x.resignDue {
-					n.resign(now, x)
+		if h.mapped.IsValid() && h.mapped != m.IP {
+			if now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval / 2)) {
+				// Re-signed for a change this round already: a later one (a
+				// second move) is left to the next maintenance pass, not lost.
+				for _, x := range n.lsts {
+					x.resignDue = true
+				}
+			} else {
+				n.resignedAt = now
+				for _, x := range n.lsts {
+					if !x.resignDue {
+						n.resign(now, x)
+					}
 				}
 			}
 		}
