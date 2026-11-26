@@ -59,12 +59,13 @@ var (
 // Host owns a warren endpoint and routes its listeners and connections to
 // the groups joined on it.
 type Host struct {
-	ep     *endpoint.Endpoint
-	mu     sync.Mutex
-	groups []*Node
-	cancel context.CancelFunc
-	done   chan struct{}
-	serves sync.WaitGroup
+	ep      *endpoint.Endpoint
+	mu      sync.Mutex
+	groups  []*Node
+	cancel  context.CancelFunc
+	done    chan struct{}
+	serves  sync.WaitGroup
+	serving atomic.Int32 // inbound connections being served
 }
 
 // NewHost starts an endpoint from cfg, deciding admission itself: cfg's
@@ -126,8 +127,10 @@ func (h *Host) accept(ctx context.Context) {
 			continue
 		}
 		h.serves.Add(1)
+		h.serving.Add(1)
 		go func() {
 			defer h.serves.Done()
+			defer h.serving.Add(-1)
 			n.serve(ctx, c)
 		}()
 	}
@@ -326,9 +329,11 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 	defer cancel()
 	done := make(chan struct{})
 	var (
-		streams atomic.Int32 // tries the caller has made
-		started atomic.Bool  // a session has begun on c
+		streams  atomic.Int32 // tries the caller has made
+		started  atomic.Bool  // a session has begun on c
+		doneOnce sync.Once
 	)
+	finish := func() { doneOnce.Do(func() { close(done) }) }
 	// Handlers are joined before serve returns, so Host.Close waits for a
 	// session to end and not just for serve.
 	var (
@@ -355,13 +360,18 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 		}
 		var b [1]byte
 		if _, err := io.ReadFull(stream, b[:]); err != nil || b[0] != preamble {
+			finish() // not a caller of ours
 			return
 		}
 		if !n.begin() {
 			// In a session already. Hold the stream until the caller hangs
-			// up, so the answer isn't lost with the teardown.
+			// up, so the answer isn't lost with the teardown; once it has
+			// used its tries, the connection is done.
 			if _, err := stream.Write([]byte{busy}); err == nil {
 				_, _ = io.Copy(io.Discard, stream)
+			}
+			if streams.Load() >= busyTries {
+				finish()
 			}
 			return
 		}
@@ -369,7 +379,7 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 			n.end()
 			return
 		}
-		defer close(done)
+		defer finish()
 		if _, err := stream.Write([]byte{answerGo}); err != nil {
 			n.end()
 			return
@@ -481,39 +491,47 @@ func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey
 	// connection after a random wait: two members calling each other at
 	// once (or a ring of them) each find the other busy, and a new Connect
 	// would spend the callee's per-caller budget.
+	// The wait is random over a window that starts at four round trips
+	// (at least busyWait), so two callers retrying at once rarely collide
+	// again even on a slow path, and doubles each try.
+	window := busyWait
 	for try := 1; ; try++ {
 		if try > 1 {
 			select {
-			case <-time.After(rand.N(busyWait)):
+			case <-time.After(rand.N(window)):
 			case <-sctx.Done():
 				return true, sctx.Err()
 			}
+			window *= 2
 		}
-		err := n.try(sctx, cl, c)
+		rtt, err := n.try(sctx, cl, c)
 		if !errors.Is(err, ErrBusy) || try == busyTries {
 			return true, err
 		}
+		window = max(window, 4*rtt)
 	}
 }
 
-// try is one stream of callAs: begin our session, ask the callee, and run
-// it if the callee answers go.
-func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) error {
-	if !n.begin() {
-		return ErrBusy // see active
-	}
+// try is one stream of callAs: open it (the first does the handshake, so
+// before our session begins), begin our session, ask the callee, and run
+// it if the callee answers go. It reports the answer's round trip, zero if
+// none was asked.
+func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) (time.Duration, error) {
 	stream, err := cl.DialConn(ctx, streamName)
 	if err != nil {
-		n.end()
-		return err
+		return 0, err
 	}
-	defer stream.Close()
+	defer stream.Close() // unwritten, the callee never sees it
+	if !n.begin() {
+		return 0, ErrBusy // see active
+	}
+	start := time.Now()
 	if err := n.answer(ctx, stream); err != nil {
 		n.end()
-		return err
+		return time.Since(start), err
 	}
 	_, err = n.session(ctx, stream, c, true)
-	return err
+	return time.Since(start), err
 }
 
 // answer writes the preamble and reads the callee's answer, waiting no

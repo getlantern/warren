@@ -235,8 +235,9 @@ func TestMutualCallsFailFast(t *testing.T) {
 }
 
 // TestBusyCalleeAnswers: a callee in another session answers busy, and the
-// caller gives up at once rather than waiting out its session or trying
-// again under the sync key.
+// caller tries a bounded number of times on the same connection, then
+// gives up, without waiting out its session or falling back to the sync
+// key.
 func TestBusyCalleeAnswers(t *testing.T) {
 	seed := network(t, 10)
 	x := newGroup(t)
@@ -248,9 +249,11 @@ func TestBusyCalleeAnswers(t *testing.T) {
 	start := time.Now()
 	err := a.Call(ctx, x.m2.Public())
 	b.active.Store(false)
-	if d := time.Since(start); d > a.cfg.CallTimeout {
+	if d := time.Since(start); d > 2*a.cfg.CallTimeout {
 		t.Fatalf("the busy call took %v", d)
 	}
+	// Once the caller has used its tries, the callee lets the connection go.
+	eventually(t, "the callee kept serving a caller that gave up", func() bool { return b.h.serving.Load() == 0 })
 	// A caller in another session gives up too, once connected.
 	a.active.Store(true)
 	p := keys.PeriodOf(time.Now())
@@ -442,24 +445,7 @@ func TestStalledCallerReleasesGroup(t *testing.T) {
 	x := newGroup(t)
 	a := x.join(t, host(t, seed), x.m1, x.r)
 	b := x.join(t, host(t, seed), x.m2, x.r)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	p := keys.PeriodOf(time.Now())
-	c, err := a.h.ep.Connect(ctx, keys.CryptoSigner(x.m1.Rendezvous(x.g, p)), x.m2.Rendezvous(x.g, p).Public())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	cl, err := hy2.Dial(ctx, c, c.Remote, c.PeerKey, hy2.FromSecret(c.Secret, hy2.ObfsUTP))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cl.Close()
-	stream, err := cl.DialConn(ctx, streamName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
+	stream := rawStream(t, a, x.m1, x.m2, x.g)
 	if _, err := stream.Write([]byte{preamble}); err != nil {
 		t.Fatal(err)
 	}
@@ -476,4 +462,43 @@ func TestStalledCallerReleasesGroup(t *testing.T) {
 	if d := time.Since(start); d > b.cfg.CallTimeout+2*time.Second {
 		t.Fatalf("the group stayed busy %v", d)
 	}
+}
+
+// rawStream opens a session stream from a, as from, to member to, writing
+// nothing on it.
+func rawStream(t *testing.T, a *Node, from, to *keys.Identity, g keys.Secret) net.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	p := keys.PeriodOf(time.Now())
+	c, err := a.h.ep.Connect(ctx, keys.CryptoSigner(from.Rendezvous(g, p)), to.Rendezvous(g, p).Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	cl, err := hy2.Dial(ctx, c, c.Remote, c.PeerKey, hy2.FromSecret(c.Secret, hy2.ObfsUTP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cl.Close() })
+	stream, err := cl.DialConn(ctx, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stream.Close() })
+	return stream
+}
+
+// TestBadPreambleEndsServe: a connection whose stream doesn't open with the
+// preamble isn't kept until the session would have timed out.
+func TestBadPreambleEndsServe(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r)
+	stream := rawStream(t, a, x.m1, x.m2, x.g)
+	if _, err := stream.Write([]byte{'?'}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the callee kept serving a stream with a bad preamble", func() bool { return b.h.serving.Load() == 0 })
 }
