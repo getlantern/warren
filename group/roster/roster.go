@@ -63,6 +63,18 @@ func New(genesis *Op) (*Roster, error) {
 	return r, nil
 }
 
+// Clone is a copy of the roster to fold with operations not yet trusted:
+// adding to it leaves r unchanged. Operations are shared (they never change
+// once added); its caches start empty, so folding it writes nothing r
+// reads.
+func (r *Roster) Clone() *Roster {
+	c := &Roster{group: r.group, ops: make(map[ID]*Op, len(r.ops)), views: map[ID]*view{}}
+	for id, o := range r.ops {
+		c.ops[id] = o
+	}
+	return c
+}
+
 // Group returns the group's ID: its genesis's ID.
 func (r *Roster) Group() ID { return r.group }
 

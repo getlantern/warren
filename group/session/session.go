@@ -301,33 +301,47 @@ func (s *session) chainFor(heads []roster.ID) []*roster.Op {
 	return ops
 }
 
-// admit takes the peer's operations (a sync session's add chain), then
-// checks its member key is on the roster, its proof verifies, and the
-// transport key it used is that member's.
+// admit checks the peer's proof verifies under the member key it named,
+// that key is on the roster (with a sync session's add chain folded in),
+// and the transport key it used is that member's. The add chain is folded
+// on a copy of the roster and kept only once all three pass, so a peer
+// that isn't admitted leaves nothing behind.
 func (s *session) admit(_ []roster.ID, ops []*roster.Op) (keys.PublicKey, error) {
 	h := s.peerHello
-	for _, o := range ops {
-		if _, err := s.cfg.Roster.Add(o); err != nil && !errors.Is(err, roster.ErrMissingParent) {
-			return h.key, err
+	if !h.key.Verify(proof(s.cfg.Secret, !s.cfg.Caller), h.sig) {
+		return h.key, ErrBadProof
+	}
+	r := s.cfg.Roster
+	if len(ops) > 0 {
+		r = r.Clone()
+		for _, o := range ops {
+			if _, err := r.Add(o); err != nil && !errors.Is(err, roster.ErrMissingParent) {
+				return h.key, err
+			}
 		}
 	}
-	f, err := s.cfg.Roster.Fold()
+	f, err := r.Fold()
 	if err != nil {
-		return h.key, err
-	}
-	if err := s.cfg.Logs.Update(f); err != nil {
 		return h.key, err
 	}
 	if f.Roles[h.key] == roster.None {
 		return h.key, ErrNotMember
 	}
-	if !h.key.Verify(proof(s.cfg.Secret, !s.cfg.Caller), h.sig) {
-		return h.key, ErrBadProof
-	}
 	if !s.transportMatches(h.key) {
 		return h.key, ErrTransportKey
 	}
-	return h.key, nil
+	// Admitted: keep the chain, and bring the logs up to the roster.
+	for _, o := range ops {
+		if _, err := s.cfg.Roster.Add(o); err != nil && !errors.Is(err, roster.ErrMissingParent) {
+			return h.key, err
+		}
+	}
+	if len(ops) > 0 {
+		if f, err = s.cfg.Roster.Fold(); err != nil {
+			return h.key, err
+		}
+	}
+	return h.key, s.cfg.Logs.Update(f)
 }
 
 // transportMatches reports whether the peer's transport key is member's:

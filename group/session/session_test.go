@@ -240,3 +240,24 @@ func TestProofFromAnotherConnectionRefused(t *testing.T) {
 		t.Fatalf("a proof over another secret: %v / %v", ea, eb)
 	}
 }
+
+// TestRefusedCallerLeavesRosterAlone: a sync-key caller that isn't
+// admitted (its chain doesn't admit it) leaves no operation in the
+// callee's roster.
+func TestRefusedCallerLeavesRosterAlone(t *testing.T) {
+	x := newGroup(t)
+	b := x.member(t, x.m2, x.r)
+	before := b.r.Len()
+	// An op b lacks, which the refused caller presents.
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	a := x.member(t, x.other, x.r) // holds G and the new op, never admitted
+	syncKey := x.g.SyncKey(keys.PeriodOf(now), x.rendezvous(x.m2)).Public()
+	if _, _, _, eb := x.call(t, a, b, syncKey); !errors.Is(eb, ErrNotMember) {
+		t.Fatalf("setup: %v", eb)
+	}
+	if b.r.Len() != before {
+		t.Fatalf("a refused caller added %d operations", b.r.Len()-before)
+	}
+}

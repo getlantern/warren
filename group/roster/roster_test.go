@@ -815,3 +815,24 @@ func TestWritersRefuseTooManyValues(t *testing.T) {
 		t.Fatal("setup: the op should be under the byte bound")
 	}
 }
+
+func TestCloneLeavesOriginal(t *testing.T) {
+	owner := keys.IdentityFromSeed([32]byte{1})
+	r, err := Found(owner, "g", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := r.Clone()
+	if _, err := (&Writer{R: c, Me: owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	if r.Len() != 1 || c.Len() != 2 {
+		t.Fatalf("lengths %d and %d", r.Len(), c.Len())
+	}
+	if _, err := c.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.views) != 0 && len(r.views) == len(c.views) {
+		t.Fatal("folding the clone wrote the original's cache")
+	}
+}
