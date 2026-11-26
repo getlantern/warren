@@ -3,6 +3,7 @@ package dht
 import (
 	"crypto/ed25519"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -129,5 +130,27 @@ func TestGetSameValueTwiceOnce(t *testing.T) {
 	g := getWithReplies(t, key, salt, []*MutableItem{&a, &a, &b})
 	if len(g.Items) != 2 {
 		t.Fatalf("%d items, want 2", len(g.Items))
+	}
+}
+
+// TestGetKeepsNewestUnderReplays: replayed old items filling the cap first
+// don't push out a newer one arriving after them.
+func TestGetKeepsNewestUnderReplays(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	salt := []byte("shard")
+	l := &lookup{}
+	for i := range MaxGetItems {
+		m, _ := NewMutable(priv, salt, int64(i+1), ImmutableValue([]byte{byte(i)}))
+		l.keep(&m)
+	}
+	current, _ := NewMutable(priv, salt, 1000, ImmutableValue([]byte("current")))
+	l.keep(&current)
+	if !slices.ContainsFunc(l.items, func(x *MutableItem) bool { return x.Sig == current.Sig }) {
+		t.Fatal("a newer item was dropped behind replays filling the cap")
+	}
+	stale, _ := NewMutable(priv, salt, 0, ImmutableValue([]byte("stale")))
+	l.keep(&stale)
+	if slices.ContainsFunc(l.items, func(x *MutableItem) bool { return x.Sig == stale.Sig }) || len(l.items) != MaxGetItems {
+		t.Fatal("an item older than every kept one displaced one")
 	}
 }

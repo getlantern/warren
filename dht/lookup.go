@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"bytes"
 	"net/netip"
 	"slices"
 	"time"
@@ -254,10 +255,32 @@ func (l *lookup) closestResponded(k int) []krpc.NodeInfo {
 	return out
 }
 
-// keep records a verified item a mutable get saw, once per signature, up
-// to MaxGetItems.
+// keep records a verified item a mutable get saw, once per signature,
+// keeping the MaxGetItems newest: old signed items anyone can replay must
+// not crowd out the current ones.
 func (l *lookup) keep(mi *MutableItem) {
-	if len(l.items) < MaxGetItems && !slices.ContainsFunc(l.items, func(x *MutableItem) bool { return x.Sig == mi.Sig }) {
-		l.items = append(l.items, mi)
+	if slices.ContainsFunc(l.items, func(x *MutableItem) bool { return x.Sig == mi.Sig }) {
+		return
 	}
+	if len(l.items) < MaxGetItems {
+		l.items = append(l.items, mi)
+		return
+	}
+	oldest := 0
+	for i, x := range l.items {
+		if older(x, l.items[oldest]) {
+			oldest = i
+		}
+	}
+	if older(l.items[oldest], mi) {
+		l.items[oldest] = mi
+	}
+}
+
+// older reports whether a sorts after b in SortItems' newest-first order.
+func older(a, b *MutableItem) bool {
+	if a.Seq != b.Seq {
+		return a.Seq < b.Seq
+	}
+	return bytes.Compare(a.Sig[:], b.Sig[:]) > 0
 }
