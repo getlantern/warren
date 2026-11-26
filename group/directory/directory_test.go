@@ -3,6 +3,7 @@ package directory
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -20,6 +21,16 @@ var (
 
 // The warren DHT driver is a Store.
 var _ Store = (*driver.Node)(nil)
+
+func clock() time.Time { return now }
+
+func members(ids ...*keys.Identity) []keys.PublicKey {
+	var out []keys.PublicKey
+	for _, id := range ids {
+		out = append(out, id.Public())
+	}
+	return out
+}
 
 func member(b byte) *keys.Identity { return keys.IdentityFromSeed([32]byte{b}) }
 
@@ -132,9 +143,9 @@ func TestShardHoldsMaxEntries(t *testing.T) {
 
 func TestWriteThenRead(t *testing.T) {
 	r := newReplicas(4)
-	d := &Directory{Group: g, Shards: 3, Store: r}
+	d := &Directory{Group: g, Shards: 3, Store: r, Now: clock}
 	a, b := member(1), member(2)
-	if err := d.Write(context.Background(), p, []Entry{{Key: rendezvous(a, p), Seen: now}, {Key: rendezvous(b, p), Seen: now.Add(-time.Hour)}}); err != nil {
+	if err := d.Write(context.Background(), p, []keys.PublicKey{a.Public(), b.Public()}, []Entry{{Key: rendezvous(a, p), Seen: now}, {Key: rendezvous(b, p), Seen: now.Add(-time.Hour)}}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.Read(context.Background(), p, []keys.PublicKey{a.Public(), b.Public()})
@@ -148,12 +159,13 @@ func TestWriteThenRead(t *testing.T) {
 // left out.
 func TestReadKeepsOnlyMembers(t *testing.T) {
 	r := newReplicas(2)
-	d := &Directory{Group: g, Shards: 1, Store: r}
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
 	a, stranger := member(1), member(9)
-	d.Write(context.Background(), p, []Entry{
-		{Key: rendezvous(a, p+1), Seen: now},
-		{Key: rendezvous(stranger, p), Seen: now},
-	})
+	// Planted directly, as a holder of G could: a member's key for another
+	// period, and a stranger's.
+	v, _ := Seal(g, p, 0, []Entry{{Key: rendezvous(a, p+1), Seen: now}, {Key: rendezvous(stranger, p), Seen: now}})
+	m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 1, v)
+	r.PutMutable(context.Background(), m, nil)
 	got, _ := d.Read(context.Background(), p, []keys.PublicKey{a.Public()})
 	if len(got) != 0 {
 		t.Fatalf("read %d entries; none is a member's for this period", len(got))
@@ -164,15 +176,15 @@ func TestReadKeepsOnlyMembers(t *testing.T) {
 // each winning on some replicas, are both read.
 func TestConcurrentWritersBothRead(t *testing.T) {
 	r := newReplicas(4)
-	d := &Directory{Group: g, Shards: 1, Store: r}
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
 	a, b := member(1), member(2)
 	r.puts = func() []int { return []int{0, 1} }
-	d.Write(context.Background(), p, []Entry{{Key: rendezvous(a, p), Seen: now}})
+	d.Write(context.Background(), p, members(a, b), []Entry{{Key: rendezvous(a, p), Seen: now}})
 	// b read before a's put landed: its put is at the same sequence number.
 	r.held[2], r.held[3] = map[string]dht.MutableItem{}, map[string]dht.MutableItem{}
 	r.puts = func() []int { return []int{2, 3} }
 	bOnly := &replicas{n: 4, held: []map[string]dht.MutableItem{{}, {}, r.held[2], r.held[3]}, puts: r.puts}
-	(&Directory{Group: g, Shards: 1, Store: bOnly}).Write(context.Background(), p, []Entry{{Key: rendezvous(b, p), Seen: now}})
+	(&Directory{Group: g, Shards: 1, Store: bOnly, Now: clock}).Write(context.Background(), p, members(a, b), []Entry{{Key: rendezvous(b, p), Seen: now}})
 	got, _ := d.Read(context.Background(), p, []keys.PublicKey{a.Public(), b.Public()})
 	if len(got) != 2 {
 		t.Fatalf("read %d of 2 concurrent writers' entries", len(got))
@@ -184,7 +196,7 @@ func TestConcurrentWritersBothRead(t *testing.T) {
 // again.
 func TestWriterMergesAgain(t *testing.T) {
 	r := newReplicas(3)
-	d := &Directory{Group: g, Shards: 1, Store: r}
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
 	a, b := member(1), member(2)
 	r.after = func() {
 		// b, unaware of a's entry, writes a higher sequence number.
@@ -194,7 +206,7 @@ func TestWriterMergesAgain(t *testing.T) {
 			h[target(m.Key, m.Salt)] = m
 		}
 	}
-	if err := d.Write(context.Background(), p, []Entry{{Key: rendezvous(a, p), Seen: now}}); err != nil {
+	if err := d.Write(context.Background(), p, members(a, b), []Entry{{Key: rendezvous(a, p), Seen: now}}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := d.Read(context.Background(), p, []keys.PublicKey{a.Public(), b.Public()})
@@ -210,5 +222,107 @@ func TestShardOfSpreads(t *testing.T) {
 	}
 	if len(seen) != 3 {
 		t.Fatalf("64 members landed in %d of 3 shards", len(seen))
+	}
+}
+
+// TestSubsecondTimesWriteOnce: a last-seen time with nanoseconds (any
+// time.Now) is stored at whole seconds, and the read-back accepts it
+// without putting again.
+func TestSubsecondTimesWriteOnce(t *testing.T) {
+	r := newReplicas(2)
+	puts := 0
+	r.puts = func() []int { puts++; return []int{0, 1} }
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	a := member(1)
+	if err := d.Write(context.Background(), p, members(a), []Entry{{Key: rendezvous(a, p), Seen: now.Add(123456789)}}); err != nil {
+		t.Fatal(err)
+	}
+	if puts != 1 {
+		t.Fatalf("%d puts for one uncontested write", puts)
+	}
+}
+
+// fullShard is a shard of MaxEntries members' entries.
+func fullShard(first byte) ([]*keys.Identity, []Entry) {
+	var ids []*keys.Identity
+	var es []Entry
+	for i := range MaxEntries {
+		id := member(first + byte(i))
+		ids = append(ids, id)
+		es = append(es, Entry{Key: rendezvous(id, p), Seen: now.Add(-time.Duration(i) * time.Second)})
+	}
+	return ids, es
+}
+
+// TestOversizedUnionNoPanic: replicas holding different full shards make
+// a read-back union larger than a shard; the write still completes.
+func TestOversizedUnionNoPanic(t *testing.T) {
+	r := newReplicas(4)
+	idsA, esA := fullShard(10)
+	idsB, esB := fullShard(100)
+	for i, es := range [][]Entry{esA, esB} {
+		v, _ := Seal(g, p, 0, es)
+		m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 5, v)
+		for _, j := range []int{2 * i, 2*i + 1} {
+			r.held[j][target(m.Key, m.Salt)] = m
+		}
+	}
+	r.puts = func() []int { return []int{0} } // a put that reaches one replica
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	w := member(250)
+	all := append(append(members(idsA...), members(idsB...)...), w.Public())
+	if err := d.Write(context.Background(), p, all, []Entry{{Key: rendezvous(w, p), Seen: now}}); err != nil && !errors.Is(err, errDisplaced) {
+		t.Fatal(err)
+	}
+}
+
+// TestPoisonedShardRepaired: a holder of G filling a shard with
+// strangers' far-future entries doesn't keep an honest member out: the
+// writer drops what isn't a member's, and its own entry is read.
+func TestPoisonedShardRepaired(t *testing.T) {
+	r := newReplicas(2)
+	var junk []Entry
+	for i := range MaxEntries {
+		junk = append(junk, Entry{Key: rendezvous(member(byte(200+i)), p), Seen: now.Add(1000 * time.Hour)})
+	}
+	v, _ := Seal(g, p, 0, junk)
+	m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 1, v)
+	r.PutMutable(context.Background(), m, nil)
+	d := &Directory{Group: g, Shards: 1, Store: r, Now: clock}
+	a := member(1)
+	if err := d.Write(context.Background(), p, members(a), []Entry{{Key: rendezvous(a, p), Seen: now}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.Read(context.Background(), p, members(a))
+	if !got[a.Public()].Equal(now) {
+		t.Fatal("a member's entry didn't survive a poisoned shard")
+	}
+}
+
+// TestFutureTimesIgnored: a member's entry dated past the clock (beyond
+// maxSkew) isn't read.
+func TestFutureTimesIgnored(t *testing.T) {
+	r := newReplicas(1)
+	a := member(1)
+	v, _ := Seal(g, p, 0, []Entry{{Key: rendezvous(a, p), Seen: now.Add(time.Hour)}})
+	m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), 1, v)
+	r.PutMutable(context.Background(), m, nil)
+	got, _ := (&Directory{Group: g, Shards: 1, Store: r, Now: clock}).Read(context.Background(), p, members(a))
+	if len(got) != 0 {
+		t.Fatal("an entry an hour in the future was read")
+	}
+}
+
+// TestPinnedShard: a shard at the highest sequence number can't be
+// replaced; the writer says so rather than wrap around.
+func TestPinnedShard(t *testing.T) {
+	r := newReplicas(1)
+	v, _ := Seal(g, p, 0, nil)
+	m, _ := dht.NewMutable(g.DirectoryKey(p), g.DirectorySalt(p, 0), math.MaxInt64, v)
+	r.PutMutable(context.Background(), m, nil)
+	a := member(1)
+	err := (&Directory{Group: g, Shards: 1, Store: r, Now: clock}).Write(context.Background(), p, members(a), []Entry{{Key: rendezvous(a, p), Seen: now}})
+	if !errors.Is(err, ErrPinned) {
+		t.Fatalf("writing a pinned shard: %v", err)
 	}
 }

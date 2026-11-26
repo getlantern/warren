@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"math"
 	"slices"
 	"time"
 
@@ -42,8 +43,23 @@ const (
 	writeTries = 3
 )
 
-// ErrMalformed means a shard's value isn't a sealed list of entries.
-var ErrMalformed = errors.New("directory: malformed shard")
+var (
+	// ErrMalformed means a shard's value isn't a sealed list of entries.
+	ErrMalformed = errors.New("directory: malformed shard")
+	// ErrPinned means a shard's sequence number is at its maximum (a
+	// holder of G signed one there), so no newer value can replace it
+	// this period; the next period's directory key gives a fresh slot.
+	ErrPinned = errors.New("directory: shard pinned at the highest sequence number")
+)
+
+// errDisplaced means concurrent writers kept displacing a writer's
+// entries for every round it tried.
+var errDisplaced = errors.New("directory: concurrent writers kept displacing this shard's entries")
+
+// maxSkew is how far past a reader's or writer's clock a last-seen time
+// may be, so a holder of G can't fill a shard with far-future entries
+// that outlast every honest one.
+const maxSkew = 5 * time.Minute
 
 // Entry is one member's liveness: its rendezvous key for the period and
 // when it was last seen.
@@ -153,6 +169,44 @@ type Directory struct {
 	Group  keys.Secret
 	Shards uint32 // from the group's genesis
 	Store  Store
+	// Now is the clock last-seen times are checked against; nil means
+	// time.Now.
+	Now func() time.Time
+}
+
+func (d *Directory) now() time.Time {
+	if d.Now != nil {
+		return d.Now()
+	}
+	return time.Now()
+}
+
+// valid is entries whose key is a member's rendezvous key for period p
+// (byRendezvous) and whose last-seen time isn't past the clock by more
+// than maxSkew, at the wire's precision (whole seconds). Both paths
+// apply it: a reader so a holder of G can't list strangers, a writer so
+// it doesn't keep and republish what a holder of G planted.
+func (d *Directory) valid(entries []Entry, byRendezvous map[keys.PublicKey]keys.PublicKey) []Entry {
+	limit := d.now().Add(maxSkew)
+	var out []Entry
+	for _, e := range entries {
+		e.Seen = time.Unix(e.Seen.Unix(), 0)
+		if _, ok := byRendezvous[e.Key]; ok && !e.Seen.After(limit) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// rendezvousOf maps each member's rendezvous key for period p to it.
+func (d *Directory) rendezvousOf(p uint64, members []keys.PublicKey) map[keys.PublicKey]keys.PublicKey {
+	m := map[keys.PublicKey]keys.PublicKey{}
+	for _, k := range members {
+		if r, err := keys.Rendezvous(d.Group, p, k); err == nil {
+			m[r] = k
+		}
+	}
+	return m
 }
 
 // readShard returns every entry any replica of shard holds in period p,
@@ -177,12 +231,7 @@ func (d *Directory) readShard(ctx context.Context, p uint64, shard uint32) ([]En
 // so a holder of G can't list a stranger. A shard that couldn't be read
 // is skipped, and its error returned with whatever the rest gave.
 func (d *Directory) Read(ctx context.Context, p uint64, members []keys.PublicKey) (map[keys.PublicKey]time.Time, error) {
-	byRendezvous := map[keys.PublicKey]keys.PublicKey{}
-	for _, m := range members {
-		if r, err := keys.Rendezvous(d.Group, p, m); err == nil {
-			byRendezvous[r] = m
-		}
-	}
+	byRendezvous := d.rendezvousOf(p, members)
 	out := map[keys.PublicKey]time.Time{}
 	var errs []error
 	for shard := range max(d.Shards, 1) {
@@ -190,7 +239,7 @@ func (d *Directory) Read(ctx context.Context, p uint64, members []keys.PublicKey
 		if err != nil {
 			errs = append(errs, err)
 		}
-		for _, e := range es {
+		for _, e := range d.valid(es, byRendezvous) {
 			if m, ok := byRendezvous[e.Key]; ok && e.Seen.After(out[m]) {
 				out[m] = e.Seen
 			}
@@ -201,25 +250,26 @@ func (d *Directory) Read(ctx context.Context, p uint64, members []keys.PublicKey
 
 // Write publishes entries (a writer's own, and those of members it's in
 // session with) for period p: each shard's current entries are read,
-// merged with the new ones, sealed and put, then read back; if a
-// concurrent writer displaced any of them, the shard is merged and put
-// again, up to writeTries rounds.
-func (d *Directory) Write(ctx context.Context, p uint64, entries []Entry) error {
+// those not valid for members dropped, merged with the new ones, sealed
+// and put, then read back; if a concurrent writer displaced any of them,
+// the shard is merged and put again, up to writeTries rounds.
+func (d *Directory) Write(ctx context.Context, p uint64, members []keys.PublicKey, entries []Entry) error {
+	byRendezvous := d.rendezvousOf(p, members)
 	byShard := map[uint32][]Entry{}
-	for _, e := range entries {
+	for _, e := range d.valid(entries, byRendezvous) {
 		s := ShardOf(e.Key, max(d.Shards, 1))
 		byShard[s] = append(byShard[s], e)
 	}
 	var errs []error
 	for _, shard := range sortedShards(byShard) {
-		if err := d.writeShard(ctx, p, shard, byShard[shard]); err != nil {
+		if err := d.writeShard(ctx, p, shard, byShard[shard], byRendezvous); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine []Entry) error {
+func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine []Entry, byRendezvous map[keys.PublicKey]keys.PublicKey) error {
 	key := d.Group.DirectoryKey(p)
 	salt := d.Group.DirectorySalt(p, shard)
 	for range writeTries {
@@ -227,7 +277,10 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 		if err != nil && len(cur) == 0 && seq == 0 {
 			return err
 		}
-		v, err := Seal(d.Group, p, shard, merge(cur, mine))
+		if seq == math.MaxInt64 {
+			return ErrPinned
+		}
+		v, err := Seal(d.Group, p, shard, merge(d.valid(cur, byRendezvous), mine))
 		if err != nil {
 			return err
 		}
@@ -242,11 +295,11 @@ func (d *Directory) writeShard(ctx context.Context, p uint64, shard uint32, mine
 		if err != nil {
 			return err
 		}
-		if present(back, mine) {
+		if present(d.valid(back, byRendezvous), mine) {
 			return nil
 		}
 	}
-	return errors.New("directory: concurrent writers kept displacing this shard's entries")
+	return errDisplaced
 }
 
 // present reports whether every one of mine is in got, at least as recent
@@ -257,8 +310,8 @@ func present(got, mine []Entry) bool {
 		at[e.Key] = e.Seen
 	}
 	var oldest time.Time
-	if len(got) >= MaxEntries {
-		oldest = newest(got)[len(got)-1].Seen
+	if kept := newest(got); len(got) >= MaxEntries {
+		oldest = kept[len(kept)-1].Seen // got, a union of replicas, may hold more than a shard does
 	}
 	for _, e := range mine {
 		if t, ok := at[e.Key]; !ok || t.Before(e.Seen) {
