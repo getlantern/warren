@@ -707,3 +707,71 @@ func TestSyncAllOrder(t *testing.T) {
 		t.Fatal("SyncAll didn't call the most recently reached member first")
 	}
 }
+
+// TestDoWaitsForSession: Do doesn't reach the roster and logs while a
+// session holds them, or while another Do does.
+func TestDoWaitsForSession(t *testing.T) {
+	n := &Node{cfg: Config{Me: me(2), Group: newGroup(t).g, Roster: copyRoster(t, newGroup(t).r)}}
+	if !n.begin() {
+		t.Fatal("begin")
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = n.Do(func(*roster.Roster, *memberlog.Set) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+		t.Fatal("Do ran during a session")
+	case <-time.After(200 * time.Millisecond):
+	}
+	n.end()
+	<-entered
+	second := make(chan struct{})
+	go func() {
+		_ = n.Do(func(*roster.Roster, *memberlog.Set) error { close(second); return nil })
+	}()
+	select {
+	case <-second:
+		t.Fatal("two Do calls overlapped")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-second
+}
+
+// TestLingerBounded: linger gives up on a peer that stops reading or never
+// answers, at CallTimeout or when its context ends.
+func TestLingerBounded(t *testing.T) {
+	n := &Node{cfg: Config{CallTimeout: 200 * time.Millisecond}}
+	bounded := func(name string, d time.Duration, f func()) {
+		t.Helper()
+		start := time.Now()
+		f()
+		if e := time.Since(start); e > d {
+			t.Fatalf("%s: linger took %v", name, e)
+		}
+	}
+	// The peer never reads, so the write blocks.
+	a, _ := net.Pipe()
+	bounded("an unread write", 2*time.Second, func() { n.linger(context.Background(), a) })
+	// The peer reads our done but never answers.
+	a, b := net.Pipe()
+	go func() { _, _ = io.ReadFull(b, make([]byte, 1)) }()
+	bounded("an unanswered read", 2*time.Second, func() { n.linger(context.Background(), a) })
+	// The same, ended by the context long before CallTimeout.
+	slow := &Node{cfg: Config{CallTimeout: time.Minute}}
+	for _, readFirst := range []bool{false, true} {
+		a, b := net.Pipe()
+		if readFirst {
+			go func() { _, _ = io.ReadFull(b, make([]byte, 1)) }()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		bounded("a cancelled linger", 2*time.Second, func() { slow.linger(ctx, a) })
+		cancel()
+	}
+}
