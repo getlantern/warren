@@ -505,3 +505,132 @@ func TestBadPreambleEndsServe(t *testing.T) {
 	}
 	eventually(t, "the callee kept serving a stream with a bad preamble", func() bool { return b.h.serving.Load() == 0 })
 }
+
+// TestCallDoesntWaitOutASession: a call made while the group is in a
+// session gives up busy rather than waiting for the session's lock.
+func TestCallDoesntWaitOutASession(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r)
+	if !b.begin() { // as a session does, holding mu throughout
+		t.Fatal("begin")
+	}
+	defer b.end()
+	got := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		got <- b.Call(ctx, x.m1.Public())
+	}()
+	select {
+	case err := <-got:
+		if !errors.Is(err, ErrBusy) {
+			t.Fatalf("got %v, want ErrBusy", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call waited on the session")
+	}
+}
+
+// TestCallAfterClose: a closed host places no calls.
+func TestCallAfterClose(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	h := host(t, seed)
+	a := x.join(t, h, x.m1, x.r)
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Call(context.Background(), x.m2.Public()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("got %v, want ErrClosed", err)
+	}
+}
+
+// TestRotateWithFullListeners: with the endpoint's listener table full, a
+// new period still drops the old keys and takes the new one.
+func TestRotateWithFullListeners(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	now := time.Now()
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	n, err := h.Join(ctx, Config{Me: x.m1, Group: x.g, Roster: c, Logs: memberlog.NewSet(c.Group()), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range dht.MaxListeners - 2 { // the rest of the table
+		if err := h.ep.AddListener(ctx, keys.CryptoSigner(me(byte(100+i)).Rendezvous(x.g, 0))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := keys.PeriodOf(now)
+	key := func(q uint64) keys.PublicKey { return x.m1.Rendezvous(x.g, q).Public() }
+	now = now.Add(2 * time.Hour)
+	if err := n.Tick(ctx); err == nil {
+		t.Fatal("two new keys fit in one free slot")
+	}
+	if n.listensUnder(key(p)) || !n.listensUnder(key(p+2)) {
+		t.Fatal("a full table kept the old key and not the new period's")
+	}
+}
+
+// TestSyncAllCarriesOn: SyncAll reaches the members it can even when one
+// doesn't answer, and returns that one's error.
+func TestSyncAllCarriesOn(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r) // the owner never joins
+	f, _ := a.cfg.Roster.Fold()
+	e, err := memberlog.Write(x.m1, x.r.Group(), nil, f.Current, a.cfg.Roster.Keyring(x.m1).Epochs[f.Current], memberlog.App, []byte("hi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.cfg.Logs.Add(e); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := a.SyncAll(ctx); err == nil {
+		t.Fatal("reached an owner that never joined")
+	}
+	if _, ok := a.Seen()[x.m2.Public()]; !ok {
+		t.Fatal("SyncAll didn't reach the member that answers")
+	}
+	if _, ok := a.Seen()[x.m1.Public()]; ok {
+		t.Fatal("SyncAll called itself")
+	}
+	b.mu.Lock()
+	l := b.cfg.Logs.Log(x.m1.Public())
+	b.mu.Unlock()
+	if l == nil || len(l.Entries()) != 1 {
+		t.Fatal("the entry didn't reach the member that answers")
+	}
+}
+
+// TestPublishSightings: a member publishes the members it reached this
+// period, so others see them in the directory though they never published.
+func TestPublishSightings(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.Call(ctx, x.m2.Public()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Publish(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.Directory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[x.m2.Public()]; !ok {
+		t.Fatal("the directory didn't show the member that was reached")
+	}
+}
