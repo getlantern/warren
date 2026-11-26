@@ -851,11 +851,15 @@ func TestCloneLeavesOriginal(t *testing.T) {
 	if len(c2.views) != before {
 		t.Fatalf("the clone started with %d of %d cached views", len(c2.views), before)
 	}
-	if _, err := (&Writer{R: c2, Me: owner}).Rekey(); err != nil {
+	// An admin's op on the clone gives its fold a new view to cache.
+	if _, err := (&Writer{R: c2, Me: admin}).Add(keys.IdentityFromSeed([32]byte{4}).Public(), "m", Member, keys.PublicKey{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c2.Fold(); err != nil {
 		t.Fatal(err)
+	}
+	if len(c2.views) <= before {
+		t.Fatal("setup: the clone's fold cached no new view")
 	}
 	if len(r.views) != before {
 		t.Fatal("folding the clone wrote the original's cache")

@@ -2,11 +2,13 @@ package session
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/getlantern/warren/bencode"
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/memberlog"
 	"github.com/getlantern/warren/group/roster"
@@ -19,6 +21,7 @@ func me(b byte) *keys.Identity { return keys.IdentityFromSeed([32]byte{b}) }
 // group is a roster with an owner and two members, and G.
 type group struct {
 	r                    *roster.Roster
+	rBefore              *roster.Roster // as newGroup made it
 	g                    keys.Secret
 	owner, m1, m2, other *keys.Identity
 }
@@ -36,6 +39,7 @@ func newGroup(t *testing.T) *group {
 		}
 	}
 	x.r, x.g = r, r.Keyring(x.owner).Secrets[r.Group()]
+	x.rBefore = copyRoster(t, r)
 	return x
 }
 
@@ -217,16 +221,133 @@ func TestSyncSessionStillNeedsMembership(t *testing.T) {
 	}
 }
 
-// TestProofBoundToConnection: a proof signed for one connection's secret
-// fails on another.
-func TestProofBoundToConnection(t *testing.T) {
+// TestProofBinding: a proof is bound to the group, the role, both
+// transport keys and the connection secret.
+func TestProofBinding(t *testing.T) {
 	x := newGroup(t)
-	sig := x.m1.Sign(proof([]byte("secret one"), true))
-	if x.m1.Public().Verify(proof([]byte("secret two"), true), sig) {
-		t.Fatal("a proof verified on another connection's secret")
+	g := x.r.Group()
+	ra, rb, rc := x.rendezvous(x.m1), x.rendezvous(x.m2), x.rendezvous(x.owner)
+	sig := x.m1.Sign(proof(g, true, ra, rb, []byte("secret")))
+	for name, other := range map[string][]byte{
+		"another secret": proof(g, true, ra, rb, []byte("other")),
+		"reflected":      proof(g, false, ra, rb, []byte("secret")),
+		"another callee": proof(g, true, ra, rc, []byte("secret")),
+		"another caller": proof(g, true, rc, rb, []byte("secret")),
+		"another group":  proof(roster.ID{1}, true, ra, rb, []byte("secret")),
+	} {
+		if x.m1.Public().Verify(other, sig) {
+			t.Fatalf("a proof verified for %s", name)
+		}
 	}
-	if x.m1.Public().Verify(proof([]byte("secret one"), false), sig) {
-		t.Fatal("a caller's proof verified as a callee's")
+}
+
+// TestCapturedProofCantBeReplayed: a member who saw another's proof when
+// called by it can't replay it to a third member under the sync key, with
+// the same secret.
+func TestCapturedProofCantBeReplayed(t *testing.T) {
+	x := newGroup(t)
+	c := x.member(t, x.owner, x.r) // the third member, called
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	// What m2 saw when m1 called it.
+	captured := x.m1.Sign(proof(x.r.Group(), true, x.rendezvous(x.m1), x.rendezvous(x.m2), secret))
+	syncKey := x.g.SyncKey(keys.PeriodOf(now), x.rendezvous(x.owner)).Public()
+	a, b := net.Pipe()
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, b, Config{Me: c.id, Group: x.g, Roster: c.r, Logs: c.logs, Secret: secret,
+			Local: x.rendezvous(x.owner), Peer: syncKey, Now: now})
+		done <- err
+	}()
+	// The replayer reads the callee's hello and sends m1's key and proof.
+	s := &session{conn: a}
+	if _, _, err := s.read(); err != nil {
+		t.Fatal(err)
+	}
+	pub := x.m1.Public()
+	hello := bencode.Append(nil, bencode.Value{Kind: bencode.Dict, Dict: []bencode.Pair{
+		{Key: []byte("h"), Value: bencode.Value{Kind: bencode.List}},
+		{Key: []byte("k"), Value: bencode.Value{Kind: bencode.String, Str: pub[:]}},
+		{Key: []byte("s"), Value: bencode.Value{Kind: bencode.String, Str: captured}},
+	}})
+	f := binary.BigEndian.AppendUint32(nil, uint32(len(hello)+1))
+	a.Write(append(append(f, frameHello), hello...))
+	if err := <-done; !errors.Is(err, ErrBadProof) {
+		t.Fatalf("a replayed proof: %v", err)
+	}
+}
+
+// TestFailedSessionReturns: a peer that sends garbage and never reads
+// doesn't leave Run blocked writing.
+func TestFailedSessionReturns(t *testing.T) {
+	x := newGroup(t)
+	b := x.member(t, x.m2, x.r)
+	p, q := net.Pipe()
+	defer p.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), q, Config{Me: b.id, Group: x.g, Roster: b.r, Logs: b.logs,
+			Secret: []byte("s"), Local: x.rendezvous(x.m2), Peer: x.rendezvous(x.m1), Now: now})
+		done <- err
+	}()
+	p.Write([]byte{0, 0, 0, 2, 'z', 'z'}) // a frame of no known kind; then never read
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("garbage was accepted")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run stayed blocked after the session failed")
+	}
+}
+
+// TestChainAcrossFrames: an add chain larger than one frame still admits
+// the newcomer; one past the cap is refused.
+func TestChainAcrossFrames(t *testing.T) {
+	defer func(c, o int) { chainChunk, maxChainOps = c, o }(chainChunk, maxChainOps)
+	chainChunk = 1 // one operation a frame
+	x := newGroup(t)
+	b := x.member(t, x.m2, x.r)
+	for range 5 {
+		if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Rekey(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newcomer := me(7)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(newcomer.Public(), "n", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	n := x.member(t, newcomer, x.r)
+	syncKey := x.g.SyncKey(keys.PeriodOf(now), x.rendezvous(x.m2)).Public()
+	if _, _, ea, eb := x.call(t, n, b, syncKey); ea != nil || eb != nil {
+		t.Fatalf("a chain over several frames: %v / %v", ea, eb)
+	}
+	maxChainOps = 2
+	b2 := x.member(t, x.m1, x.rBefore)
+	if _, _, _, eb := x.call(t, n, b2, x.g.SyncKey(keys.PeriodOf(now), x.rendezvous(x.m1)).Public()); !errors.Is(eb, ErrChainTooLarge) {
+		t.Fatalf("a chain past the cap: %v", eb)
+	}
+}
+
+// TestTransportPeriodWindow: a rendezvous key of the next or previous
+// period is accepted (a call across a period boundary), one two away isn't.
+func TestTransportPeriodWindow(t *testing.T) {
+	x := newGroup(t)
+	p := keys.PeriodOf(now)
+	for _, c := range []struct {
+		period uint64
+		ok     bool
+	}{{p - 1, true}, {p + 1, true}, {p - 2, false}, {p + 2, false}} {
+		a, b := x.member(t, x.m1, x.r), x.member(t, x.m2, x.r)
+		_, _, _, eb := x.call(t, a, b, x.m1.Rendezvous(x.g, c.period).Public())
+		if c.ok && eb != nil {
+			t.Fatalf("period %+d refused: %v", int64(c.period)-int64(p), eb)
+		}
+		if !c.ok && !errors.Is(eb, ErrTransportKey) {
+			t.Fatalf("period %+d: %v", int64(c.period)-int64(p), eb)
+		}
 	}
 }
 
@@ -259,5 +380,23 @@ func TestRefusedCallerLeavesRosterAlone(t *testing.T) {
 	}
 	if b.r.Len() != before {
 		t.Fatalf("a refused caller added %d operations", b.r.Len()-before)
+	}
+}
+
+// TestSendChainSplits: a chain past chainChunk goes in several frames.
+func TestSendChainSplits(t *testing.T) {
+	defer func(c int) { chainChunk = c }(chainChunk)
+	x := newGroup(t)
+	var ops []*roster.Op
+	for _, id := range x.r.IDs() {
+		if id != x.r.Group() {
+			ops = append(ops, x.r.Op(id))
+		}
+	}
+	chainChunk = 1
+	s := &session{out: make(chan []byte, 64)}
+	s.sendChain(ops)
+	if len(s.out) != len(ops) {
+		t.Fatalf("%d frames for %d operations, one each at this chunk size", len(s.out), len(ops))
 	}
 }

@@ -34,17 +34,35 @@ var (
 	ErrTransportKey = errors.New("session: transport key doesn't match the member")
 	// ErrFrame means a malformed or oversized frame.
 	ErrFrame = errors.New("session: malformed frame")
+	// ErrChainTooLarge means a sync session's add chain is past what a
+	// callee takes from a peer it hasn't admitted yet.
+	ErrChainTooLarge = errors.New("session: add chain too large")
 )
 
 const (
-	// maxFrame bounds a frame: a sync message, or a hello carrying an add
-	// chain.
+	// maxFrame bounds a frame: a sync message, a hello, or a piece of an
+	// add chain.
 	maxFrame = gsync.MaxMessage + 1
-	// maxChainOps bounds the operations a hello may carry.
-	maxChainOps = 1024
+	// maxHeads bounds the roster heads a hello may name.
+	maxHeads = 4096
+	// maxChainOps and maxChainBytes bound the add chain a callee takes
+	// from a caller it hasn't admitted: generous for a real group's roster
+	// (it is causally whole, never cut short), and a limit on what holding
+	// G alone can make a callee keep before being refused.
+	maxChainBytes = 16 << 20
 
 	frameHello = 'h'
+	frameChain = 'c'
 	frameSync  = 's'
+)
+
+var (
+	// chainChunk is the operation bytes one chain frame carries; tests
+	// lower it.
+	chainChunk = 1 << 20
+	// maxChainOps bounds the add chain's operations, with maxChainBytes;
+	// tests lower it.
+	maxChainOps = 8192
 )
 
 // Config is one side of a session.
@@ -67,8 +85,9 @@ type Config struct {
 }
 
 // Run admits the peer and syncs with it, returning its member key once
-// both sides are finished. It closes conn if ctx ends first; otherwise
-// conn is the caller's to close.
+// both sides are finished. It closes conn if ctx ends or the session fails
+// (so neither direction is left blocked); after a success conn is the
+// caller's to close.
 func Run(ctx context.Context, conn io.ReadWriteCloser, cfg Config) (keys.PublicKey, error) {
 	s := &session{cfg: cfg, conn: conn, out: make(chan []byte, 256), werr: make(chan error, 1)}
 	stop := make(chan struct{})
@@ -82,6 +101,9 @@ func Run(ctx context.Context, conn io.ReadWriteCloser, cfg Config) (keys.PublicK
 	}()
 	go s.write()
 	peer, err := s.run()
+	if err != nil {
+		conn.Close() // unblocks a writer the peer stopped reading
+	}
 	close(s.out)
 	if werr := <-s.werr; err == nil {
 		err = werr
@@ -108,7 +130,9 @@ func (s *session) write() {
 	var err error
 	for f := range s.out {
 		if err == nil {
-			_, err = s.conn.Write(f)
+			if _, err = s.conn.Write(f); err != nil {
+				s.conn.Close() // unblocks the reader: the session has failed
+			}
 		}
 	}
 	s.werr <- err
@@ -146,10 +170,7 @@ func (s *session) periods() []uint64 {
 // viaSync reports whether the caller's transport key is the sync key for
 // calling the callee's rendezvous key: a caller the callee may not know.
 func (s *session) viaSync() bool {
-	caller, callee := s.cfg.Peer, s.cfg.Local
-	if s.cfg.Caller {
-		caller, callee = s.cfg.Local, s.cfg.Peer
-	}
+	caller, callee := s.transport()
 	for _, p := range s.periods() {
 		if s.cfg.Group.SyncKey(p, callee).Public() == caller {
 			return true
@@ -158,15 +179,35 @@ func (s *session) viaSync() bool {
 	return false
 }
 
-// proof is what a side signs: the connection's secret and which side it
-// is, so a proof can be neither replayed on another connection nor
-// reflected back.
-func proof(secret []byte, caller bool) []byte {
+// proof is what a side signs: the group, which side it is, both transport
+// keys (the key the caller signed the call with and the key it called),
+// and the connection's secret. The caller picks the secret, so the keys
+// are what keep a proof one member made for calling another from being
+// replayed to a third, under another caller key (a sync key) or to
+// another callee; the role keeps it from being reflected back.
+func proof(group roster.ID, caller bool, callerKey, calleeKey keys.PublicKey, secret []byte) []byte {
 	role := "callee"
 	if caller {
 		role = "caller"
 	}
-	return append([]byte("warren/group/v1 session "+role+" "), secret...)
+	b := append([]byte("warren/group/v1 session "+role+" "), group[:]...)
+	b = append(b, callerKey[:]...)
+	b = append(b, calleeKey[:]...)
+	return append(b, secret...)
+}
+
+// transport is the call's caller and callee keys, whichever side this is.
+func (s *session) transport() (caller, callee keys.PublicKey) {
+	if s.cfg.Caller {
+		return s.cfg.Local, s.cfg.Peer
+	}
+	return s.cfg.Peer, s.cfg.Local
+}
+
+// proofFor is what the caller side (callerSide) signs in this session.
+func (s *session) proofFor(callerSide bool) []byte {
+	caller, callee := s.transport()
+	return proof(s.cfg.Roster.Group(), callerSide, caller, callee, s.cfg.Secret)
 }
 
 func (s *session) run() (keys.PublicKey, error) {
@@ -175,24 +216,23 @@ func (s *session) run() (keys.PublicKey, error) {
 	if sync && s.cfg.Caller {
 		// The callee may not know us: wait for its heads, then send the
 		// operations it lacks that admit us, with our proof.
-		heads, _, err := s.hello()
+		heads, _, err := s.hello(false)
 		if err != nil {
 			return peer, err
 		}
-		s.sendHello(s.chainFor(heads))
-		if peer, err = s.admit(heads, nil); err != nil {
+		s.sendChain(s.chainFor(heads))
+		s.sendHello()
+		if peer, err = s.admit(nil); err != nil {
 			return peer, err
 		}
 	} else {
-		s.sendHello(nil)
-		heads, ops, err := s.hello()
+		s.sendHello()
+		// Only a sync session's callee takes an add chain before the hello.
+		_, ops, err := s.hello(sync && !s.cfg.Caller)
 		if err != nil {
 			return peer, err
 		}
-		if len(ops) > 0 && (!sync || s.cfg.Caller) { // only a sync session's callee takes ops in a hello
-			return peer, fmt.Errorf("%w: operations outside a sync session's hello", ErrFrame)
-		}
-		if peer, err = s.admit(heads, ops); err != nil {
+		if peer, err = s.admit(ops); err != nil {
 			return peer, err
 		}
 	}
@@ -203,42 +243,98 @@ type hello struct {
 	key   keys.PublicKey
 	sig   []byte
 	heads []roster.ID
-	ops   []*roster.Op
 }
 
-func (s *session) sendHello(ops []*roster.Op) {
-	sig := s.cfg.Me.Sign(proof(s.cfg.Secret, s.cfg.Caller))
-	var hs, os []bencode.Value
+func (s *session) sendHello() {
+	sig := s.cfg.Me.Sign(s.proofFor(s.cfg.Caller))
+	var hs []bencode.Value
 	for _, h := range s.cfg.Roster.Heads() {
 		hs = append(hs, bencode.Value{Kind: bencode.String, Str: slices.Clone(h[:])})
-	}
-	for _, o := range ops {
-		os = append(os, bencode.Value{Kind: bencode.String, Str: o.Encode()})
 	}
 	pub := s.cfg.Me.Public()
 	d := bencode.Value{Kind: bencode.Dict, Dict: []bencode.Pair{
 		{Key: []byte("h"), Value: bencode.Value{Kind: bencode.List, List: hs}},
 		{Key: []byte("k"), Value: bencode.Value{Kind: bencode.String, Str: pub[:]}},
-		{Key: []byte("o"), Value: bencode.Value{Kind: bencode.List, List: os}},
 		{Key: []byte("s"), Value: bencode.Value{Kind: bencode.String, Str: sig}},
 	}}
 	s.send(frameHello, bencode.Append(nil, d))
 }
 
-func (s *session) hello() ([]roster.ID, []*roster.Op, error) {
-	kind, b, err := s.read()
-	if err != nil {
-		return nil, nil, err
+// sendChain sends ops in frames of up to chainChunk bytes, before the
+// hello they belong to.
+func (s *session) sendChain(ops []*roster.Op) {
+	var cur []bencode.Value
+	size := 0
+	flush := func() {
+		if len(cur) > 0 {
+			s.send(frameChain, bencode.Append(nil, bencode.Value{Kind: bencode.List, List: cur}))
+			cur, size = nil, 0
+		}
 	}
-	if kind != frameHello {
-		return nil, nil, ErrFrame
+	for _, o := range ops {
+		b := o.Encode()
+		if size+len(b) > chainChunk {
+			flush()
+		}
+		cur = append(cur, bencode.Value{Kind: bencode.String, Str: b})
+		size += len(b)
 	}
-	h, err := decodeHello(b)
-	if err != nil {
-		return nil, nil, err
+	flush()
+}
+
+// hello reads the peer's hello, and before it, if takeChain, the add
+// chain it sends; a chain past maxChainOps or maxChainBytes ends the
+// session.
+func (s *session) hello(takeChain bool) ([]roster.ID, []*roster.Op, error) {
+	var ops []*roster.Op
+	total := 0
+	for {
+		kind, b, err := s.read()
+		if err != nil {
+			return nil, nil, err
+		}
+		switch {
+		case kind == frameChain && takeChain:
+			if total += len(b); total > maxChainBytes {
+				return nil, nil, ErrChainTooLarge
+			}
+			got, err := decodeChain(b)
+			if err != nil {
+				return nil, nil, err
+			}
+			if ops = append(ops, got...); len(ops) > maxChainOps {
+				return nil, nil, ErrChainTooLarge
+			}
+			continue
+		case kind != frameHello:
+			return nil, nil, ErrFrame
+		}
+		h, err := decodeHello(b)
+		if err != nil {
+			return nil, nil, err
+		}
+		s.peerHello = h
+		return h.heads, ops, nil
 	}
-	s.peerHello = h
-	return h.heads, h.ops, nil
+}
+
+func decodeChain(b []byte) ([]*roster.Op, error) {
+	v, err := bencode.DecodeLimit(b, 1<<16)
+	if err != nil || v.Kind != bencode.List {
+		return nil, ErrFrame
+	}
+	var ops []*roster.Op
+	for _, x := range v.List {
+		if x.Kind != bencode.String {
+			return nil, ErrFrame
+		}
+		o, err := roster.Decode(x.Str)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrFrame, err)
+		}
+		ops = append(ops, o)
+	}
+	return ops, nil
 }
 
 func decodeHello(b []byte) (hello, error) {
@@ -250,10 +346,8 @@ func decodeHello(b []byte) (hello, error) {
 	k, ok1 := v.Get("k")
 	sig, ok2 := v.Get("s")
 	hs, ok3 := v.Get("h")
-	os, ok4 := v.Get("o")
-	if !ok1 || !ok2 || !ok3 || !ok4 || k.Kind != bencode.String || len(k.Str) != 32 ||
-		sig.Kind != bencode.String || hs.Kind != bencode.List || os.Kind != bencode.List ||
-		len(hs.List) > maxChainOps || len(os.List) > maxChainOps {
+	if !ok1 || !ok2 || !ok3 || k.Kind != bencode.String || len(k.Str) != 32 ||
+		sig.Kind != bencode.String || hs.Kind != bencode.List || len(hs.List) > maxHeads {
 		return h, ErrFrame
 	}
 	h.key, h.sig = keys.PublicKey(k.Str), slices.Clone(sig.Str)
@@ -262,16 +356,6 @@ func decodeHello(b []byte) (hello, error) {
 			return h, ErrFrame
 		}
 		h.heads = append(h.heads, roster.ID(x.Str))
-	}
-	for _, x := range os.List {
-		if x.Kind != bencode.String {
-			return h, ErrFrame
-		}
-		o, err := roster.Decode(x.Str)
-		if err != nil {
-			return h, fmt.Errorf("%w: %w", ErrFrame, err)
-		}
-		h.ops = append(h.ops, o)
 	}
 	return h, nil
 }
@@ -295,10 +379,7 @@ func (s *session) chainFor(heads []roster.ID) []*roster.Op {
 			ops = append(ops, s.cfg.Roster.Op(id))
 		}
 	}
-	if len(ops) > maxChainOps {
-		ops = ops[len(ops)-maxChainOps:] // the newest, which admit recent members
-	}
-	return ops
+	return ops // whole: a chain cut short would lack the parents of what it keeps
 }
 
 // admit checks the peer's proof verifies under the member key it named,
@@ -306,9 +387,9 @@ func (s *session) chainFor(heads []roster.ID) []*roster.Op {
 // and the transport key it used is that member's. The add chain is folded
 // on a copy of the roster and kept only once all three pass, so a peer
 // that isn't admitted leaves nothing behind.
-func (s *session) admit(_ []roster.ID, ops []*roster.Op) (keys.PublicKey, error) {
+func (s *session) admit(ops []*roster.Op) (keys.PublicKey, error) {
 	h := s.peerHello
-	if !h.key.Verify(proof(s.cfg.Secret, !s.cfg.Caller), h.sig) {
+	if !h.key.Verify(s.proofFor(!s.cfg.Caller), h.sig) {
 		return h.key, ErrBadProof
 	}
 	// Only operations this side lacks need a copy to fold on; a chain of
