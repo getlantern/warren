@@ -943,7 +943,15 @@ line, B runs alongside it, C waits on device time, D is maintenance.
    blinded keys, admission (roster, then member-key proof in the
    session), sync sessions under the sync key, join and rejoin sessions,
    the directory over mutable items, and liveness (members each has
-   reached lately). Drives step 2's state machine.
+   reached lately). Drives step 2's state machine. In four parts:
+   1. `group/session` (built): admission (member-key proofs over the
+      connection secret, the roster, the transport key matching the
+      member, a sync-key caller's add chain), then `group/sync` to the
+      end, over any byte stream;
+   2. `group/directory`: sealed shards, merged across replicas;
+   3. `group/node`: the runtime on an endpoint (listening under rendezvous
+      keys, calling members, liveness), tested over loopback networks;
+   4. join and rejoin sessions, with invites.
 6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
    tree over ciphertext, announcements. Pure library, so it can be built
    alongside steps 4 and 5.

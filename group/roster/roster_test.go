@@ -815,3 +815,80 @@ func TestWritersRefuseTooManyValues(t *testing.T) {
 		t.Fatal("setup: the op should be under the byte bound")
 	}
 }
+
+func TestCloneLeavesOriginal(t *testing.T) {
+	owner := keys.IdentityFromSeed([32]byte{1})
+	r, err := Found(owner, "g", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := r.Clone()
+	if _, err := (&Writer{R: c, Me: owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	if r.Len() != 1 || c.Len() != 2 { // checked before the admin's ops below
+		t.Fatalf("lengths %d and %d", r.Len(), c.Len())
+	}
+	if _, err := c.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	// Ops by an admin give the fold views to cache.
+	admin := keys.IdentityFromSeed([32]byte{2})
+	if _, err := (&Writer{R: r, Me: owner}).Add(admin.Public(), "a", Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: admin}).Add(keys.IdentityFromSeed([32]byte{3}).Public(), "m", Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	before := len(r.views)
+	if before == 0 {
+		t.Fatal("setup: no views cached to share")
+	}
+	c2 := r.Clone()
+	if len(c2.views) != before {
+		t.Fatalf("the clone started with %d of %d cached views", len(c2.views), before)
+	}
+	// An admin's op on the clone gives its fold a new view to cache.
+	if _, err := (&Writer{R: c2, Me: admin}).Add(keys.IdentityFromSeed([32]byte{4}).Public(), "m", Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	if len(c2.views) <= before {
+		t.Fatal("setup: the clone's fold cached no new view")
+	}
+	if len(r.views) != before {
+		t.Fatal("folding the clone wrote the original's cache")
+	}
+}
+
+// TestClosureOneWalk: the closure of heads is them and their ancestors,
+// unknown ones skipped, the same however often a head repeats.
+func TestClosureOneWalk(t *testing.T) {
+	owner := keys.IdentityFromSeed([32]byte{1})
+	r, err := Found(owner, "g", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := (&Writer{R: r, Me: owner}).Rekey(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	head := r.Heads()[0]
+	one := r.Closure([]ID{head})
+	if len(one) != r.Len() {
+		t.Fatalf("closure of the head: %d of %d", len(one), r.Len())
+	}
+	many := make([]ID, 4096)
+	for i := range many {
+		many[i] = head
+	}
+	if got := r.Closure(append(many, ID{9})); len(got) != len(one) || got[ID{9}] {
+		t.Fatal("repeated or unknown heads changed the closure")
+	}
+}

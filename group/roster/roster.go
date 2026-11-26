@@ -63,6 +63,22 @@ func New(genesis *Op) (*Roster, error) {
 	return r, nil
 }
 
+// Clone is a copy of the roster to fold with operations not yet trusted:
+// adding to it leaves r unchanged. Operations and the views already
+// computed are shared (neither ever changes once made), each in a map of
+// the clone's own, so folding it reuses r's work but writes nothing r
+// reads.
+func (r *Roster) Clone() *Roster {
+	c := &Roster{group: r.group, ops: make(map[ID]*Op, len(r.ops)), views: make(map[ID]*view, len(r.views))}
+	for id, o := range r.ops {
+		c.ops[id] = o
+	}
+	for id, v := range r.views {
+		c.views[id] = v
+	}
+	return c
+}
+
 // Group returns the group's ID: its genesis's ID.
 func (r *Roster) Group() ID { return r.group }
 
@@ -152,6 +168,31 @@ func (r *Roster) Heads() []ID {
 	}
 	slices.SortFunc(hs, func(a, b ID) int { return bytes.Compare(a[:], b[:]) })
 	return hs
+}
+
+// Closure returns the operations among ids the roster holds, with all
+// their ancestors: one walk with one visited set, so ids sharing history,
+// or repeating, cost no more than the roster's size.
+func (r *Roster) Closure(ids []ID) map[ID]bool {
+	seen := map[ID]bool{}
+	var stack []ID
+	push := func(id ID) {
+		if !seen[id] && r.ops[id] != nil {
+			seen[id] = true
+			stack = append(stack, id)
+		}
+	}
+	for _, id := range ids {
+		push(id)
+	}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, p := range r.ops[id].Parents {
+			push(p)
+		}
+	}
+	return seen
 }
 
 // History returns id's strict causal ancestors, or nil if the roster
