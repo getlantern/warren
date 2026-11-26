@@ -280,3 +280,62 @@ func TestFailingSignerAskedOncePerPass(t *testing.T) {
 		t.Fatalf("%d signs in one pass for %d records", c.signs, len(n.lst.records))
 	}
 }
+
+// randReader records whether Sign got a randomness source.
+type randReader struct {
+	k   ed25519.PrivateKey
+	got io.Reader
+}
+
+func (r *randReader) Public() crypto.PublicKey { return r.k.Public() }
+func (r *randReader) Sign(rr io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	r.got = rr
+	return r.k.Sign(rr, msg, opts)
+}
+
+func TestSignGetsRandomness(t *testing.T) {
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	r := &randReader{k: k}
+	if _, err := NewMutable(r, nil, 1, []byte("1:v")); err != nil || r.got == nil {
+		t.Fatalf("Sign got no randomness source: %v", err)
+	}
+}
+
+// shifting names key a until switched, then names and signs with b.
+type shifting struct {
+	a, b    ed25519.PrivateKey
+	shifted bool
+}
+
+func (s *shifting) key() ed25519.PrivateKey {
+	if s.shifted {
+		return s.b
+	}
+	return s.a
+}
+func (s *shifting) Public() crypto.PublicKey { return s.key().Public() }
+func (s *shifting) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	return s.key().Sign(r, msg, opts)
+}
+
+// TestKeyChangeAfterListenRefused: a signer whose key changes after
+// Listen fails to re-sign, keeping the record under the listened key.
+func TestKeyChangeAfterListenRefused(t *testing.T) {
+	_, a, _ := ed25519.GenerateKey(rand.Reader)
+	_, b, _ := ed25519.GenerateKey(rand.Reader)
+	s := &shifting{a: a, b: b}
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	if err := n.Listen(t0, s); err != nil {
+		t.Fatal(err)
+	}
+	s.shifted = true
+	n.resign(t0.Add(time.Second))
+	if !n.lst.resignDue {
+		t.Fatal("a re-sign under a changed key was taken")
+	}
+	for _, target := range n.lst.records {
+		if o := n.owned[target]; o.rec.mut.Key != [32]byte(a.Public().(ed25519.PublicKey)) {
+			t.Fatal("a record under the changed key was stored")
+		}
+	}
+}

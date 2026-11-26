@@ -629,6 +629,9 @@ func TestListenNeverSplitsIdentities(t *testing.T) {
 		t.Skip("no IPv6 loopback:", err)
 	}
 	defer n.Close()
+	if len(n.Addrs()) != 2 {
+		t.Skip("only one family bound")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	old := ed25519.NewKeyFromSeed(make([]byte, 32))

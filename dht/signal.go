@@ -33,6 +33,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
@@ -558,6 +559,11 @@ func (n *Node) makeRecord(now time.Time, priv crypto.Signer, pub [32]byte, x *ec
 	// with a new value (BEP 44 error 302), stranding the stale record.
 	seq := max(now.Unix(), n.recordSeq[target]+1)
 	m, err := NewMutable(priv, salt, seq, encodeRecord([32]byte(x.PublicKey().Bytes())))
+	if err == nil && m.Key != pub {
+		// A signer whose key changed since Listen would publish under a
+		// target no caller looks up: a failure like any other.
+		return target, seq, MutableItem{}, fmt.Errorf("%w: its key changed since Listen", ErrSigner)
+	}
 	return target, seq, m, err
 }
 

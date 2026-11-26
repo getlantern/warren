@@ -3,6 +3,7 @@ package dht
 import (
 	"crypto"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha1"
 	"errors"
 	"fmt"
@@ -72,7 +73,9 @@ func sign(s crypto.Signer, msg []byte) (out [64]byte, err error) {
 			out, err = [64]byte{}, fmt.Errorf("%w: it panicked: %v", ErrSigner, r)
 		}
 	}()
-	sig, err := s.Sign(nil, msg, crypto.Hash(0))
+	// rand.Reader, though Ed25519 needs none: crypto.Signer lets a signer
+	// read it (for blinding, say).
+	sig, err := s.Sign(rand.Reader, msg, crypto.Hash(0))
 	if err != nil {
 		return [64]byte{}, fmt.Errorf("%w: %w", ErrSigner, err)
 	}
