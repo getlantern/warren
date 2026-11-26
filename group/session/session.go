@@ -189,7 +189,7 @@ func (s *session) run() (keys.PublicKey, error) {
 		if err != nil {
 			return peer, err
 		}
-		if len(ops) > 0 && !(sync && !s.cfg.Caller) {
+		if len(ops) > 0 && (!sync || s.cfg.Caller) { // only a sync session's callee takes ops in a hello
 			return peer, fmt.Errorf("%w: operations outside a sync session's hello", ErrFrame)
 		}
 		if peer, err = s.admit(heads, ops); err != nil {
