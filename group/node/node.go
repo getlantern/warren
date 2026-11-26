@@ -287,14 +287,14 @@ func (n *Node) signerFor(key keys.PublicKey) keys.Signer {
 func (n *Node) refresh() {
 	// A roster that won't fold admits no member keys (a stale set may hold
 	// a removed member), but still the sync keys, which need no roster.
-	f, err := n.cfg.Roster.Fold()
-	if err != nil {
-		f.Roles = nil
+	var roles map[keys.PublicKey]roster.Role
+	if f, err := n.cfg.Roster.Fold(); err == nil {
+		roles = f.Roles
 	}
 	admit := map[keys.PublicKey]bool{}
 	p := keys.PeriodOf(n.now())
 	for _, q := range []uint64{p - 1, p, p + 1} {
-		for m := range f.Roles {
+		for m := range roles {
 			if m == n.cfg.Me.Public() {
 				continue
 			}
