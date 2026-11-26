@@ -684,11 +684,11 @@ func (n *Node) GetMutable(ctx context.Context, key [32]byte, salt []byte) (*dht.
 		op, err := d.GetMutable(now, key, salt)
 		return op, false, err
 	}, nil)
+	// The newest across families is GetMutableAll's first, so the two
+	// agree when families found different values at one sequence number.
 	var best *dht.MutableItem
-	for _, e := range got {
-		if it := e.(dht.GetDone).Item; it != nil && (best == nil || it.Seq > best.Seq) {
-			best = it
-		}
+	if items := mergeItems(got); len(items) > 0 {
+		best = &items[0]
 	}
 	if err != nil {
 		return best, err

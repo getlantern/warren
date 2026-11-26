@@ -841,3 +841,18 @@ func TestMergeItemsAcrossFamilies(t *testing.T) {
 		t.Fatalf("merged %d items, want 3 newest first", len(got))
 	}
 }
+
+// TestGetMutableAgreesWithAll: with families finding different values at
+// one sequence number, GetMutable's newest is GetMutableAll's first,
+// whichever family answered first.
+func TestGetMutableAgreesWithAll(t *testing.T) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	a, _ := dht.NewMutable(priv, []byte("s"), 5, dht.ImmutableValue([]byte("a")))
+	b, _ := dht.NewMutable(priv, []byte("s"), 5, dht.ImmutableValue([]byte("b")))
+	for _, order := range [][]dht.MutableItem{{a, b}, {b, a}} {
+		got := []dht.Event{dht.GetDone{Items: order[:1], Item: &order[0]}, dht.GetDone{Items: order[1:], Item: &order[1]}}
+		if mergeItems(got)[0].Sig != mergeItems([]dht.Event{got[1], got[0]})[0].Sig {
+			t.Fatal("the newest depends on which family answered first")
+		}
+	}
+}

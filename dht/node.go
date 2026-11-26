@@ -45,7 +45,8 @@ type GetDone struct {
 	Op     OpID
 	Target krpc.NodeID
 	Value  []byte // nil if not found
-	// Item is the highest-sequence verified item, for mutable gets.
+	// Item is the newest verified item, for mutable gets: highest sequence
+	// number, and on a tie the lower signature, as Items[0].
 	Item *MutableItem
 	// Items is every distinct verified item the get saw (distinct by
 	// signature: different values at one sequence number included), up to

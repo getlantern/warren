@@ -64,8 +64,8 @@ type lookup struct {
 	rec   record // put payload
 	cas   *int64
 	value []byte // immutable get result
-	// Mutable gets: the expected key and salt, the best verified item, and
-	// every distinct one seen (by signature), up to MaxGetItems.
+	// Mutable gets: the expected key and salt, the newest verified item,
+	// and the MaxGetItems newest distinct ones seen (by signature).
 	key        *[32]byte
 	salt       []byte
 	best       *MutableItem
