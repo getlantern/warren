@@ -40,7 +40,13 @@ func (c cryptoSigner) Public() crypto.PublicKey {
 	return ed25519.PublicKey(pk[:])
 }
 
-func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) (sig []byte, err error) {
+	// A typed-nil option of another kind panics in HashFunc.
+	defer func() {
+		if recover() != nil {
+			sig, err = nil, errors.New("keys: unusable signer options")
+		}
+	}()
 	switch o := opts.(type) {
 	case nil:
 	case *ed25519.Options:

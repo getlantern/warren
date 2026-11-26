@@ -275,19 +275,24 @@ func (c *Client) Close() error {
 	return err
 }
 
+// isEd25519 reports whether s's key is an Ed25519 key. A typed nil (a nil
+// ed25519.PrivateKey) passes a nil check and panics in Public: not one.
+func isEd25519(s crypto.Signer) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	pk, ok := s.Public().(ed25519.PublicKey)
+	return ok && len(pk) == ed25519.PublicKeySize
+}
+
 // certificate is a self-signed TLS 1.3 certificate for an ed25519 identity.
-func certificate(identity crypto.Signer) (cert tls.Certificate, err error) {
+func certificate(identity crypto.Signer) (tls.Certificate, error) {
 	if identity == nil {
 		return tls.Certificate{}, ErrNotEd25519
 	}
-	// A typed nil (a nil ed25519.PrivateKey) passes the check above and
-	// panics in Public or Sign.
-	defer func() {
-		if recover() != nil {
-			cert, err = tls.Certificate{}, ErrNotEd25519
-		}
-	}()
-	if pk, ok := identity.Public().(ed25519.PublicKey); !ok || len(pk) != ed25519.PublicKeySize {
+	if !isEd25519(identity) {
 		return tls.Certificate{}, ErrNotEd25519
 	}
 	tmpl := &x509.Certificate{

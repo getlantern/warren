@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -753,6 +754,16 @@ func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
 	errs, err := n.each(ctx, func(_ int, d *dht.Node, now time.Time) error { return d.ListenKey(now, priv, x) })
 	if err != nil {
 		return err
+	}
+	// A family whose signer failed kept its old identity while the others
+	// moved: siblings would publish different identities. Unlisten them
+	// all. (A family failing for another reason, a family down, leaves the
+	// rest listening, as before.)
+	for _, e := range errs {
+		if errors.Is(e, dht.ErrSigner) && slices.Contains(errs, nil) {
+			_, _ = n.each(ctx, func(_ int, d *dht.Node, _ time.Time) error { d.Unlisten(); return nil })
+			return e
+		}
 	}
 	return anyOK(errs)
 }

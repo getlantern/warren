@@ -2,10 +2,12 @@ package driver
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"syscall"
@@ -601,5 +603,49 @@ func TestPacketsFromReplacedSocketDropped(t *testing.T) {
 	}
 	if !n.current(packet{fam: 0, conn: cur}) {
 		t.Fatal("a packet from the present socket was dropped")
+	}
+}
+
+// budget signs with k for its first n signatures, then fails.
+type budget struct {
+	k ed25519.PrivateKey
+	n int
+}
+
+func (b *budget) Public() crypto.PublicKey { return b.k.Public() }
+func (b *budget) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	if b.n <= 0 {
+		return nil, errors.New("device gone")
+	}
+	b.n--
+	return b.k.Sign(r, msg, opts)
+}
+
+// TestListenNeverSplitsIdentities: a signer that works for one family and
+// fails for the other leaves neither listening under different keys.
+func TestListenNeverSplitsIdentities(t *testing.T) {
+	n, err := ListenDual("127.0.0.1:0", "[::1]:0", memberConfig(false), memberConfig6(false))
+	if err != nil {
+		t.Skip("no IPv6 loopback:", err)
+	}
+	defer n.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	old := ed25519.NewKeyFromSeed(make([]byte, 32))
+	if err := n.Listen(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	if err := n.Listen(ctx, &budget{k: k, n: 1}); !errors.Is(err, dht.ErrSigner) {
+		t.Fatalf("a signer failing for one family: %v", err)
+	}
+	keys := map[[32]byte]bool{}
+	n.InspectEach(ctx, func(_ netip.AddrPort, d *dht.Node) {
+		if pk, ok := d.Listening(); ok {
+			keys[pk] = true
+		}
+	})
+	if len(keys) > 1 {
+		t.Fatalf("families listen under %d different keys", len(keys))
 	}
 }

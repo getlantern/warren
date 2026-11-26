@@ -183,9 +183,7 @@ func TestSignerFailedOnce(t *testing.T) {
 	}
 	count()
 	f.fail = true
-	if n.resign(t0.Add(time.Second)) {
-		t.Fatal("resign reported success with a failing signer")
-	}
+	n.resign(t0.Add(time.Second))
 	n.resign(t0.Add(2 * time.Second))
 	if c := count(); c != 1 {
 		t.Fatalf("%d SignerFailed events for one run of failures", c)
@@ -200,10 +198,11 @@ func TestSignerFailedOnce(t *testing.T) {
 }
 
 // TestRebindRetriedAfterFailedSign: a NAT mapping change seen while the
-// signer fails stays unhandled, so the next keepalive re-signs.
+// signer fails is re-signed by the next maintenance pass, once the signer
+// works, and a failing signer is asked once a pass, not per holder reply.
 func TestRebindRetriedAfterFailedSign(t *testing.T) {
 	_, k, _ := ed25519.GenerateKey(rand.Reader)
-	f := &failing{k: k}
+	f := &counting{failing: failing{k: k}}
 	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
 	if err := n.Listen(t0, f); err != nil {
 		t.Fatal(err)
@@ -212,18 +211,39 @@ func TestRebindRetriedAfterFailedSign(t *testing.T) {
 	for _, tg := range n.lst.records {
 		target = tg
 	}
+	seq := n.recordSeq[target]
 	old := netip.MustParseAddrPort("192.0.2.1:1000")
-	h := &holder{addr: netip.MustParseAddrPort("198.51.100.1:6881"), target: target, mapped: old}
-	n.lst.holders = append(n.lst.holders, h)
 	moved := netip.MustParseAddrPort("192.0.2.9:2000")
-	f.fail = true
-	n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: moved, R: krpc.Return{}})
-	if h.mapped != old {
-		t.Fatal("a mapping change was marked handled though its re-sign failed")
+	var hs []*holder
+	for i := range 4 {
+		h := &holder{addr: netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)}), 6881), target: target, mapped: old}
+		hs = append(hs, h)
+		n.lst.holders = append(n.lst.holders, h)
+	}
+	f.fail, f.signs = true, 0
+	for _, h := range hs {
+		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: moved})
+	}
+	if f.signs > len(n.lst.records) {
+		t.Fatalf("%d signs for one mapping change seen by %d holders", f.signs, len(hs))
+	}
+	if !n.lst.resignDue {
+		t.Fatal("a failed re-sign left nothing due")
 	}
 	f.fail = false
-	n.keepaliveReply(t0.Add(2*time.Second), h, &krpc.Msg{IP: moved, R: krpc.Return{}})
-	if h.mapped != moved {
-		t.Fatal("the mapping change wasn't handled once signing worked")
+	n.maintain(t0.Add(2 * time.Second))
+	if n.lst.resignDue || n.recordSeq[target] <= seq {
+		t.Fatal("maintenance didn't re-sign after the signer recovered")
 	}
+}
+
+// counting counts Sign calls.
+type counting struct {
+	failing
+	signs int
+}
+
+func (c *counting) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	c.signs++
+	return c.failing.Sign(r, msg, opts)
 }

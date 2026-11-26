@@ -53,6 +53,10 @@ type Config struct {
 	Profile *punch.Profile
 	// Authorize, if set, decides which callers a listener answers.
 	Authorize func(caller [32]byte) bool
+	// SignerFailed, if set, is told when the listener's signer fails to
+	// sign a record (a hardware key gone, say): callers can't reach it once
+	// the record held before ages out. It is called on its own goroutine.
+	SignerFailed func(err error)
 	// RelayOnly never reveals this endpoint's addresses to peers: every
 	// connection goes through a relay router.
 	RelayOnly bool
@@ -1227,8 +1231,13 @@ func (e *Endpoint) events() {
 			if !ok {
 				return
 			}
-			if in, ok := ev.(dht.Incoming); ok {
-				e.incoming(in)
+			switch ev := ev.(type) {
+			case dht.Incoming:
+				e.incoming(ev)
+			case dht.SignerFailed:
+				if f := e.cfg.SignerFailed; f != nil {
+					go f(ev.Err)
+				}
 			}
 		}
 	}

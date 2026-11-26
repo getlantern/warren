@@ -958,6 +958,9 @@ func (n *Node) maintain(now time.Time) {
 	n.fwd.expire(now)
 	n.expireRelays(now)
 	if n.lst != nil {
+		if n.lst.resignDue {
+			n.resign(now)
+		}
 		n.ensureRecords(now)
 		n.keepalive(now)
 	}

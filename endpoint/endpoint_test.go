@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -356,5 +357,46 @@ func TestRecvSkipsControlAndStrangers(t *testing.T) {
 	n, err := c.Recv(buf)
 	if err != nil || string(buf[:n]) != "payload" {
 		t.Fatalf("Recv = %q, %v", buf[:n], err)
+	}
+}
+
+// oneSign signs once with k, then fails.
+type oneSign struct {
+	k    ed25519.PrivateKey
+	used bool
+}
+
+func (o *oneSign) Public() crypto.PublicKey { return o.k.Public() }
+func (o *oneSign) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	if o.used {
+		return nil, errors.New("device gone")
+	}
+	o.used = true
+	return o.k.Sign(r, msg, opts)
+}
+
+// TestSignerFailedReachesApp: a listener whose signer fails on a re-sign
+// is told through Config.SignerFailed.
+func TestSignerFailedReachesApp(t *testing.T) {
+	got := make(chan error, 1)
+	e, err := New(Config{DHT: member(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1),
+		SignerFailed: func(err error) { got <- err }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.Listen(ctx, &oneSign{k: key("one sign")}); err != nil {
+		t.Fatal(err)
+	}
+	e.DHT().Inspect(ctx, func(d *dht.Node) { d.Rebound(time.Now()) }) // re-signs
+	select {
+	case err := <-got:
+		if !errors.Is(err, dht.ErrSigner) {
+			t.Fatalf("told %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the app was never told its signer failed")
 	}
 }

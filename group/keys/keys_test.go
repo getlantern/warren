@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/hex"
 	"math/big"
@@ -404,5 +405,12 @@ func TestCryptoSignerOptionEdges(t *testing.T) {
 	}
 	if _, err := cs.Sign(nil, make([]byte, 64), &ed25519.Options{Hash: crypto.SHA512}); err == nil {
 		t.Fatal("signed Ed25519ph")
+	}
+}
+
+func TestCryptoSignerTypedNilOptions(t *testing.T) {
+	cs := CryptoSigner(IdentityFromSeed([32]byte{6}))
+	if _, err := cs.Sign(nil, []byte("m"), (*rsa.PSSOptions)(nil)); err == nil {
+		t.Fatal("signed with typed-nil options of another kind")
 	}
 }
