@@ -172,6 +172,11 @@ func TestRegistrySlotPerListener(t *testing.T) {
 	if e.resumable(cb.resume, caller, lb) != cb {
 		t.Fatal("forgetting one key's connection dropped the other's slot")
 	}
+	cb.LocalKey = [32]byte{0xc} // the app relabels it: its slot must still go
+	e.forget(cb)
+	if e.resumable(cb.resume, caller, lb) != nil {
+		t.Fatal("a relabeled connection's slot outlived it")
+	}
 }
 
 // A write that chose the old socket just before a swap closed it follows

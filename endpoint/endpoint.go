@@ -122,6 +122,7 @@ type Conn struct {
 	resume   [16]byte
 	outbound bool
 	identity crypto.Signer // signs resume offers; outbound only
+	slot     connKey       // its registry slot
 	// migrateSlot serializes migrations of this connection: a newer one
 	// waits for one in flight and then runs, so the latest network change
 	// always gets the last word (a one-slot semaphore, so a waiter can give
@@ -784,7 +785,9 @@ type connKey struct {
 	resume [16]byte
 }
 
-func (c *Conn) key() connKey { return connKey{c.PeerKey, c.LocalKey, c.resume} }
+// key is the connection's slot, fixed when it was made: PeerKey and
+// LocalKey are exported, and a caller changing one mustn't strand it.
+func (c *Conn) key() connKey { return c.slot }
 
 // punched is a freshly punched path: its socket and the peer's address.
 type punched struct {
@@ -804,6 +807,7 @@ func (e *Endpoint) newConn(pd punched, peer, local [32]byte, secret []byte, iden
 		p: newPath(pd.sock, pd.remote), e: e, resume: resumeID(secret),
 		outbound: identity != nil, identity: identity, created: time.Now(),
 	}
+	c.slot = connKey{peer, local, c.resume}
 	e.connsMu.Lock()
 	if e.refusing.Load() {
 		// Refusing began while this connection punched: the host is
