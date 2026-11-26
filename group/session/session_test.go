@@ -556,3 +556,30 @@ func TestSyncCallerChecksCalleeFirst(t *testing.T) {
 		t.Fatalf("the caller sent %d bytes to a callee it hadn't admitted", len(got))
 	}
 }
+
+// TestManyHeadsCapped: a roster with more heads than a hello may name
+// still has sessions: the hello advertises at most maxHeads.
+func TestManyHeadsCapped(t *testing.T) {
+	defer func(h int) { maxHeads = h }(maxHeads)
+	x := newGroup(t)
+	// Two concurrent rekeys, written on copies and merged: two heads.
+	other := copyRoster(t, x.r)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	op, err := (&roster.Writer{R: other, Me: x.owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := x.r.Add(op); err != nil {
+		t.Fatal(err)
+	}
+	if len(x.r.Heads()) != 2 {
+		t.Fatalf("setup: %d heads", len(x.r.Heads()))
+	}
+	maxHeads = 1
+	a, b := x.member(t, x.m1, x.r), x.member(t, x.m2, x.r)
+	if _, _, ea, eb := x.call(t, a, b, x.rendezvous(x.m1)); ea != nil || eb != nil {
+		t.Fatalf("a roster with more heads than a hello names: %v / %v", ea, eb)
+	}
+}

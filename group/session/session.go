@@ -47,8 +47,6 @@ const (
 	// maxFrame bounds a frame: a sync message, a hello, or a piece of an
 	// add chain.
 	maxFrame = gsync.MaxMessage + 1
-	// maxHeads bounds the roster heads a hello may name.
-	maxHeads = 4096
 	// maxChainOps and maxChainBytes bound the add chain a callee takes
 	// from a caller it hasn't admitted: generous for a real group's roster
 	// (it is causally whole, never cut short), and a limit on what holding
@@ -67,6 +65,10 @@ const (
 var maxQueued = 64 << 20
 
 var (
+	// maxHeads bounds the roster heads a hello names: they are only a hint
+	// of what the peer holds (fewer means more history sent), so a sender
+	// caps what it advertises and a receiver refuses more. Tests lower it.
+	maxHeads = 4096
 	// chainChunk is the operation bytes one chain frame carries; tests
 	// lower it.
 	chainChunk = 1 << 20
@@ -319,7 +321,8 @@ type hello struct {
 func (s *session) sendHello() {
 	sig := s.cfg.Me.Sign(s.proofFor(s.cfg.Caller))
 	var hs []bencode.Value
-	for _, h := range s.cfg.Roster.Heads() {
+	heads := s.cfg.Roster.Heads()
+	for _, h := range heads[:min(len(heads), maxHeads)] {
 		hs = append(hs, bencode.Value{Kind: bencode.String, Str: slices.Clone(h[:])})
 	}
 	pub := s.cfg.Me.Public()
