@@ -4,6 +4,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/getlantern/warren/group/roster"
 	"github.com/getlantern/warren/krpc"
 	"github.com/getlantern/warren/overlay"
+	"github.com/getlantern/warren/transport/hy2"
 )
 
 var farsi = overlay.NewKey("fa")
@@ -174,6 +176,7 @@ func TestMembersSyncOverNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-ticking
+	eventually(t, "the callee's session didn't end", func() bool { return !b.active.Load() })
 	if err := b.Call(ctx, x.m1.Public()); err != nil {
 		t.Fatalf("a second session, the other way: %v", err)
 	}
@@ -211,18 +214,23 @@ func TestMutualCallsFailFast(t *testing.T) {
 	x := newGroup(t)
 	a := x.join(t, host(t, seed), x.m1, x.r)
 	b := x.join(t, host(t, seed), x.m2, x.r)
-	for range 3 {
+	// Two rounds: on loopback every host is one network, which the
+	// endpoint allows three calls a minute.
+	for range 2 {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		errs := make(chan error, 2)
 		start := time.Now()
 		go func() { errs <- a.Call(ctx, x.m2.Public()) }()
 		go func() { errs <- b.Call(ctx, x.m1.Public()) }()
-		<-errs
-		<-errs
+		e1, e2 := <-errs, <-errs
 		cancel()
 		if d := time.Since(start); d > 10*time.Second {
 			t.Fatalf("mutual calls took %v; they waited on each other", d)
 		}
+		if e1 != nil && e2 != nil {
+			t.Fatalf("neither mutual call synced: %v / %v", e1, e2)
+		}
+		eventually(t, "a session didn't end", func() bool { return !a.active.Load() && !b.active.Load() })
 	}
 }
 
@@ -423,5 +431,49 @@ func TestJoinFailureLeavesNothing(t *testing.T) {
 	h.mu.Unlock()
 	if left != 0 {
 		t.Fatal("a failed join stayed on the host")
+	}
+}
+
+// TestStalledCallerReleasesGroup: a caller with an admitted key that never
+// proves membership holds the group busy only until its admission times
+// out, not for the whole session.
+func TestStalledCallerReleasesGroup(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	p := keys.PeriodOf(time.Now())
+	c, err := a.h.ep.Connect(ctx, keys.CryptoSigner(x.m1.Rendezvous(x.g, p)), x.m2.Rendezvous(x.g, p).Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	cl, err := hy2.Dial(ctx, c, c.Remote, c.PeerKey, hy2.FromSecret(c.Secret, hy2.ObfsUTP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	stream, err := cl.DialConn(ctx, streamName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if _, err := stream.Write([]byte{preamble}); err != nil {
+		t.Fatal(err)
+	}
+	var ans [1]byte
+	if _, err := io.ReadFull(stream, ans[:]); err != nil || ans[0] != answerGo {
+		t.Fatalf("answer %q, %v", ans[0], err)
+	}
+	start := time.Now()
+	for deadline := time.Now().Add(10 * time.Second); b.active.Load(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a stalled caller kept the group busy")
+		}
+	}
+	if d := time.Since(start); d > b.cfg.CallTimeout+2*time.Second {
+		t.Fatalf("the group stayed busy %v", d)
 	}
 }

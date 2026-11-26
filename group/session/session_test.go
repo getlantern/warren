@@ -46,9 +46,10 @@ func newGroup(t *testing.T) *group {
 
 // member is one member's copy of the roster and its logs.
 type member struct {
-	id   *keys.Identity
-	r    *roster.Roster
-	logs *memberlog.Set
+	id       *keys.Identity
+	r        *roster.Roster
+	logs     *memberlog.Set
+	admitted int // times Admitted was called
 }
 
 func copyRoster(t *testing.T, r *roster.Roster) *roster.Roster {
@@ -110,14 +111,14 @@ func (x *group) callWith(t *testing.T, caller, callee *member, callerKey keys.Pu
 	done := make(chan res, 1)
 	go func() {
 		p, err := Run(ctx, b, Config{Me: callee.id, Group: x.g, Roster: callee.r, Logs: callee.logs, Secret: secret,
-			Local: x.rendezvous(callee.id), Peer: callerKey, Now: now})
+			Local: x.rendezvous(callee.id), Peer: callerKey, Now: now, Admitted: func() { callee.admitted++ }})
 		if err != nil {
 			b.Close()
 		}
 		done <- res{p, err}
 	}()
 	p, err := Run(ctx, a, Config{Me: caller.id, Group: x.g, Roster: caller.r, Logs: caller.logs, Secret: cs, Caller: true,
-		Local: callerKey, Peer: x.rendezvous(callee.id), Now: now})
+		Local: callerKey, Peer: x.rendezvous(callee.id), Now: now, Admitted: func() { caller.admitted++ }})
 	if err != nil {
 		a.Close()
 	}
@@ -149,6 +150,9 @@ func TestMembersSync(t *testing.T) {
 	if l := b.logs.Log(x.m1.Public()); l == nil || len(l.Entries()) != 1 {
 		t.Fatal("the entry didn't sync")
 	}
+	if a.admitted != 1 || b.admitted != 1 {
+		t.Fatalf("Admitted called %d and %d times, want once each", a.admitted, b.admitted)
+	}
 }
 
 func TestStrangerRefused(t *testing.T) {
@@ -158,6 +162,9 @@ func TestStrangerRefused(t *testing.T) {
 	_, _, _, eb := x.call(t, a, b, x.rendezvous(x.m1))
 	if !errors.Is(eb, ErrNotMember) {
 		t.Fatalf("callee admitted a stranger: %v", eb)
+	}
+	if b.admitted != 0 {
+		t.Fatal("Admitted was called for a stranger")
 	}
 }
 

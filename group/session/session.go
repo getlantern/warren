@@ -94,6 +94,10 @@ type Config struct {
 	Local, Peer keys.PublicKey
 	// Now places the session in a period, for the rendezvous and sync keys.
 	Now time.Time
+	// Admitted, if set, is called once the peer is admitted, before the
+	// sync: until then the peer has proved only that it holds an admitted
+	// transport key, so a caller can bound that phase more tightly.
+	Admitted func()
 }
 
 // Run admits the peer and syncs with it, returning its member key once
@@ -486,6 +490,9 @@ func (s *session) admit(ops []*roster.Op) (keys.PublicKey, error) {
 	}
 	if !s.transportMatches(h.key) {
 		return h.key, ErrTransportKey
+	}
+	if s.cfg.Admitted != nil {
+		s.cfg.Admitted()
 	}
 	// Admitted: keep the chain, and bring the logs up to the roster.
 	for _, o := range ops {

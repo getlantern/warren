@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sync"
@@ -27,6 +28,12 @@ import (
 
 // streamName is the hysteria2 destination a session stream asks for.
 const streamName = "warren-group:1"
+
+// busyTries and busyWait bound a call's tries of a busy group.
+const (
+	busyTries = 3
+	busyWait  = 500 * time.Millisecond
+)
 
 // A caller writes preamble as soon as it opens the stream: a hysteria2
 // server isn't handed a stream until its client writes, and a sync-key
@@ -135,7 +142,10 @@ type Config struct {
 	// Now is the clock that places the group in a period; nil means
 	// time.Now.
 	Now func() time.Time
-	// CallTimeout bounds one attempt to reach a member; zero means 15s.
+	// CallTimeout bounds one attempt to reach a member, and a session's
+	// admission (a caller holding an admitted key, such as any holder of G
+	// with a sync key, can't hold the group busy past it without proving
+	// it's a member); zero means 15s.
 	CallTimeout time.Duration
 	// SessionTimeout bounds one session; zero means a minute.
 	SessionTimeout time.Duration
@@ -275,12 +285,13 @@ func (n *Node) signerFor(key keys.PublicKey) keys.Signer {
 // keys for calling each of ours. mu held, so a set built from an older
 // roster can't replace a newer one.
 func (n *Node) refresh() {
+	// A roster that won't fold admits no member keys (a stale set may hold
+	// a removed member), but still the sync keys, which need no roster.
 	f, err := n.cfg.Roster.Fold()
-	admit := map[keys.PublicKey]bool{}
 	if err != nil {
-		n.admit.Store(&admit) // fail closed: a stale set may hold a removed member
-		return
+		f.Roles = nil
 	}
+	admit := map[keys.PublicKey]bool{}
 	p := keys.PeriodOf(n.now())
 	for _, q := range []uint64{p - 1, p, p + 1} {
 		for m := range f.Roles {
@@ -314,41 +325,70 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.SessionTimeout)
 	defer cancel()
 	done := make(chan struct{})
-	var once sync.Once
+	var (
+		streams atomic.Int32 // tries the caller has made
+		started atomic.Bool  // a session has begun on c
+	)
+	// Handlers are joined before serve returns, so Host.Close waits for a
+	// session to end and not just for serve.
+	var (
+		hmu      sync.Mutex
+		returned bool
+		handlers sync.WaitGroup
+	)
 	srv, err := hy2.Serve(ctx, c, keys.CryptoSigner(signer), hy2.FromSecret(c.Secret, hy2.ObfsUTP), func(stream net.Conn, dest string) {
-		defer stream.Close()
-		if dest != streamName {
+		hmu.Lock()
+		if returned {
+			hmu.Unlock()
+			_ = stream.Close()
 			return
 		}
-		once.Do(func() {
-			defer close(done)
-			var b [1]byte
-			if _, err := io.ReadFull(stream, b[:]); err != nil || b[0] != preamble {
-				return
+		handlers.Add(1)
+		hmu.Unlock()
+		defer handlers.Done()
+		defer stream.Close()
+		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
+		defer stop()
+		// Each try is a stream; one session per connection.
+		if dest != streamName || streams.Add(1) > busyTries || started.Load() {
+			return
+		}
+		var b [1]byte
+		if _, err := io.ReadFull(stream, b[:]); err != nil || b[0] != preamble {
+			return
+		}
+		if !n.begin() {
+			// In a session already. Hold the stream until the caller hangs
+			// up, so the answer isn't lost with the teardown.
+			if _, err := stream.Write([]byte{busy}); err == nil {
+				_, _ = io.Copy(io.Discard, stream)
 			}
-			if !n.begin() {
-				// In a session already. Hold the stream until the caller
-				// hangs up, so the answer isn't lost with the teardown.
-				if _, err := stream.Write([]byte{busy}); err == nil {
-					_, _ = io.Copy(io.Discard, stream)
-				}
-				return
-			}
-			if _, err := stream.Write([]byte{answerGo}); err != nil {
-				n.end()
-				return
-			}
-			_, _ = n.session(ctx, stream, c, false)
-		})
+			return
+		}
+		if !started.CompareAndSwap(false, true) {
+			n.end()
+			return
+		}
+		defer close(done)
+		if _, err := stream.Write([]byte{answerGo}); err != nil {
+			n.end()
+			return
+		}
+		_, _ = n.session(ctx, stream, c, false)
 	})
 	if err != nil {
 		return
 	}
-	defer func() { _ = srv.Close() }()
 	select {
 	case <-done:
 	case <-ctx.Done():
 	}
+	cancel()
+	_ = srv.Close()
+	hmu.Lock()
+	returned = true
+	hmu.Unlock()
+	handlers.Wait()
 }
 
 // begin starts a session unless one is running; see active.
@@ -369,9 +409,14 @@ func (n *Node) end() {
 // the peer as reached when it ends well.
 func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, caller bool) (keys.PublicKey, error) {
 	defer n.end()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	admission := time.AfterFunc(n.cfg.CallTimeout, cancel) // see CallTimeout
+	defer admission.Stop()
 	peer, err := session.Run(ctx, stream, session.Config{
 		Me: n.cfg.Me, Group: n.cfg.Group, Roster: n.cfg.Roster, Logs: n.cfg.Logs,
 		Secret: c.Secret, Caller: caller, Local: c.LocalKey, Peer: c.PeerKey, Now: n.now(),
+		Admitted: func() { admission.Stop() },
 	})
 	if err == nil {
 		n.smu.Lock()
@@ -432,30 +477,55 @@ func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey
 		return true, err
 	}
 	defer func() { _ = cl.Close() }()
-	stream, err := cl.DialConn(sctx, streamName)
+	// A busy group, ours or the callee's, is tried again on the same
+	// connection after a random wait: two members calling each other at
+	// once (or a ring of them) each find the other busy, and a new Connect
+	// would spend the callee's per-caller budget.
+	for try := 1; ; try++ {
+		if try > 1 {
+			select {
+			case <-time.After(rand.N(busyWait)):
+			case <-sctx.Done():
+				return true, sctx.Err()
+			}
+		}
+		err := n.try(sctx, cl, c)
+		if !errors.Is(err, ErrBusy) || try == busyTries {
+			return true, err
+		}
+	}
+}
+
+// try is one stream of callAs: begin our session, ask the callee, and run
+// it if the callee answers go.
+func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) error {
+	if !n.begin() {
+		return ErrBusy // see active
+	}
+	stream, err := cl.DialConn(ctx, streamName)
 	if err != nil {
-		return true, err
+		n.end()
+		return err
 	}
 	defer stream.Close()
-	if !n.begin() {
-		return true, ErrBusy // see active
-	}
-	if err := n.answer(stream); err != nil {
+	if err := n.answer(ctx, stream); err != nil {
 		n.end()
-		return true, err
+		return err
 	}
-	_, err = n.session(sctx, stream, c, true)
-	return true, err
+	_, err = n.session(ctx, stream, c, true)
+	return err
 }
 
 // answer writes the preamble and reads the callee's answer, waiting no
 // longer than a call.
-func (n *Node) answer(stream net.Conn) error {
+func (n *Node) answer(ctx context.Context, stream net.Conn) error {
 	if _, err := stream.Write([]byte{preamble}); err != nil {
 		return err
 	}
 	t := time.AfterFunc(n.cfg.CallTimeout, func() { _ = stream.Close() })
 	defer t.Stop()
+	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
+	defer stop()
 	var b [1]byte
 	if _, err := io.ReadFull(stream, b[:]); err != nil {
 		return err
