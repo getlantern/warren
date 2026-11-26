@@ -487,6 +487,7 @@ func (n *Node) listen(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey, rep
 		records: map[int64]krpc.NodeID{}, sessions: map[SessionID]*session{}, seen: map[string]time.Time{},
 	}
 	n.lsts = append(n.lsts, l)
+	n.resignedFor = netip.AddrPort{} // a new listener set: no baseline
 	n.storeRecord(now, target, seq, m)
 	l.records[cur] = target
 	n.maintain(now)
@@ -586,9 +587,7 @@ func (n *Node) SignalKey() (k [32]byte) {
 // Unlisten stops listening under every key.
 func (n *Node) Unlisten() {
 	for _, l := range n.lsts {
-		for _, t := range l.records {
-			delete(n.owned, t)
-		}
+		n.drop(l)
 	}
 	n.lsts = nil
 }
@@ -599,10 +598,38 @@ func (n *Node) RemoveListener(pub [32]byte) {
 	if l == nil {
 		return
 	}
+	n.drop(l)
+	n.lsts = slices.DeleteFunc(n.lsts, func(x *listener) bool { return x == l })
+}
+
+// drop forgets a listener being removed: its records stop being published,
+// and its session IDs stay reserved until those sessions would have
+// expired, so a later offer reusing one can't make a stale Answer for it
+// seal another listener's response. The listener set changed, so the
+// address last acted on is no baseline any more.
+func (n *Node) drop(l *listener) {
 	for _, t := range l.records {
 		delete(n.owned, t)
 	}
-	n.lsts = slices.DeleteFunc(n.lsts, func(x *listener) bool { return x == l })
+	for id, s := range l.sessions {
+		if n.retired == nil {
+			n.retired = map[SessionID]time.Time{}
+		}
+		n.retired[id] = s.expires
+	}
+	n.resignedFor = netip.AddrPort{}
+}
+
+// sessionRetired reports whether id was a removed listener's session that
+// hasn't expired, forgetting expired ones.
+func (n *Node) sessionRetired(now time.Time, id SessionID) bool {
+	for k, exp := range n.retired {
+		if !now.Before(exp) {
+			delete(n.retired, k)
+		}
+	}
+	_, ok := n.retired[id]
+	return ok
 }
 
 // ensureRecords publishes the current epoch's record and retires records
@@ -874,6 +901,9 @@ find:
 		return true
 	}
 	if len(l.sessions) >= MaxSessions {
+		return true
+	}
+	if n.sessionRetired(now, SessionID(m.Salt[:16])) {
 		return true
 	}
 	// The caller picks the session ID (the salt's first half): one already

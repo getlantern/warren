@@ -481,3 +481,94 @@ func TestDedupRebasedByNewHolders(t *testing.T) {
 		t.Fatal("a move back to A, after holders adopted at B, was skipped")
 	}
 }
+
+// TestRemovedListenersSessionIDsStayReserved: after a key is removed, an
+// offer to another key reusing one of its live session IDs is refused, and
+// Answer for that ID finds nothing.
+func TestRemovedListenersSessionIDsStayReserved(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	n.AddListener(t0, seededKey(2))
+	n.Drain()
+	first := offerTo(n, n.lsts[0], seededKey(9), "to A")
+	n.acceptOffer(t0, addr(40), first)
+	_, evs := n.Drain()
+	id := evs[0].(Incoming).Session
+	n.RemoveListener(pubOf(seededKey(1)))
+	reuse := offerTo(n, n.lsts[0], seededKey(10), "to B, reusing A's id")
+	var target krpc.NodeID
+	for _, tg := range n.lsts[0].records {
+		target = tg
+	}
+	m, _ := NewMutable(seededKey(10), offerSalt(first.Salt[:16], target), t0.Unix(), reuse.V)
+	n.acceptOffer(t0, addr(41), &m)
+	if len(n.lsts[0].sessions) != 0 {
+		t.Fatal("an offer reused a removed key's live session ID")
+	}
+	if err := n.Answer(t0, id, []byte("A's answer")); !errors.Is(err, ErrUnknownSession) {
+		t.Fatalf("a stale Answer: %v", err)
+	}
+	// Once those sessions would have expired, the ID is free again.
+	later := t0.Add(sessionLifetime + time.Second)
+	if n.sessionRetired(later, id) {
+		t.Fatal("a removed key's session ID stayed reserved past its expiry")
+	}
+}
+
+// TestListenerSetChangeRebasesDedup: a removed listener's last acted-on
+// address doesn't make a new listener skip a move back to it.
+func TestListenerSetChangeRebasesDedup(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	keep := krpc.Return{V: []byte("1:v")}
+	b := netip.MustParseAddrPort("198.51.100.7:4000")
+	l := n.lsts[0]
+	var target krpc.NodeID
+	for _, tg := range l.records {
+		target = tg
+	}
+	h := &holder{addr: addr(60), target: target, mapped: netip.MustParseAddrPort("203.0.113.5:5000")}
+	l.holders = append(l.holders, h)
+	n.keepaliveReply(t0.Add(time.Minute), h, &krpc.Msg{IP: b, R: keep}) // acted on: B
+	n.RemoveListener(pubOf(seededKey(1)))
+	n.AddListener(t0.Add(2*time.Minute), seededKey(2))
+	l = n.lsts[0]
+	for _, tg := range l.records {
+		target = tg
+	}
+	h = &holder{addr: addr(61), target: target, mapped: netip.MustParseAddrPort("192.0.2.3:3000")}
+	l.holders = append(l.holders, h)
+	seq := n.recordSeq[target]
+	n.keepaliveReply(t0.Add(3*time.Minute), h, &krpc.Msg{IP: b, R: keep}) // a move to B, for this listener
+	if n.recordSeq[target] <= seq && !l.resignDue {
+		t.Fatal("a new listener's move to an address a removed one acted on was skipped")
+	}
+}
+
+// TestRemovalRebasesDedup: removing the listener that acted on an address
+// makes it no baseline for the listeners left.
+func TestRemovalRebasesDedup(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	n.AddListener(t0, seededKey(2))
+	keep := krpc.Return{V: []byte("1:v")}
+	b := netip.MustParseAddrPort("198.51.100.7:4000")
+	targetOf := func(l *listener) (tg krpc.NodeID) {
+		for _, t := range l.records {
+			tg = t
+		}
+		return
+	}
+	h1 := &holder{addr: addr(60), target: targetOf(n.lsts[0]), mapped: netip.MustParseAddrPort("203.0.113.5:5000")}
+	n.lsts[0].holders = append(n.lsts[0].holders, h1)
+	n.keepaliveReply(t0.Add(time.Minute), h1, &krpc.Msg{IP: b, R: keep}) // acted on: B
+	n.RemoveListener(pubOf(seededKey(1)))
+	l := n.lsts[0]
+	h2 := &holder{addr: addr(61), target: targetOf(l), mapped: netip.MustParseAddrPort("192.0.2.3:3000")}
+	l.holders = append(l.holders, h2)
+	seq := n.recordSeq[targetOf(l)]
+	n.keepaliveReply(t0.Add(3*time.Minute), h2, &krpc.Msg{IP: b, R: keep})
+	if n.recordSeq[targetOf(l)] <= seq && !l.resignDue {
+		t.Fatal("after removing the listener that acted on B, a move to B was skipped")
+	}
+}

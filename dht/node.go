@@ -169,6 +169,9 @@ type Node struct {
 	// and resignedFor the address last acted on.
 	resignedAt  time.Time
 	resignedFor netip.AddrPort
+	// retired is removed listeners' session IDs, until they would have
+	// expired: no new offer may take one.
+	retired map[SessionID]time.Time
 	// recordSeq is the last sequence number signed per record target. It
 	// outlives the listener, so re-listening never reuses a number.
 	recordSeq map[krpc.NodeID]int64
