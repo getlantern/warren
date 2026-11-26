@@ -922,9 +922,12 @@ line, B runs alongside it, C waits on device time, D is maintenance.
    the Ed25519 blinding and expanded-key signer in `group/keys`.
 4. **Warren changes**, each its own small PR, signer first since every
    later step signs with blinded keys:
-   1. a signer interface (`keys.Signer`) through `endpoint.Listen`,
-      `Connect`, `driver.Node.Listen`/`Signal`, `dht.Node.Listen`/
-      `ListenKey`/`Signal`, and the identity a `Conn` keeps;
+   1. a signer interface through `endpoint.Listen`, `Connect`,
+      `driver.Node.Listen`/`Signal`, `dht.Node.Listen`/`ListenKey`/
+      `Signal`/`NewMutable`, the identity a `Conn` keeps, and hy2's
+      certificate (built: they take a `crypto.Signer`, which an
+      `ed25519.PrivateKey` already is; `keys.CryptoSigner` adapts a
+      blinded key);
    2. several listeners per endpoint, and `Authorize` told the listener key;
    3. mutable-item puts from the endpoint, and reads that return every
       distinct value the replicas hold.

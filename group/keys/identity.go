@@ -1,10 +1,12 @@
 package keys
 
 import (
+	"crypto"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/sha512"
 	"errors"
+	"fmt"
 	"io"
 
 	"filippo.io/edwards25519"
@@ -19,6 +21,60 @@ type PublicKey [32]byte
 type Signer interface {
 	Public() PublicKey
 	Sign(msg []byte) []byte
+}
+
+// hashFunc is o.HashFunc, or false if o is a typed nil that panics in it.
+func hashFunc(o crypto.SignerOpts) (h crypto.Hash, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	return o.HashFunc(), true
+}
+
+// CryptoSigner adapts s to a crypto.Signer, the form warren's endpoint,
+// driver, dht and hy2 take a key in, so a member can listen and connect
+// under a blinded key. It signs messages whole, as Ed25519 does.
+// A nil s gives nil, so it's refused like any missing signer.
+func CryptoSigner(s Signer) crypto.Signer {
+	if s == nil {
+		return nil
+	}
+	return cryptoSigner{s}
+}
+
+type cryptoSigner struct{ s Signer }
+
+func (c cryptoSigner) Public() crypto.PublicKey {
+	pk := c.s.Public()
+	return ed25519.PublicKey(pk[:])
+}
+
+func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	switch o := opts.(type) {
+	case nil:
+	case *ed25519.Options:
+		if o != nil && (o.Hash != 0 || o.Context != "") {
+			return nil, errors.New("keys: a blinded key signs pure Ed25519 only: no Ed25519ph or Ed25519ctx")
+		}
+	default:
+		if h, ok := hashFunc(o); !ok || h != 0 {
+			return nil, errors.New("keys: Ed25519 signs messages whole, not digests")
+		}
+	}
+	return signWhole(c.s, msg)
+}
+
+// signWhole signs msg with s, turning a panic in s (a hardware key gone,
+// say) into an error, so a TLS handshake fails rather than the process.
+func signWhole(s Signer, msg []byte) (sig []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			sig, err = nil, fmt.Errorf("keys: the signer panicked: %v", r)
+		}
+	}()
+	return s.Sign(msg), nil
 }
 
 // Verify reports whether sig is pk's signature of msg, and pk is a usable

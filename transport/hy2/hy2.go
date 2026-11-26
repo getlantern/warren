@@ -10,6 +10,7 @@ package hy2
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/hkdf"
 	"crypto/rand"
@@ -19,6 +20,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/netip"
@@ -176,8 +178,12 @@ func (s *Server) Close() error {
 	return err
 }
 
-// Serve runs a hysteria2 server on pc whose certificate is identity's key.
-func Serve(ctx context.Context, pc net.PacketConn, identity ed25519.PrivateKey, opts Options, h Handler) (*Server, error) {
+// ErrNotEd25519 means a server identity isn't an Ed25519 signer.
+var ErrNotEd25519 = errors.New("hy2: identity is not an ed25519 signer")
+
+// Serve runs a hysteria2 server on pc whose certificate is identity's key:
+// an ed25519.PrivateKey, or any crypto.Signer of an Ed25519 key.
+func Serve(ctx context.Context, pc net.PacketConn, identity crypto.Signer, opts Options, h Handler) (*Server, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
@@ -270,8 +276,26 @@ func (c *Client) Close() error {
 	return err
 }
 
+// isEd25519 reports whether s's key is an Ed25519 key. A typed nil (a nil
+// ed25519.PrivateKey) passes a nil check and panics in Public: not one.
+func isEd25519(s crypto.Signer) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	pk, ok := s.Public().(ed25519.PublicKey)
+	return ok && len(pk) == ed25519.PublicKeySize
+}
+
 // certificate is a self-signed TLS 1.3 certificate for an ed25519 identity.
-func certificate(identity ed25519.PrivateKey) (tls.Certificate, error) {
+func certificate(identity crypto.Signer) (tls.Certificate, error) {
+	if identity == nil {
+		return tls.Certificate{}, ErrNotEd25519
+	}
+	if !isEd25519(identity) {
+		return tls.Certificate{}, ErrNotEd25519
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: serverName},
@@ -281,11 +305,23 @@ func certificate(identity ed25519.PrivateKey) (tls.Certificate, error) {
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, identity.Public(), identity)
+	der, err := createCertificate(tmpl, identity)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: identity}, nil
+}
+
+// createCertificate self-signs tmpl with identity, turning a panic in the
+// signer (a hardware key gone, say) into an error rather than the end of
+// the process.
+func createCertificate(tmpl *x509.Certificate, identity crypto.Signer) (der []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			der, err = nil, fmt.Errorf("hy2: the identity's signer panicked: %v", r)
+		}
+	}()
+	return x509.CreateCertificate(rand.Reader, tmpl, tmpl, identity.Public(), identity)
 }
 
 // socketDialer hands hysteria2 the existing socket, bound to the peer.

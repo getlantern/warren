@@ -24,15 +24,16 @@ package dht
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/ed25519"
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
@@ -63,7 +64,14 @@ type SignalFailed struct {
 	Err error
 }
 
+// SignerFailed means the listener's signer couldn't sign a record: the
+// record held before keeps being served, and each maintenance pass tries
+// again, but callers can't reach us once it ages out. It is emitted when a
+// sign fails after the last one succeeded.
+type SignerFailed struct{ Err error }
+
 func (Incoming) isEvent()     {}
+func (SignerFailed) isEvent() {}
 func (Answered) isEvent()     {}
 func (SignalFailed) isEvent() {}
 
@@ -377,19 +385,24 @@ type session struct {
 const maxSessionRelays = 4
 
 type listener struct {
-	priv     ed25519.PrivateKey
-	pub      [32]byte
-	x        *ecdh.PrivateKey
-	records  map[int64]krpc.NodeID // epoch → record target
-	holders  []*holder
-	nextKA   time.Time
-	sessions map[SessionID]*session
-	seen     map[string]time.Time
-	retry    time.Duration // publication backoff while nothing stores our record
+	priv    crypto.Signer
+	failing bool // the signer's last attempt failed
+	// resignDue means a record failed to sign: maintenance re-signs them
+	// all on its next pass, so a rebind isn't lost and a failing signer is
+	// asked once a pass, not once per holder reply.
+	resignDue bool
+	pub       [32]byte
+	x         *ecdh.PrivateKey
+	records   map[int64]krpc.NodeID // epoch → record target
+	holders   []*holder
+	nextKA    time.Time
+	sessions  map[SessionID]*session
+	seen      map[string]time.Time
+	retry     time.Duration // publication backoff while nothing stores our record
 }
 
 // Listen publishes a signaling record for priv's key and keeps it reachable.
-func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
+func (n *Node) Listen(now time.Time, priv crypto.Signer) error {
 	x, err := ecdh.X25519().NewPrivateKey(n.randBytes(32))
 	if err != nil {
 		return err
@@ -401,15 +414,31 @@ func (n *Node) Listen(now time.Time, priv ed25519.PrivateKey) error {
 // for one identity must share it: they publish the same record target, and
 // a holder that keeps one store across families would otherwise reject one
 // record, or hand callers a key the receiving node can't decrypt with.
-func (n *Node) ListenKey(now time.Time, priv ed25519.PrivateKey, x *ecdh.PrivateKey) error {
+//
+// priv signs on the node's own loop, so its Sign must be quick: a hardware
+// key waiting for a touch would stall every lookup meanwhile.
+func (n *Node) ListenKey(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey) error {
+	pub, err := SignerKey(priv)
+	if err != nil {
+		return err
+	}
+	// Sign the new identity's current record before dropping the identity
+	// listened under now, so a signer that can't sign leaves that one
+	// reachable and nothing changed.
+	cur := epochOf(now)
+	target, seq, m, err := n.makeRecord(now, priv, pub, x, cur)
+	if err != nil {
+		return err
+	}
 	// A new identity replaces the old one entirely: its records stop being
 	// republished, since their offers could no longer be decrypted.
 	n.Unlisten()
 	n.lst = &listener{
-		priv: priv, pub: [32]byte(priv.Public().(ed25519.PublicKey)), x: x,
+		priv: priv, pub: pub, x: x,
 		records: map[int64]krpc.NodeID{}, sessions: map[SessionID]*session{}, seen: map[string]time.Time{},
 	}
-	n.ensureRecords(now)
+	n.storeRecord(now, target, seq, m)
+	n.lst.records[cur] = target
 	n.maintain(now)
 	return nil
 }
@@ -453,7 +482,7 @@ func (n *Node) Rebound(now time.Time) {
 		}
 		for _, t := range l.records {
 			if o := n.owned[t]; o != nil {
-				o.next = now // maintain re-signs due records with a fresh seq
+				o.next = now // maintain republishes due records under a newer seq
 			}
 		}
 		l.nextKA = now
@@ -486,7 +515,9 @@ func (n *Node) ensureRecords(now time.Time) {
 	l := n.lst
 	cur := epochOf(now)
 	if _, ok := l.records[cur]; !ok {
-		l.records[cur] = n.signRecord(now, cur)
+		if t, ok := n.signRecord(now, cur); ok {
+			l.records[cur] = t
+		}
 	}
 	for e, t := range l.records {
 		if e < cur-1 {
@@ -497,16 +528,48 @@ func (n *Node) ensureRecords(now time.Time) {
 	}
 }
 
-func (n *Node) signRecord(now time.Time, epoch int64) krpc.NodeID {
+// signRecord signs and stores our record for epoch, reporting its target
+// and whether it signed: a signer can fail (a hardware key unplugged), and
+// then nothing changes, so the record held before keeps being served and
+// the next pass tries again.
+func (n *Node) signRecord(now time.Time, epoch int64) (krpc.NodeID, bool) {
 	l := n.lst
-	salt := RecordSalt(l.pub, epoch)
-	target := MutableTarget(l.pub, salt)
+	target, seq, m, err := n.makeRecord(now, l.priv, l.pub, l.x, epoch)
+	if err != nil {
+		// Maintenance re-signs every record on its next pass; until then
+		// the record held before is served.
+		l.resignDue = true
+		if !l.failing {
+			l.failing = true
+			n.events = append(n.events, SignerFailed{Err: err})
+		}
+		return target, false
+	}
+	l.failing = false
+	n.storeRecord(now, target, seq, m)
+	return target, true
+}
+
+// makeRecord signs pub's record for epoch, changing nothing.
+func (n *Node) makeRecord(now time.Time, priv crypto.Signer, pub [32]byte, x *ecdh.PrivateKey, epoch int64) (krpc.NodeID, int64, MutableItem, error) {
+	salt := RecordSalt(pub, epoch)
+	target := MutableTarget(pub, salt)
 	// Never reuse a sequence number for a different value, even across
 	// Unlisten and Listen (which re-keys): storage nodes reject an equal seq
 	// with a new value (BEP 44 error 302), stranding the stale record.
 	seq := max(now.Unix(), n.recordSeq[target]+1)
-	m, _ := NewMutable(l.priv, salt, seq, encodeRecord([32]byte(l.x.PublicKey().Bytes())))
-	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now}
+	m, err := NewMutable(priv, salt, seq, encodeRecord([32]byte(x.PublicKey().Bytes())))
+	if err == nil && m.Key != pub {
+		// A signer whose key changed since Listen would publish under a
+		// target no caller looks up: a failure like any other.
+		return target, seq, MutableItem{}, fmt.Errorf("%w: its key changed since Listen", ErrSigner)
+	}
+	return target, seq, m, err
+}
+
+// storeRecord makes a signed record ours to publish.
+func (n *Node) storeRecord(now time.Time, target krpc.NodeID, seq int64, m MutableItem) {
+	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now, fresh: true}
 	if n.recordSeq == nil {
 		n.recordSeq = map[krpc.NodeID]int64{}
 	}
@@ -522,14 +585,16 @@ func (n *Node) signRecord(now time.Time, epoch int64) krpc.NodeID {
 		}
 	}
 	n.recordSeq[target] = seq
-	return target
 }
 
 const maxRecordSeqs = 64
 
 // resign republishes every record with a newer sequence number, rebinding
 // holders to our current address after a NAT mapping change.
+// A record that fails to sign leaves resignDue set, and maintenance tries
+// them all again on its next pass.
 func (n *Node) resign(now time.Time) {
+	n.lst.resignDue = false
 	for e := range n.lst.records {
 		n.signRecord(now, e)
 	}
@@ -637,7 +702,9 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 		}
 	}
 	if m.IP.IsValid() {
-		if h.mapped.IsValid() && h.mapped != m.IP {
+		// After a failed re-sign maintenance retries, once a pass, so other
+		// holders' replies don't ask a failing signer again.
+		if h.mapped.IsValid() && h.mapped != m.IP && !n.lst.resignDue {
 			n.resign(now)
 		}
 		h.mapped = m.IP
@@ -791,7 +858,7 @@ func (l *listener) tokenFor(s *session, via netip.AddrPort) []byte {
 
 type signalOp struct {
 	op        OpID
-	priv      ed25519.PrivateKey
+	priv      crypto.Signer
 	provider  [32]byte
 	payload   []byte
 	epoch     int64 // the current epoch's
@@ -834,7 +901,10 @@ type offerTry struct {
 // Signal sends payload to provider through the DHT and returns its answer
 // as an Answered event, or SignalFailed. priv signs the offer; the provider
 // sees its public key as the caller's identity.
-func (n *Node) Signal(now time.Time, priv ed25519.PrivateKey, provider [32]byte, payload []byte) (OpID, error) {
+func (n *Node) Signal(now time.Time, priv crypto.Signer, provider [32]byte, payload []byte) (OpID, error) {
+	if _, err := SignerKey(priv); err != nil {
+		return 0, err
+	}
 	if len(payload) > MaxSignalPayload {
 		return 0, ErrPayloadTooLarge
 	}
@@ -1184,4 +1254,21 @@ func (n *Node) Holders() []netip.AddrPort {
 		out = append(out, h.addr)
 	}
 	return out
+}
+
+// Listening reports the key the node listens under, if it listens.
+func (n *Node) Listening() ([32]byte, bool) {
+	if n.lst == nil {
+		return [32]byte{}, false
+	}
+	return n.lst.pub, true
+}
+
+// Listener returns what the node listens under, if it listens, so a
+// caller moving several nodes to a new identity can move one back.
+func (n *Node) Listener() (crypto.Signer, *ecdh.PrivateKey, bool) {
+	if n.lst == nil {
+		return nil, nil, false
+	}
+	return n.lst.priv, n.lst.x, true
 }

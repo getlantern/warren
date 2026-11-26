@@ -2,10 +2,13 @@ package endpoint
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/getlantern/warren/dht"
 	"github.com/getlantern/warren/driver"
+	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/krpc"
 	"github.com/getlantern/warren/overlay"
 )
@@ -77,7 +81,7 @@ func phone(t *testing.T, seed netip.AddrPort) *Endpoint {
 	return e
 }
 
-func listenAndWait(t *testing.T, e *Endpoint, k ed25519.PrivateKey) {
+func listenAndWait(t *testing.T, e *Endpoint, k crypto.Signer) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -147,6 +151,61 @@ func TestConnectByPublicKey(t *testing.T) {
 	}
 	roundTrip(t, out, in, "hello provider")
 	roundTrip(t, in, out, "hello caller")
+}
+
+// TestConnectUnderBlindedKeys: both ends sign with blinded keys, which
+// have no seed and so aren't ed25519.PrivateKeys; the caller reaches the
+// provider by its blinded public key, and each sees the other's.
+func TestConnectUnderBlindedKeys(t *testing.T) {
+	seed := network(t, 10)
+	provider, caller := phone(t, seed), phone(t, seed)
+	var g keys.Secret
+	g[0] = 7
+	pk := keys.CryptoSigner(keys.IdentityFromSeed([32]byte{1}).Rendezvous(g, 42))
+	ck := keys.CryptoSigner(keys.IdentityFromSeed([32]byte{2}).Rendezvous(g, 42))
+	listenAndWait(t, provider, pk)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	accepted := make(chan *Conn, 1)
+	go func() {
+		c, err := provider.Accept(ctx)
+		if err != nil {
+			t.Error(err)
+		}
+		accepted <- c
+	}()
+	ppub, cpub := [32]byte(pk.Public().(ed25519.PublicKey)), [32]byte(ck.Public().(ed25519.PublicKey))
+	out, err := caller.Connect(ctx, ck, ppub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	in := <-accepted
+	if in == nil {
+		t.Fatal("nothing accepted")
+	}
+	defer in.Close()
+	if out.PeerKey != ppub || in.PeerKey != cpub {
+		t.Errorf("peer keys: caller sees %x, provider sees %x", out.PeerKey[:4], in.PeerKey[:4])
+	}
+	roundTrip(t, out, in, "hello, blinded provider")
+}
+
+func TestConnectRefusesBadSigner(t *testing.T) {
+	seed := network(t, 4)
+	e := phone(t, seed)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var nilKey ed25519.PrivateKey
+	for _, s := range []crypto.Signer{nil, nilKey, keys.CryptoSigner(nil)} {
+		if _, err := e.Connect(ctx, s, [32]byte{1}); !errors.Is(err, dht.ErrSigner) {
+			t.Fatalf("connect with signer %T: %v", s, err)
+		}
+	}
+	if err := e.Listen(ctx, nil); err == nil {
+		t.Fatal("listened with no signer")
+	}
 }
 
 func TestConcurrentCallers(t *testing.T) {
@@ -298,5 +357,46 @@ func TestRecvSkipsControlAndStrangers(t *testing.T) {
 	n, err := c.Recv(buf)
 	if err != nil || string(buf[:n]) != "payload" {
 		t.Fatalf("Recv = %q, %v", buf[:n], err)
+	}
+}
+
+// oneSign signs once with k, then fails.
+type oneSign struct {
+	k    ed25519.PrivateKey
+	used bool
+}
+
+func (o *oneSign) Public() crypto.PublicKey { return o.k.Public() }
+func (o *oneSign) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
+	if o.used {
+		return nil, errors.New("device gone")
+	}
+	o.used = true
+	return o.k.Sign(r, msg, opts)
+}
+
+// TestSignerFailedReachesApp: a listener whose signer fails on a re-sign
+// is told through Config.SignerFailed.
+func TestSignerFailedReachesApp(t *testing.T) {
+	got := make(chan error, 1)
+	e, err := New(Config{DHT: member(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1),
+		SignerFailed: func(err error) { got <- err }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.Listen(ctx, &oneSign{k: key("one sign")}); err != nil {
+		t.Fatal(err)
+	}
+	e.DHT().Inspect(ctx, func(d *dht.Node) { d.Rebound(time.Now()) }) // re-signs
+	select {
+	case err := <-got:
+		if !errors.Is(err, dht.ErrSigner) {
+			t.Fatalf("told %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the app was never told its signer failed")
 	}
 }

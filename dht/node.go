@@ -132,6 +132,9 @@ type item struct {
 type owned struct {
 	rec  record
 	next time.Time
+	// fresh means a record was just signed and not yet published, so the
+	// republish pass puts it as is rather than signing it again.
+	fresh bool
 }
 
 type Node struct {
@@ -958,6 +961,9 @@ func (n *Node) maintain(now time.Time) {
 	n.fwd.expire(now)
 	n.expireRelays(now)
 	if n.lst != nil {
+		if n.lst.resignDue {
+			n.resign(now)
+		}
 		n.ensureRecords(now)
 		n.keepalive(now)
 	}
@@ -999,10 +1005,15 @@ func (n *Node) maintain(now time.Time) {
 		if len(n.lookups) >= n.cfg.MaxLookups-4 {
 			break
 		}
-		if e, ok := n.recordEpoch(k); ok {
-			n.signRecord(now, e) // a fresh seq rebinds holders that lost us
+		// A fresh seq rebinds holders that lost us; a record just signed
+		// has one already.
+		// A failing signer was already asked this pass (resignDue is still
+		// set): don't ask again per due record.
+		if e, ok := n.recordEpoch(k); ok && !n.owned[k].fresh && (n.lst == nil || !n.lst.resignDue) {
+			n.signRecord(now, e)
 		}
 		o := n.owned[k]
+		o.fresh = false
 		o.next = now.Add(n.cfg.RepublishInterval)
 		if n.isRecord(k) {
 			// Configure before the first step, which can finish synchronously.

@@ -2,8 +2,13 @@ package keys
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/hex"
+	"math/big"
 	"testing"
 	"time"
 
@@ -349,4 +354,75 @@ var vectors = map[string]string{
 	"rendezvous":    "50cbbb712d4836024b79035eae267e03a8afc0458bd9935e07f19bda7c62470d",
 	"syncKey":       "62a33e1c5af2ea4eb1a7a900776614f9413f5638f5e66e0c5aed75f49fd9a0b6",
 	"dirSeal":       "9dfd19a3317a929dc2bb2f763e5f14ef53ab663ecad3635134db608f4fc20fd2",
+}
+
+func TestCryptoSigner(t *testing.T) {
+	id := IdentityFromSeed([32]byte{3})
+	var g Secret
+	g[0] = 1
+	b := id.Rendezvous(g, 9)
+	cs := CryptoSigner(b)
+	pk := cs.Public().(ed25519.PublicKey)
+	if [32]byte(pk) != [32]byte(b.Public()) {
+		t.Fatal("the adapter names another key")
+	}
+	sig, err := cs.Sign(nil, []byte("msg"), crypto.Hash(0))
+	if err != nil || !ed25519.Verify(pk, []byte("msg"), sig) {
+		t.Fatalf("a blinded signature through the adapter: %v", err)
+	}
+	if _, err := cs.Sign(nil, make([]byte, 32), crypto.SHA256); err == nil {
+		t.Fatal("signed a digest")
+	}
+	// A TLS certificate, as hy2 makes one, under the blinded key.
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, cs.Public(), cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := x509.ParseCertificate(der)
+	if err != nil || c.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) != nil {
+		t.Fatalf("a self-signed certificate under the blinded key: %v", err)
+	}
+}
+
+func TestCryptoSignerRefusesContext(t *testing.T) {
+	cs := CryptoSigner(IdentityFromSeed([32]byte{4}))
+	if _, err := cs.Sign(nil, []byte("m"), &ed25519.Options{Context: "warren"}); err == nil {
+		t.Fatal("signed with an Ed25519ctx context as pure Ed25519")
+	}
+	if _, err := cs.Sign(nil, []byte("m"), &ed25519.Options{}); err != nil {
+		t.Fatalf("pure Ed25519 options: %v", err)
+	}
+}
+
+func TestCryptoSignerOptionEdges(t *testing.T) {
+	if CryptoSigner(nil) != nil {
+		t.Fatal("an adapter around no signer")
+	}
+	cs := CryptoSigner(IdentityFromSeed([32]byte{5}))
+	if _, err := cs.Sign(nil, []byte("m"), (*ed25519.Options)(nil)); err != nil {
+		t.Fatalf("a nil *ed25519.Options: %v", err)
+	}
+	if _, err := cs.Sign(nil, make([]byte, 64), &ed25519.Options{Hash: crypto.SHA512}); err == nil {
+		t.Fatal("signed Ed25519ph")
+	}
+}
+
+func TestCryptoSignerTypedNilOptions(t *testing.T) {
+	cs := CryptoSigner(IdentityFromSeed([32]byte{6}))
+	if _, err := cs.Sign(nil, []byte("m"), (*rsa.PSSOptions)(nil)); err == nil {
+		t.Fatal("signed with typed-nil options of another kind")
+	}
+}
+
+type panicSigner struct{ PublicKey }
+
+func (p panicSigner) Public() PublicKey { return p.PublicKey }
+func (panicSigner) Sign([]byte) []byte  { panic("device gone") }
+
+func TestCryptoSignerRecoversSignerPanic(t *testing.T) {
+	cs := CryptoSigner(panicSigner{IdentityFromSeed([32]byte{7}).Public()})
+	if _, err := cs.Sign(nil, []byte("m"), crypto.Hash(0)); err == nil {
+		t.Fatal("a panicking signer's panic got through as success")
+	}
 }

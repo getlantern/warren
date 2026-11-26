@@ -8,13 +8,14 @@ package driver
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdh"
-	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -744,17 +745,49 @@ func (n *Node) Snapshot(ctx context.Context) ([]byte, error) {
 // Listen makes us reachable for signaling under priv's key on every node, so
 // callers of either family can reach us. Offers arrive as dht.Incoming on
 // Events; reply with Answer.
-func (n *Node) Listen(ctx context.Context, priv ed25519.PrivateKey) error {
+func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
 	// One signaling key for every family, so their records are identical.
 	x, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return err
 	}
-	errs, err := n.each(ctx, func(_ int, d *dht.Node, now time.Time) error { return d.ListenKey(now, priv, x) })
-	if err != nil {
+	// All on one turn of the loop, so no family serves a new identity while
+	// another's signer failure is still being undone.
+	res := make(chan error, 1)
+	if err := n.do(ctx, func(now time.Time) {
+		type was struct {
+			priv crypto.Signer
+			x    *ecdh.PrivateKey
+			ok   bool
+		}
+		prev := make([]was, len(n.fams))
+		errs := make([]error, len(n.fams))
+		for i, fm := range n.fams {
+			prev[i].priv, prev[i].x, prev[i].ok = fm.node.Listener()
+			errs[i] = fm.node.ListenKey(now, priv, x)
+		}
+		// A family whose signer failed kept its old identity while the
+		// others moved: move them back, so siblings never publish different
+		// identities. (A family failing for another reason, a family down,
+		// leaves the rest listening, as before.)
+		i := slices.IndexFunc(errs, func(e error) bool { return errors.Is(e, dht.ErrSigner) })
+		if i >= 0 && slices.Contains(errs, nil) {
+			for j, fm := range n.fams {
+				if errs[j] != nil {
+					continue
+				}
+				if !prev[j].ok || fm.node.ListenKey(now, prev[j].priv, prev[j].x) != nil {
+					fm.node.Unlisten()
+				}
+			}
+			res <- errs[i]
+			return
+		}
+		res <- anyOK(errs)
+	}); err != nil {
 		return err
 	}
-	return anyOK(errs)
+	return <-res
 }
 
 // Answer replies to an offer through the node that delivered it.
@@ -777,7 +810,7 @@ func (n *Node) Answer(ctx context.Context, s dht.SessionID, payload []byte) erro
 
 // Signal sends payload to provider through every node and returns the first
 // answer, or the last failure if none answers.
-func (n *Node) Signal(ctx context.Context, priv ed25519.PrivateKey, provider [32]byte, payload []byte) ([]byte, error) {
+func (n *Node) Signal(ctx context.Context, priv crypto.Signer, provider [32]byte, payload []byte) ([]byte, error) {
 	payload = append([]byte(nil), payload...) // a slower family reads it after we return
 	got, partial, err := n.call(ctx, func(_ int, d *dht.Node, now time.Time) (dht.OpID, bool, error) {
 		op, err := d.Signal(now, priv, provider, payload)

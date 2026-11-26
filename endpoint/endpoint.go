@@ -11,7 +11,7 @@ package endpoint
 
 import (
 	"context"
-	"crypto/ed25519"
+	"crypto"
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -53,6 +53,15 @@ type Config struct {
 	Profile *punch.Profile
 	// Authorize, if set, decides which callers a listener answers.
 	Authorize func(caller [32]byte) bool
+	// SignerFailed, if set, is told when the listener's signer fails to
+	// re-sign a record (a hardware key gone, say): callers can't reach it
+	// once the record held before ages out. It is called on its own
+	// goroutine, each time a DHT family's signer starts failing (a failure
+	// during Listen is Listen's error instead), and like every DHT event it
+	// is best effort: one that arrives while the event queue is full is
+	// dropped. An in-memory key, an ed25519.PrivateKey or a blinded key
+	// from group/keys, never fails.
+	SignerFailed func(err error)
 	// RelayOnly never reveals this endpoint's addresses to peers: every
 	// connection goes through a relay router.
 	RelayOnly bool
@@ -105,7 +114,7 @@ type Conn struct {
 	e        *Endpoint
 	resume   [16]byte
 	outbound bool
-	identity ed25519.PrivateKey // signs resume offers; outbound only
+	identity crypto.Signer // signs resume offers; outbound only
 	// migrateSlot serializes migrations of this connection: a newer one
 	// waits for one in flight and then runs, so the latest network change
 	// always gets the last word (a one-slot semaphore, so a waiter can give
@@ -623,7 +632,7 @@ func defaultRoutes() [2]netip.Addr {
 
 // Listen makes this endpoint reachable under priv's key; accept connections
 // with Accept.
-func (e *Endpoint) Listen(ctx context.Context, priv ed25519.PrivateKey) error {
+func (e *Endpoint) Listen(ctx context.Context, priv crypto.Signer) error {
 	return e.node.Listen(ctx, priv)
 }
 
@@ -680,7 +689,11 @@ func (e *Endpoint) enqueue(c *Conn) {
 }
 
 // Connect reaches peer by public key, signing the offer with identity.
-func (e *Endpoint) Connect(ctx context.Context, identity ed25519.PrivateKey, peer [32]byte) (*Conn, error) {
+func (e *Endpoint) Connect(ctx context.Context, identity crypto.Signer, peer [32]byte) (*Conn, error) {
+	// Before any socket is punched: a bad signer would fail only at Signal.
+	if _, err := dht.SignerKey(identity); err != nil {
+		return nil, err
+	}
 	// An outbound connection is owned by the endpoint until it is returned:
 	// Close cancels it and waits for its runner and sockets to be released.
 	e.mu.Lock()
@@ -754,7 +767,7 @@ type punched struct {
 // identity is set only for outbound connections. While the endpoint refuses
 // new connections it registers nothing and returns nil; the caller closes
 // the socket.
-func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity ed25519.PrivateKey) *Conn {
+func (e *Endpoint) newConn(pd punched, peer [32]byte, secret []byte, identity crypto.Signer) *Conn {
 	c := &Conn{
 		Remote: pd.remote, PeerKey: peer, Secret: secret, Relayed: pd.relayed,
 		p: newPath(pd.sock, pd.remote), e: e, resume: resumeID(secret),
@@ -1223,8 +1236,13 @@ func (e *Endpoint) events() {
 			if !ok {
 				return
 			}
-			if in, ok := ev.(dht.Incoming); ok {
-				e.incoming(in)
+			switch ev := ev.(type) {
+			case dht.Incoming:
+				e.incoming(ev)
+			case dht.SignerFailed:
+				if f := e.cfg.SignerFailed; f != nil {
+					go f(ev.Err)
+				}
 			}
 		}
 	}
