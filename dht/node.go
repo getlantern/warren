@@ -1000,7 +1000,7 @@ func (n *Node) maintain(now time.Time) {
 			break
 		}
 		if e, ok := n.recordEpoch(k); ok {
-			n.signRecord(now, e) // a fresh seq rebinds holders that lost us; on failure the old one stays
+			n.signRecord(now, e) // a fresh seq rebinds holders that lost us
 		}
 		o := n.owned[k]
 		o.next = now.Add(n.cfg.RepublishInterval)

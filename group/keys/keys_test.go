@@ -393,3 +393,16 @@ func TestCryptoSignerRefusesContext(t *testing.T) {
 		t.Fatalf("pure Ed25519 options: %v", err)
 	}
 }
+
+func TestCryptoSignerOptionEdges(t *testing.T) {
+	if CryptoSigner(nil) != nil {
+		t.Fatal("an adapter around no signer")
+	}
+	cs := CryptoSigner(IdentityFromSeed([32]byte{5}))
+	if _, err := cs.Sign(nil, []byte("m"), (*ed25519.Options)(nil)); err != nil {
+		t.Fatalf("a nil *ed25519.Options: %v", err)
+	}
+	if _, err := cs.Sign(nil, make([]byte, 64), &ed25519.Options{Hash: crypto.SHA512}); err == nil {
+		t.Fatal("signed Ed25519ph")
+	}
+}

@@ -33,6 +33,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
@@ -63,7 +64,14 @@ type SignalFailed struct {
 	Err error
 }
 
+// SignerFailed means the listener's signer couldn't sign a record: the
+// record held before keeps being served, and each pass tries again, but
+// callers can't reach us once it ages out. It is emitted once when the
+// failures start.
+type SignerFailed struct{ Err error }
+
 func (Incoming) isEvent()     {}
+func (SignerFailed) isEvent() {}
 func (Answered) isEvent()     {}
 func (SignalFailed) isEvent() {}
 
@@ -378,6 +386,7 @@ const maxSessionRelays = 4
 
 type listener struct {
 	priv     crypto.Signer
+	failing  bool // the signer's last attempt failed
 	pub      [32]byte
 	x        *ecdh.PrivateKey
 	records  map[int64]krpc.NodeID // epoch → record target
@@ -401,9 +410,17 @@ func (n *Node) Listen(now time.Time, priv crypto.Signer) error {
 // for one identity must share it: they publish the same record target, and
 // a holder that keeps one store across families would otherwise reject one
 // record, or hand callers a key the receiving node can't decrypt with.
+//
+// priv signs on the node's own loop, so its Sign must be quick: a hardware
+// key waiting for a touch would stall every lookup meanwhile.
 func (n *Node) ListenKey(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey) error {
 	pub, err := SignerKey(priv)
 	if err != nil {
+		return err
+	}
+	// Sign once before dropping the identity listened under now, so a
+	// signer that can't sign leaves that one reachable.
+	if _, err := NewMutable(priv, nil, 1, []byte("0:")); err != nil {
 		return err
 	}
 	// A new identity replaces the old one entirely: its records stop being
@@ -414,6 +431,10 @@ func (n *Node) ListenKey(now time.Time, priv crypto.Signer, x *ecdh.PrivateKey) 
 		records: map[int64]krpc.NodeID{}, sessions: map[SessionID]*session{}, seen: map[string]time.Time{},
 	}
 	n.ensureRecords(now)
+	if _, ok := n.lst.records[epochOf(now)]; !ok {
+		n.Unlisten()
+		return fmt.Errorf("%w: no record signed", ErrSigner)
+	}
 	n.maintain(now)
 	return nil
 }
@@ -517,8 +538,13 @@ func (n *Node) signRecord(now time.Time, epoch int64) (krpc.NodeID, bool) {
 	seq := max(now.Unix(), n.recordSeq[target]+1)
 	m, err := NewMutable(l.priv, salt, seq, encodeRecord([32]byte(l.x.PublicKey().Bytes())))
 	if err != nil {
+		if !l.failing {
+			l.failing = true
+			n.events = append(n.events, SignerFailed{Err: err})
+		}
 		return target, false
 	}
+	l.failing = false
 	n.owned[target] = &owned{rec: record{v: m.V, mut: &m}, next: now}
 	if n.recordSeq == nil {
 		n.recordSeq = map[krpc.NodeID]int64{}
@@ -542,10 +568,15 @@ const maxRecordSeqs = 64
 
 // resign republishes every record with a newer sequence number, rebinding
 // holders to our current address after a NAT mapping change.
-func (n *Node) resign(now time.Time) {
+// It reports whether every record was signed.
+func (n *Node) resign(now time.Time) bool {
+	ok := true
 	for e := range n.lst.records {
-		n.signRecord(now, e)
+		if _, signed := n.signRecord(now, e); !signed {
+			ok = false
+		}
 	}
+	return ok
 }
 
 // recordEpoch reports the epoch of one of our record targets.
@@ -650,8 +681,8 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 		}
 	}
 	if m.IP.IsValid() {
-		if h.mapped.IsValid() && h.mapped != m.IP {
-			n.resign(now)
+		if h.mapped.IsValid() && h.mapped != m.IP && !n.resign(now) {
+			return // the address change stays unhandled, so the next keepalive retries
 		}
 		h.mapped = m.IP
 	}

@@ -177,8 +177,8 @@ func (s *Server) Close() error {
 	return err
 }
 
-// errNotEd25519 means a server identity isn't an Ed25519 signer.
-var errNotEd25519 = errors.New("hy2: identity is not an ed25519 signer")
+// ErrNotEd25519 means a server identity isn't an Ed25519 signer.
+var ErrNotEd25519 = errors.New("hy2: identity is not an ed25519 signer")
 
 // Serve runs a hysteria2 server on pc whose certificate is identity's key:
 // an ed25519.PrivateKey, or any crypto.Signer of an Ed25519 key.
@@ -276,12 +276,19 @@ func (c *Client) Close() error {
 }
 
 // certificate is a self-signed TLS 1.3 certificate for an ed25519 identity.
-func certificate(identity crypto.Signer) (tls.Certificate, error) {
+func certificate(identity crypto.Signer) (cert tls.Certificate, err error) {
 	if identity == nil {
-		return tls.Certificate{}, errNotEd25519
+		return tls.Certificate{}, ErrNotEd25519
 	}
+	// A typed nil (a nil ed25519.PrivateKey) passes the check above and
+	// panics in Public or Sign.
+	defer func() {
+		if recover() != nil {
+			cert, err = tls.Certificate{}, ErrNotEd25519
+		}
+	}()
 	if pk, ok := identity.Public().(ed25519.PublicKey); !ok || len(pk) != ed25519.PublicKeySize {
-		return tls.Certificate{}, errNotEd25519
+		return tls.Certificate{}, ErrNotEd25519
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),

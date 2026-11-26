@@ -8,9 +8,12 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/getlantern/warren/krpc"
 )
 
 // opaque signs with an ed25519 key it doesn't expose: a crypto.Signer that
@@ -118,5 +121,109 @@ func TestSignerEdges(t *testing.T) {
 	gone := &failing{k: a, fail: true}
 	if _, err := NewMutable(gone, nil, 1, []byte("1:v")); !errors.Is(err, ErrSigner) || !strings.Contains(err.Error(), "device gone") {
 		t.Fatalf("a failing signer's cause: %v", err)
+	}
+}
+
+// panicky panics in Sign, as a broken adapter might.
+type panicky struct{ k ed25519.PrivateKey }
+
+func (p panicky) Public() crypto.PublicKey { return p.k.Public() }
+func (panicky) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
+	panic("broken signer")
+}
+
+func TestSignPanicIsRefusal(t *testing.T) {
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	if _, err := NewMutable(panicky{k}, nil, 1, []byte("1:v")); !errors.Is(err, ErrSigner) {
+		t.Fatalf("a panicking signer: %v", err)
+	}
+}
+
+// TestListenRefusesUnsigningSigner: a signer that can't sign is refused,
+// and the identity listened under before stays.
+func TestListenRefusesUnsigningSigner(t *testing.T) {
+	_, good, _ := ed25519.GenerateKey(rand.Reader)
+	_, other, _ := ed25519.GenerateKey(rand.Reader)
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	if err := n.Listen(t0, good); err != nil {
+		t.Fatal(err)
+	}
+	for name, s := range map[string]crypto.Signer{
+		"failing":   &failing{k: other, fail: true},
+		"wrong key": wrongKey{pub: other, k: good},
+		"panicking": panicky{other},
+	} {
+		if err := n.Listen(t0, s); !errors.Is(err, ErrSigner) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if n.lst == nil || n.lst.pub != [32]byte(good.Public().(ed25519.PublicKey)) || len(n.lst.records) == 0 {
+			t.Fatalf("%s: the identity listened under before was dropped", name)
+		}
+	}
+}
+
+// TestSignerFailedOnce: a run of failed signs is reported once, and again
+// only after a success.
+func TestSignerFailedOnce(t *testing.T) {
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	f := &failing{k: k}
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	if err := n.Listen(t0, f); err != nil {
+		t.Fatal(err)
+	}
+	count := func() int {
+		_, evs := n.Drain()
+		c := 0
+		for _, e := range evs {
+			if _, ok := e.(SignerFailed); ok {
+				c++
+			}
+		}
+		return c
+	}
+	count()
+	f.fail = true
+	if n.resign(t0.Add(time.Second)) {
+		t.Fatal("resign reported success with a failing signer")
+	}
+	n.resign(t0.Add(2 * time.Second))
+	if c := count(); c != 1 {
+		t.Fatalf("%d SignerFailed events for one run of failures", c)
+	}
+	f.fail = false
+	n.resign(t0.Add(3 * time.Second))
+	f.fail = true
+	n.resign(t0.Add(4 * time.Second))
+	if c := count(); c != 1 {
+		t.Fatalf("%d SignerFailed events after a success and a new failure", c)
+	}
+}
+
+// TestRebindRetriedAfterFailedSign: a NAT mapping change seen while the
+// signer fails stays unhandled, so the next keepalive re-signs.
+func TestRebindRetriedAfterFailedSign(t *testing.T) {
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	f := &failing{k: k}
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	if err := n.Listen(t0, f); err != nil {
+		t.Fatal(err)
+	}
+	var target krpc.NodeID
+	for _, tg := range n.lst.records {
+		target = tg
+	}
+	old := netip.MustParseAddrPort("192.0.2.1:1000")
+	h := &holder{addr: netip.MustParseAddrPort("198.51.100.1:6881"), target: target, mapped: old}
+	n.lst.holders = append(n.lst.holders, h)
+	moved := netip.MustParseAddrPort("192.0.2.9:2000")
+	f.fail = true
+	n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: moved, R: krpc.Return{}})
+	if h.mapped != old {
+		t.Fatal("a mapping change was marked handled though its re-sign failed")
+	}
+	f.fail = false
+	n.keepaliveReply(t0.Add(2*time.Second), h, &krpc.Msg{IP: moved, R: krpc.Return{}})
+	if h.mapped != moved {
+		t.Fatal("the mapping change wasn't handled once signing worked")
 	}
 }

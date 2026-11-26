@@ -43,7 +43,8 @@ var ErrSigner = errors.New("dht: not a usable ed25519 signer")
 
 // SignerKey returns s's Ed25519 public key. Every key this package signs
 // with is a crypto.Signer: an ed25519.PrivateKey, or anything else that
-// signs Ed25519 messages whole (a blinded key, a key in hardware).
+// signs Ed25519 messages whole (a blinded key, a key in hardware). Signing
+// runs on the node's loop, so a signer's Sign must be quick.
 func SignerKey(s crypto.Signer) (key [32]byte, err error) {
 	if s == nil {
 		return [32]byte{}, ErrSigner
@@ -63,7 +64,14 @@ func SignerKey(s crypto.Signer) (key [32]byte, err error) {
 }
 
 // sign signs msg whole with s, as Ed25519 does.
-func sign(s crypto.Signer, msg []byte) ([64]byte, error) {
+func sign(s crypto.Signer, msg []byte) (out [64]byte, err error) {
+	// The signer is the caller's code, run on the node's loop: a panic in
+	// it is a refusal, not the end of every lookup.
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = [64]byte{}, fmt.Errorf("%w: it panicked: %v", ErrSigner, r)
+		}
+	}()
 	sig, err := s.Sign(nil, msg, crypto.Hash(0))
 	if err != nil {
 		return [64]byte{}, fmt.Errorf("%w: %w", ErrSigner, err)

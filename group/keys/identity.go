@@ -25,7 +25,13 @@ type Signer interface {
 // CryptoSigner adapts s to a crypto.Signer, the form warren's endpoint,
 // driver, dht and hy2 take a key in, so a member can listen and connect
 // under a blinded key. It signs messages whole, as Ed25519 does.
-func CryptoSigner(s Signer) crypto.Signer { return cryptoSigner{s} }
+// A nil s gives nil, so it's refused like any missing signer.
+func CryptoSigner(s Signer) crypto.Signer {
+	if s == nil {
+		return nil
+	}
+	return cryptoSigner{s}
+}
 
 type cryptoSigner struct{ s Signer }
 
@@ -35,11 +41,16 @@ func (c cryptoSigner) Public() crypto.PublicKey {
 }
 
 func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
-	if opts != nil && opts.HashFunc() != 0 {
-		return nil, errors.New("keys: Ed25519 signs messages whole, not digests")
-	}
-	if o, ok := opts.(*ed25519.Options); ok && o.Context != "" {
-		return nil, errors.New("keys: no Ed25519ctx: a blinded key signs pure Ed25519 only")
+	switch o := opts.(type) {
+	case nil:
+	case *ed25519.Options:
+		if o != nil && (o.Hash != 0 || o.Context != "") {
+			return nil, errors.New("keys: a blinded key signs pure Ed25519 only: no Ed25519ph or Ed25519ctx")
+		}
+	default:
+		if o.HashFunc() != 0 {
+			return nil, errors.New("keys: Ed25519 signs messages whole, not digests")
+		}
 	}
 	return c.s.Sign(msg), nil
 }
