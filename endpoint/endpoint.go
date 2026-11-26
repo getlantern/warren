@@ -99,14 +99,16 @@ type Config struct {
 // by Endpoint.Rebind, and by the stall watcher when the peer goes silent)
 // punches a fresh path and moves the connection onto it, while Remote,
 // Secret and everything layered above stay the same.
+//
+// Its exported fields (Remote, PeerKey, LocalKey, Secret, Relayed) are set
+// when the connection is made and read-only after.
 type Conn struct {
 	// Remote is the peer's address as the connection reports it. It is the
 	// address first punched and never changes, even after Migrate moves the
 	// connection to another path.
 	Remote netip.AddrPort
 	// PeerKey is the provider's key for an outbound connection, the
-	// caller's verified key for an inbound one. Like every field here it
-	// is set when the connection is made and read-only after.
+	// caller's verified key for an inbound one.
 	PeerKey [32]byte
 	// LocalKey is our key: the identity that signed an outbound
 	// connection's offer, or the listener key an inbound one called.
@@ -561,7 +563,7 @@ func (e *Endpoint) migrateAll(ctx context.Context, onlyUnmoved bool) error {
 				kind = moveRetry
 			}
 			if err := c.migrate(ctx, kind, stallMark{}); err != nil {
-				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.PeerKey[:4], err)
+				errs[i] = fmt.Errorf("migrating connection to %x: %w", c.regKey.peer[:4], err)
 			}
 		})
 	}
@@ -952,7 +954,7 @@ func (c *Conn) migrate(ctx context.Context, kind moveKind, stall stallMark) erro
 	seq := c.migrations
 	offer := offerOf(legs)
 	offer.Resume = resumeOffer(c.resume, seq)
-	payload, err := e.node.Signal(ctx, c.identity, c.PeerKey, offer.Marshal())
+	payload, err := e.node.Signal(ctx, c.identity, c.regKey.peer, offer.Marshal())
 	if err != nil {
 		abortAll(legs)
 		return err
