@@ -261,3 +261,22 @@ func TestListenSignsOnce(t *testing.T) {
 		t.Fatalf("%d signatures for one Listen", c.signs)
 	}
 }
+
+// TestFailingSignerAskedOncePerPass: with records due and a re-sign
+// pending, a failing signer is asked once per record by resign, not again
+// by the republish pass.
+func TestFailingSignerAskedOncePerPass(t *testing.T) {
+	_, k, _ := ed25519.GenerateKey(rand.Reader)
+	c := &counting{failing: failing{k: k}}
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	if err := n.Listen(t0, c); err != nil {
+		t.Fatal(err)
+	}
+	c.fail = true
+	n.resign(t0.Add(time.Second)) // fails: resignDue
+	c.signs = 0
+	n.Rebound(t0.Add(2 * time.Second)) // marks records due and runs a pass
+	if c.signs > len(n.lst.records) {
+		t.Fatalf("%d signs in one pass for %d records", c.signs, len(n.lst.records))
+	}
+}

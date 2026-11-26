@@ -481,7 +481,7 @@ func (n *Node) Rebound(now time.Time) {
 		}
 		for _, t := range l.records {
 			if o := n.owned[t]; o != nil {
-				o.next = now // maintain re-signs due records with a fresh seq
+				o.next = now // maintain republishes due records under a newer seq
 			}
 		}
 		l.nextKA = now

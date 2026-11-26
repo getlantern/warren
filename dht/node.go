@@ -1007,7 +1007,9 @@ func (n *Node) maintain(now time.Time) {
 		}
 		// A fresh seq rebinds holders that lost us; a record just signed
 		// has one already.
-		if e, ok := n.recordEpoch(k); ok && !n.owned[k].fresh {
+		// A failing signer was already asked this pass (resignDue is still
+		// set): don't ask again per due record.
+		if e, ok := n.recordEpoch(k); ok && !n.owned[k].fresh && (n.lst == nil || !n.lst.resignDue) {
 			n.signRecord(now, e)
 		}
 		o := n.owned[k]

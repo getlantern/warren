@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha512"
 	"errors"
+	"fmt"
 	"io"
 
 	"filippo.io/edwards25519"
@@ -62,7 +63,18 @@ func (c cryptoSigner) Sign(_ io.Reader, msg []byte, opts crypto.SignerOpts) ([]b
 			return nil, errors.New("keys: Ed25519 signs messages whole, not digests")
 		}
 	}
-	return c.s.Sign(msg), nil
+	return signWhole(c.s, msg)
+}
+
+// signWhole signs msg with s, turning a panic in s (a hardware key gone,
+// say) into an error, so a TLS handshake fails rather than the process.
+func signWhole(s Signer, msg []byte) (sig []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			sig, err = nil, fmt.Errorf("keys: the signer panicked: %v", r)
+		}
+	}()
+	return s.Sign(msg), nil
 }
 
 // Verify reports whether sig is pk's signature of msg, and pk is a usable

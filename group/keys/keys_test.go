@@ -414,3 +414,15 @@ func TestCryptoSignerTypedNilOptions(t *testing.T) {
 		t.Fatal("signed with typed-nil options of another kind")
 	}
 }
+
+type panicSigner struct{ PublicKey }
+
+func (p panicSigner) Public() PublicKey { return p.PublicKey }
+func (panicSigner) Sign([]byte) []byte  { panic("device gone") }
+
+func TestCryptoSignerRecoversSignerPanic(t *testing.T) {
+	cs := CryptoSigner(panicSigner{IdentityFromSeed([32]byte{7}).Public()})
+	if _, err := cs.Sign(nil, []byte("m"), crypto.Hash(0)); err == nil {
+		t.Fatal("a panicking signer's panic got through as success")
+	}
+}
