@@ -380,7 +380,11 @@ func (o *oneSign) Sign(r io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte,
 func TestSignerFailedReachesApp(t *testing.T) {
 	got := make(chan error, 1)
 	e, err := New(Config{DHT: member(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1),
-		SignerFailed: func(err error) { got <- err }})
+		SignerFailed: func(listener [32]byte, err error) {
+			if listener == pub(key("one sign")) {
+				got <- err
+			}
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}

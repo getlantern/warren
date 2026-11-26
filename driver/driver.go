@@ -746,18 +746,14 @@ func (n *Node) Snapshot(ctx context.Context) ([]byte, error) {
 // callers of either family can reach us, replacing every key listened
 // under before. Offers arrive as dht.Incoming on Events; reply with Answer.
 func (n *Node) Listen(ctx context.Context, priv crypto.Signer) error {
-	return n.listen(ctx, priv, func(d *dht.Node, now time.Time, x *ecdh.PrivateKey) error {
-		return d.ListenKey(now, priv, x)
-	})
+	return n.listen(ctx, priv, true)
 }
 
 // AddListener makes us reachable under priv's key as well as any listened
 // under already, on every node; dht.Incoming.Listener says which key an
 // offer called.
 func (n *Node) AddListener(ctx context.Context, priv crypto.Signer) error {
-	return n.listen(ctx, priv, func(d *dht.Node, now time.Time, x *ecdh.PrivateKey) error {
-		return d.AddListenerKey(now, priv, x)
-	})
+	return n.listen(ctx, priv, false)
 }
 
 // RemoveListener stops listening under pub on every node, leaving any
@@ -770,10 +766,16 @@ func (n *Node) RemoveListener(ctx context.Context, pub [32]byte) error {
 	return err
 }
 
-// listen runs f on every node with one signaling key, so their records are
-// identical, all on one turn of the loop, so no family serves a new key
-// while another's signer failure is still being undone.
-func (n *Node) listen(ctx context.Context, priv crypto.Signer, f func(*dht.Node, time.Time, *ecdh.PrivateKey) error) error {
+// listen listens under priv on every node with one signaling key, so their
+// records are identical, replacing every key or only priv's. It runs on
+// one turn of the loop, and if any node fails while another succeeded it
+// undoes the change on those that succeeded, so siblings never publish
+// different keys.
+func (n *Node) listen(ctx context.Context, priv crypto.Signer, replaceAll bool) error {
+	pub, err := dht.SignerKey(priv)
+	if err != nil {
+		return err
+	}
 	x, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return err
@@ -784,35 +786,75 @@ func (n *Node) listen(ctx context.Context, priv crypto.Signer, f func(*dht.Node,
 		errs := make([]error, len(n.fams))
 		for i, fm := range n.fams {
 			prev[i] = fm.node.Listeners()
-			errs[i] = f(fm.node, now, x)
-		}
-		// A family whose signer failed kept its listeners while the others
-		// changed theirs: put those back, so siblings never publish
-		// different keys. (A family failing for another reason, a family
-		// down, leaves the rest listening, as before.)
-		i := slices.IndexFunc(errs, func(e error) bool { return errors.Is(e, dht.ErrSigner) })
-		if i >= 0 && slices.Contains(errs, nil) {
-			for j, fm := range n.fams {
-				if errs[j] == nil {
-					restore(now, fm.node, prev[j])
-				}
+			if replaceAll {
+				errs[i] = fm.node.ListenKey(now, priv, x)
+			} else {
+				errs[i] = fm.node.AddListenerKey(now, priv, x)
 			}
-			res <- errs[i]
+		}
+		i := slices.IndexFunc(errs, func(e error) bool { return e != nil })
+		if i < 0 {
+			res <- nil
 			return
 		}
-		res <- anyOK(errs)
+		if !slices.Contains(errs, nil) {
+			res <- errs[i] // nothing changed anywhere
+			return
+		}
+		for j, fm := range n.fams {
+			if errs[j] != nil {
+				continue
+			}
+			if replaceAll {
+				restoreAll(now, fm.node, prev[j])
+			} else {
+				undoAdd(now, fm.node, pub, prev[j])
+			}
+		}
+		n.reconcile()
+		res <- errs[i]
 	}); err != nil {
 		return err
 	}
 	return <-res
 }
 
-// restore puts d's listeners back as they were. One that won't sign again
-// is left off rather than published under a key its siblings lack.
-func restore(now time.Time, d *dht.Node, prev []dht.Listener) {
+// restoreAll puts d's listeners back as they were before a Listen.
+func restoreAll(now time.Time, d *dht.Node, prev []dht.Listener) {
 	d.Unlisten()
 	for _, l := range prev {
 		_ = d.AddListenerKey(now, l.Signer, l.SignalKey)
+	}
+}
+
+// undoAdd takes back an AddListener of pub on d, leaving its other
+// listeners (their sessions, holders and records) untouched, and puts back
+// a listener the add replaced under the same key.
+func undoAdd(now time.Time, d *dht.Node, pub [32]byte, prev []dht.Listener) {
+	d.RemoveListener(pub)
+	for _, l := range prev {
+		if l.Key == pub {
+			_ = d.AddListenerKey(now, l.Signer, l.SignalKey)
+		}
+	}
+}
+
+// reconcile drops any key not every node listens under, so after an undo
+// whose re-listening failed somewhere (a signer that won't sign again) the
+// siblings still publish the same keys.
+func (n *Node) reconcile() {
+	count := map[[32]byte]int{}
+	for _, fm := range n.fams {
+		for _, l := range fm.node.Listeners() {
+			count[l.Key]++
+		}
+	}
+	for k, c := range count {
+		if c < len(n.fams) {
+			for _, fm := range n.fams {
+				fm.node.RemoveListener(k)
+			}
+		}
 	}
 }
 

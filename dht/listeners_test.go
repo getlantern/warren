@@ -226,3 +226,61 @@ func TestSessionIDUniqueAcrossListeners(t *testing.T) {
 		t.Fatalf("%d offers delivered; the reused session ID was taken", incoming)
 	}
 }
+
+// TestMappingChangeResignsOncePerRound: many holders across listeners all
+// reporting one address change re-sign each record once, not once per
+// holder.
+func TestMappingChangeResignsOncePerRound(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	var cs []*counting
+	for i := range 3 {
+		c := &counting{failing: failing{k: seededKey(byte(i + 1))}}
+		cs = append(cs, c)
+		n.AddListener(t0, c)
+	}
+	moved := netip.MustParseAddrPort("192.0.2.9:2000")
+	var hs []*holder
+	for i, l := range n.lsts {
+		var target krpc.NodeID
+		for _, tg := range l.records {
+			target = tg
+		}
+		for j := range 4 {
+			h := &holder{addr: addr(60 + 4*i + j), target: target, mapped: netip.MustParseAddrPort("192.0.2.1:1000")}
+			l.holders = append(l.holders, h)
+			hs = append(hs, h)
+		}
+	}
+	for _, c := range cs {
+		c.signs = 0
+	}
+	for _, h := range hs {
+		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: moved})
+	}
+	for i, c := range cs {
+		if c.signs > len(n.lsts[i].records) {
+			t.Fatalf("listener %d signed %d times for one address change", i, c.signs)
+		}
+	}
+}
+
+func TestSignerFailedNamesListener(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	ok := seededKey(1)
+	f := &failing{k: seededKey(2)}
+	n.AddListener(t0, ok)
+	n.AddListener(t0, f)
+	n.Drain()
+	f.fail = true
+	n.resign(t0.Add(time.Second), n.lsts[1])
+	_, evs := n.Drain()
+	for _, e := range evs {
+		if sf, isSF := e.(SignerFailed); isSF {
+			if sf.Listener != pubOf(f.k) {
+				t.Fatalf("SignerFailed named %x", sf.Listener[:4])
+			}
+			return
+		}
+	}
+	t.Fatal("no SignerFailed")
+}

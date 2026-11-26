@@ -69,7 +69,10 @@ type SignalFailed struct {
 // record held before keeps being served, and each maintenance pass tries
 // again, but callers can't reach us once it ages out. It is emitted when a
 // sign fails after the last one succeeded.
-type SignerFailed struct{ Err error }
+type SignerFailed struct {
+	Listener [32]byte // the key whose signer failed
+	Err      error
+}
 
 func (Incoming) isEvent()     {}
 func (SignerFailed) isEvent() {}
@@ -403,7 +406,9 @@ type listener struct {
 }
 
 // MaxListeners bounds the keys a node listens under at once: each keeps
-// records published and holders kept alive.
+// records published and holders kept alive, and their republication after
+// a rebind shares the node's lookup slots, so a node meant to stay
+// responsive listens under a handful, not the cap.
 const MaxListeners = 64
 
 // ErrTooManyListeners means AddListener would exceed MaxListeners.
@@ -624,7 +629,7 @@ func (n *Node) signRecord(now time.Time, l *listener, epoch int64) (krpc.NodeID,
 		l.resignDue = true
 		if !l.failing {
 			l.failing = true
-			n.events = append(n.events, SignerFailed{Err: err})
+			n.events = append(n.events, SignerFailed{Listener: l.pub, Err: err})
 		}
 		return target, false
 	}
@@ -767,8 +772,12 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 	if m.IP.IsValid() {
 		// After a failed re-sign maintenance retries, once a pass, so other
 		// holders' replies don't ask a failing signer again.
-		if h.mapped.IsValid() && h.mapped != m.IP {
-			// Our address moved: every listener's holders bind to it.
+		// Our address moved: every listener's holders bind to it. One
+		// re-sign a keepalive round covers every holder reporting it (each
+		// tracks its own view, as behind a symmetric NAT each sees its own
+		// mapping), so many listeners' holders don't each set one off.
+		if h.mapped.IsValid() && h.mapped != m.IP && !now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval/2)) {
+			n.resignedAt = now
 			for _, x := range n.lsts {
 				if !x.resignDue {
 					n.resign(now, x)

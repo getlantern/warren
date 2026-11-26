@@ -57,15 +57,15 @@ type Config struct {
 	// answers (a group's rendezvous key, say, only its members), after
 	// Authorize if both are set.
 	AuthorizeListener func(listener, caller [32]byte) bool
-	// SignerFailed, if set, is told when the listener's signer fails to
-	// re-sign a record (a hardware key gone, say): callers can't reach it
+	// SignerFailed, if set, is told when a listener's signer fails to
+	// re-sign a record, with that listener's key (a hardware key gone, say): callers can't reach it
 	// once the record held before ages out. It is called on its own
 	// goroutine, each time a DHT family's signer starts failing (a failure
 	// during Listen is Listen's error instead), and like every DHT event it
 	// is best effort: one that arrives while the event queue is full is
 	// dropped. An in-memory key, an ed25519.PrivateKey or a blinded key
 	// from group/keys, never fails.
-	SignerFailed func(err error)
+	SignerFailed func(listener [32]byte, err error)
 	// RelayOnly never reveals this endpoint's addresses to peers: every
 	// connection goes through a relay router.
 	RelayOnly bool
@@ -652,7 +652,9 @@ func (e *Endpoint) AddListener(ctx context.Context, priv crypto.Signer) error {
 }
 
 // RemoveListener stops listening under pub, leaving any other key.
-// Connections made under it carry on.
+// Connections made under it carry on until the network changes: their
+// callers find no record to signal a migration through, and a resume
+// through another of our keys is refused.
 func (e *Endpoint) RemoveListener(ctx context.Context, pub [32]byte) error {
 	return e.node.RemoveListener(ctx, pub)
 }
@@ -839,10 +841,9 @@ func (e *Endpoint) forget(c *Conn) {
 }
 
 // resumable returns the live inbound connection a resume ID names, if the
-// offer comes from that connection's caller.
-// resumable is the inbound connection a resume offer names, if it called
-// the same listener key: a caller can't move a connection made under one
-// of our keys by calling another.
+// offer comes from that connection's caller and called the same listener
+// key: a caller can't move a connection made under one of our keys by
+// calling another.
 func (e *Endpoint) resumable(id [16]byte, caller, listener [32]byte) *Conn {
 	e.connsMu.Lock()
 	defer e.connsMu.Unlock()
@@ -1269,7 +1270,7 @@ func (e *Endpoint) events() {
 				e.incoming(ev)
 			case dht.SignerFailed:
 				if f := e.cfg.SignerFailed; f != nil {
-					go f(ev.Err)
+					go f(ev.Listener, ev.Err)
 				}
 			}
 		}
