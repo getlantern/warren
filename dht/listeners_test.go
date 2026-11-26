@@ -452,3 +452,32 @@ func TestReturnToEarlierAddressResigns(t *testing.T) {
 		t.Fatal("a return to an earlier address was skipped")
 	}
 }
+
+// TestDedupRebasedByNewHolders: after a move to A, holders adopted at B
+// (a move nobody reported) make B the baseline, so a later move back to A
+// is acted on.
+func TestDedupRebasedByNewHolders(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	l := n.lsts[0]
+	var target krpc.NodeID
+	for _, tg := range l.records {
+		target = tg
+	}
+	keep := krpc.Return{V: []byte("1:v")}
+	c := netip.MustParseAddrPort("203.0.113.5:5000")
+	a, b := netip.MustParseAddrPort("192.0.2.1:1000"), netip.MustParseAddrPort("198.51.100.7:4000")
+	old := &holder{addr: addr(60), target: target, mapped: c}
+	l.holders = append(l.holders, old)
+	n.keepaliveReply(t0.Add(time.Minute), old, &krpc.Msg{IP: a, R: keep}) // acted on: A
+	// The old holder is replaced; a new one first sees us at B.
+	l.holders = nil
+	fresh := &holder{addr: addr(61), target: target}
+	l.holders = append(l.holders, fresh)
+	n.keepaliveReply(t0.Add(2*time.Minute), fresh, &krpc.Msg{IP: b, R: keep})
+	seq := n.recordSeq[target]
+	n.keepaliveReply(t0.Add(3*time.Minute), fresh, &krpc.Msg{IP: a, R: keep}) // back to A
+	if n.recordSeq[target] <= seq && !l.resignDue {
+		t.Fatal("a move back to A, after holders adopted at B, was skipped")
+	}
+}

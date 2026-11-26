@@ -368,9 +368,12 @@ const maxRecentOffers = 4096
 // one caller can't touch another's, and remembered for as long as the DHT
 // would still accept a copy of the offer (dht.OfferWindow). When full, the oldest entry makes way: a flood can't
 // make us refuse offers.
-func (e *Endpoint) firstOffer(caller [32]byte, secret []byte, now time.Time) (*offerEntry, bool) {
+func (e *Endpoint) firstOffer(caller, listener [32]byte, secret []byte, now time.Time) (*offerEntry, bool) {
+	// The listener called is part of the key: offers through two of our
+	// keys are two offers, and one must never get the other's answer.
 	h := sha256.New()
 	h.Write(caller[:])
+	h.Write(listener[:])
 	h.Write(secret)
 	key := [32]byte(h.Sum(nil))
 	// A copy can arrive as late as the DHT still accepts the offer: a
@@ -1292,7 +1295,7 @@ func (e *Endpoint) incoming(in dht.Incoming) {
 	if err != nil || len(offer.Secret) < 16 {
 		return
 	}
-	entry, first := e.firstOffer(in.Caller, offer.Secret, time.Now())
+	entry, first := e.firstOffer(in.Caller, in.Listener, offer.Secret, time.Now())
 	if !first {
 		if answer, now := entry.copyOf(in.Session); now {
 			e.wg.Go(func() {

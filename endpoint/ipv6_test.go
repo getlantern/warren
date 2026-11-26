@@ -205,12 +205,12 @@ func TestFirstOfferDedupes(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	alice, bob := [32]byte{1}, [32]byte{2}
-	first := func(c [32]byte, at time.Time) bool { _, ok := e.firstOffer(c, secret, at); return ok }
-	entry, ok := e.firstOffer(alice, secret, now)
+	first := func(c [32]byte, at time.Time) bool { _, ok := e.firstOffer(c, [32]byte{}, secret, at); return ok }
+	entry, ok := e.firstOffer(alice, [32]byte{}, secret, now)
 	if !ok {
 		t.Fatal("a new offer was treated as a copy")
 	}
-	copyEntry, ok := e.firstOffer(alice, secret, now.Add(time.Second))
+	copyEntry, ok := e.firstOffer(alice, [32]byte{}, secret, now.Add(time.Second))
 	if ok || copyEntry != entry {
 		t.Fatal("a repeated offer was accepted twice, or didn't share the first copy's entry")
 	}
@@ -229,7 +229,7 @@ func TestFirstOfferDedupes(t *testing.T) {
 	if entry.publish(nil) != nil || string(entry.answer) != "answer" {
 		t.Fatal("a later publish changed the answer")
 	}
-	late, ok := e.firstOffer(alice, secret, now.Add(2*time.Second))
+	late, ok := e.firstOffer(alice, [32]byte{}, secret, now.Add(2*time.Second))
 	if ok {
 		t.Fatal("a late copy was treated as new")
 	}
@@ -480,10 +480,30 @@ func TestCopyNeedsNoSlot(t *testing.T) {
 	secret := make([]byte, 32)
 	crand.Read(secret)
 	caller := [32]byte{9}
-	entry, _ := e.firstOffer(caller, secret, time.Now()) // the first copy, in progress
+	entry, _ := e.firstOffer(caller, [32]byte{}, secret, time.Now()) // the first copy, in progress
 	offer := punch.Offer{Secret: secret, Candidates: []netip.AddrPort{netip.MustParseAddrPort("2.10.0.1:4000")}}
 	e.incoming(dht.Incoming{Session: dht.SessionID{5}, Caller: caller, Payload: offer.Marshal()})
 	if queued := entry.publish([]byte("answer")); len(queued) != 1 || queued[0] != (dht.SessionID{5}) {
 		t.Fatalf("the copy wasn't queued while slots were full: %v", queued)
+	}
+}
+
+// TestFirstOfferPerListener: one caller's offers with one secret through
+// two of our keys are two offers, each answered on its own.
+func TestFirstOfferPerListener(t *testing.T) {
+	e := &Endpoint{cfg: Config{GatherWait: time.Second, PunchDeadline: 6 * time.Second}}
+	now := time.Unix(1_800_000_000, 0)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	caller, la, lb := [32]byte{1}, [32]byte{0xa}, [32]byte{0xb}
+	ea, ok := e.firstOffer(caller, la, secret, now)
+	if !ok {
+		t.Fatal("first offer treated as a copy")
+	}
+	eb, ok := e.firstOffer(caller, lb, secret, now)
+	if !ok || eb == ea {
+		t.Fatal("an offer through another key shared the first key's entry")
+	}
+	if _, ok := e.firstOffer(caller, la, secret, now.Add(time.Second)); ok {
+		t.Fatal("a copy through the same key was taken as new")
 	}
 }

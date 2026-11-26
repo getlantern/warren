@@ -536,7 +536,8 @@ func (n *Node) holderOwner(h *holder) *listener {
 // mappings on the new network. Routing contacts stay: their addresses
 // didn't change.
 func (n *Node) Rebound(now time.Time) {
-	n.rtt = rttEstimator{} // round trips on the old network say nothing about the new
+	n.rtt = rttEstimator{}           // round trips on the old network say nothing about the new
+	n.resignedFor = netip.AddrPort{} // a new network: any address may be a move again
 	n.reflections, n.destOrder = nil, nil
 	n.gen++
 	// Queries in flight went out from the old socket: abandon them, so a
@@ -785,6 +786,13 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 		// pass. A move is never lost, and however many holders report it
 		// (behind a symmetric NAT each sees its own port) it costs a few
 		// full re-signs, not one per holder.
+		// A holder first seeing us somewhere other than the address last
+		// acted on (a holder adopted since a move we never saw reported)
+		// means that address is no longer our baseline: forget it, so a
+		// later move back to it is acted on.
+		if !h.mapped.IsValid() && m.IP != n.resignedFor {
+			n.resignedFor = netip.AddrPort{}
+		}
 		if h.mapped.IsValid() && h.mapped != m.IP && m.IP != n.resignedFor {
 			n.resignedFor = m.IP
 			if !n.resignedAt.IsZero() && now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval/2)) {
