@@ -7,6 +7,7 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdh"
@@ -862,6 +863,7 @@ func (n *Node) reconcile() [][32]byte {
 			}
 		}
 	}
+	slices.SortFunc(dropped, func(a, b [32]byte) int { return bytes.Compare(a[:], b[:]) })
 	return dropped
 }
 

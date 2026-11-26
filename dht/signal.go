@@ -115,10 +115,10 @@ const (
 	pendingAnswerTTL  = 30 * time.Second
 	maxBindings       = 512
 	maxPendingAnswers = 256
-	maxSessions       = 64 // offers in progress per listener
-	// maxNodeSessions bounds them across every listener: a flood to one
-	// key (a public invite's) fills its own share, not every key's.
-	maxNodeSessions   = 4 * maxSessions
+	// maxSessions bounds offers in progress per listener, so a flood to one
+	// key (a public invite's) fills its own share, never another key's;
+	// MaxListeners times it bounds the node's.
+	maxSessions       = 64
 	maxHolders        = 4
 	holderMaxFailures = 2
 )
@@ -783,17 +783,21 @@ func (n *Node) keepaliveReply(now time.Time, h *holder, m *krpc.Msg) {
 		if h.mapped.IsValid() && h.mapped != m.IP {
 			if now.Before(n.resignedAt.Add(n.cfg.KeepaliveInterval / 2)) {
 				// Re-signed for a change this round already. Other holders
-				// reporting the same new address need nothing more; one not
-				// seen yet (a second move) is left to the next maintenance
-				// pass, not lost.
-				if !n.resignedFor[m.IP] {
-					n.resignedFor[m.IP] = true
+				// reporting the same new host need nothing more (by IP: behind
+				// a symmetric NAT each sees its own port); a host not seen yet
+				// (a second move) is left to the next maintenance pass, not
+				// lost.
+				if n.resignedFor == nil {
+					n.resignedFor = map[netip.Addr]bool{}
+				}
+				if !n.resignedFor[m.IP.Addr()] {
+					n.resignedFor[m.IP.Addr()] = true
 					for _, x := range n.lsts {
 						x.resignDue = true
 					}
 				}
 			} else {
-				n.resignedAt, n.resignedFor = now, map[netip.AddrPort]bool{m.IP: true}
+				n.resignedAt, n.resignedFor = now, map[netip.Addr]bool{m.IP.Addr(): true}
 				for _, x := range n.lsts {
 					if !x.resignDue {
 						n.resign(now, x)
@@ -842,9 +846,12 @@ find:
 	if l == nil {
 		return false
 	}
-	if !fresh(m.Seq, now) || len(l.sessions) >= maxSessions || n.sessionCount() >= maxNodeSessions {
+	if !fresh(m.Seq, now) {
 		return true
 	}
+	// A retry of an offer already taken adds no session, so it is handled
+	// even when the listener is full: a caller whose answer was lost still
+	// gets it through another holder.
 	if _, dup := l.seen[string(m.Salt)]; dup {
 		if s := l.sessions[SessionID(m.Salt[:16])]; s != nil && from != s.via && !slices.Contains(s.relays, from) {
 			// Our adopted holders always qualify (few, and known to store the
@@ -861,6 +868,9 @@ find:
 				}
 			}
 		}
+		return true
+	}
+	if len(l.sessions) >= maxSessions {
 		return true
 	}
 	// The caller picks the session ID (the salt's first half): one already
@@ -896,16 +906,6 @@ find:
 	l.sessions[id] = &session{via: from, answerSalt: answerSalt(m.Salt), key: answerKey, expires: now.Add(sessionLifetime)}
 	n.events = append(n.events, Incoming{Session: id, Caller: m.Key, Listener: l.pub, Payload: payload})
 	return true
-}
-
-// sessionCount is the offers in progress across every listener: one bound
-// for all, so more listeners don't mean more state.
-func (n *Node) sessionCount() int {
-	c := 0
-	for _, l := range n.lsts {
-		c += len(l.sessions)
-	}
-	return c
 }
 
 // Answer replies to an Incoming offer through the holder that relayed it.

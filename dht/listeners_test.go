@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -162,8 +163,8 @@ func TestFloodedListenerLeavesOthers(t *testing.T) {
 	for i := range maxSessions + 10 {
 		n.acceptOffer(t0, addr(40), offerTo(n, n.lsts[0], seededKey(byte(10+i%200)), "flood"))
 	}
-	if c := len(n.lsts[0].sessions); c > maxSessions {
-		t.Fatalf("%d sessions on the flooded key, cap %d", c, maxSessions)
+	if c := len(n.lsts[0].sessions); c != maxSessions {
+		t.Fatalf("%d sessions on the flooded key, want the cap, %d", c, maxSessions)
 	}
 	n.Drain()
 	n.acceptOffer(t0, addr(41), offerTo(n, n.lsts[1], seededKey(250), "member"))
@@ -341,4 +342,63 @@ func TestSameMoveReportedByManyResignsOnce(t *testing.T) {
 	if l.resignDue {
 		t.Fatal("holders reporting the move already re-signed for left a re-sign due")
 	}
+}
+
+// TestRetryAtCapGetsAnswer: a caller's retry through another holder, of an
+// offer already taken, gets the answer even with the listener full.
+func TestRetryAtCapGetsAnswer(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	l := n.lsts[0]
+	n.Drain()
+	genuine := offerTo(n, l, seededKey(9), "genuine")
+	n.acceptOffer(t0, addr(40), genuine)
+	_, evs := n.Drain()
+	in := evs[0].(Incoming)
+	if err := n.Answer(t0, in.Session, []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	for i := range maxSessions {
+		n.acceptOffer(t0, addr(41), offerTo(n, l, seededKey(byte(20+i)), "flood"))
+	}
+	n.Drain()
+	n.acceptOffer(t0, addr(77), genuine) // the retry, through another holder
+	if s := l.sessions[in.Session]; s == nil || !slices.Contains(s.relays, addr(77)) {
+		t.Fatal("a retry at the cap was dropped")
+	}
+}
+
+// TestSymmetricNATMoveResignsOnce: holders each seeing their own port after
+// one move leave nothing more due.
+func TestSymmetricNATMoveResignsOnce(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	l := n.lsts[0]
+	var target krpc.NodeID
+	for _, tg := range l.records {
+		target = tg
+	}
+	for i := range 3 {
+		h := &holder{addr: addr(60 + i), target: target, mapped: netip.MustParseAddrPort("192.0.2.1:1000")}
+		l.holders = append(l.holders, h)
+		n.keepaliveReply(t0.Add(time.Second), h, &krpc.Msg{IP: netip.AddrPortFrom(netip.MustParseAddr("198.51.100.7"), uint16(40001+i))})
+	}
+	if l.resignDue {
+		t.Fatal("ports of one new host each set a re-sign due")
+	}
+}
+
+// TestMoveNearZeroClock: a mapping change with a clock near the zero time
+// (inside the first window) doesn't panic.
+func TestMoveNearZeroClock(t *testing.T) {
+	n := New(Config{ID: outsiderID(rng(1)), Rand: rng(2)})
+	n.AddListener(t0, seededKey(1))
+	l := n.lsts[0]
+	var target krpc.NodeID
+	for _, tg := range l.records {
+		target = tg
+	}
+	h := &holder{addr: addr(60), target: target, mapped: netip.MustParseAddrPort("192.0.2.1:1000")}
+	l.holders = append(l.holders, h)
+	n.keepaliveReply(time.Time{}.Add(time.Second), h, &krpc.Msg{IP: netip.MustParseAddrPort("192.0.2.9:2000")})
 }
