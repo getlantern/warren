@@ -125,6 +125,9 @@ const RetryGrace = time.Hour
 type Issued struct {
 	Invite Invite
 	Key    *keys.Identity
+	// Answered is the rejoiners this invite answered with the roster alone;
+	// pass it as AdminConfig.Answered.
+	Answered Answered
 }
 
 // Listener is the signer the admin listens under in period p (see

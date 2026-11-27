@@ -926,3 +926,34 @@ func TestIssueRefusesUnparseableLink(t *testing.T) {
 		t.Fatal("a refused invite was recorded")
 	}
 }
+
+// TestRetryRosterOnlyRejoin: a rejoin answered with the roster alone (the
+// roster already holds every key sealed to it) is remembered, so a retry
+// past expiry is answered again without Approve; without that memory the
+// roster can't show it.
+func TestRetryRosterOnlyRejoin(t *testing.T) {
+	x := group(t, 1)
+	remember := func(a *AdminConfig, _ *JoinConfig) { a.Answered = &x.issued.Answered }
+	if _, _, op, jerr, serr := x.run(t, x.member, true, remember); jerr != nil || serr != nil || op != nil {
+		t.Fatalf("roster-only rejoin: op=%v, %v / %v", op, jerr, serr)
+	}
+	late := func(a *AdminConfig, j *JoinConfig) {
+		remember(a, j)
+		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
+		a.Approve = func(Request) bool { t.Error("a retry was put to Approve"); return false }
+	}
+	if r, _, op, jerr, serr := x.run(t, x.member, true, late); jerr != nil || serr != nil || r == nil || op != nil {
+		t.Fatalf("retry of a roster-only rejoin: %v / %v", jerr, serr)
+	}
+	// Another member isn't covered by it.
+	other := me(34)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(other.Public(), "o", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, jerr, _ := x.run(t, other, true, func(a *AdminConfig, j *JoinConfig) {
+		remember(a, j)
+		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
+	}); !errors.Is(jerr, ErrInviteUnusable) {
+		t.Fatalf("a member the invite never answered rode on another's: %v", jerr)
+	}
+}

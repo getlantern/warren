@@ -550,8 +550,11 @@ whose answer was lost can be asked again with the same key: an admin that
 finds an approver's `add` or `deliver` naming the invite to that key, still
 a member, answers with the roster again, plus a plain `deliver` (naming no
 invite, spending nothing) of any keys it has since come to lack, so a spent
-or expired invite can't strand it. The admin keeps the invite key, and
-keeps listening, until an hour past the invite's expiry
+or expired invite can't strand it. A rejoin answered with the roster
+alone leaves no trace in the roster (the rejoiner may still need it: away
+past the grace window, it may lack the rekeys sealed to it), so the admin
+remembers such rejoiners while it serves the invite. The admin keeps the
+invite key, and keeps listening, until an hour past the invite's expiry
 (`join.RetryGrace`), even once it is spent; a retry is answered while it
 listens. Nothing else changes: no `add`, no
 removal, no rekey, and its log carries on. A removed member can't do this:

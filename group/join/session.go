@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/getlantern/warren/bencode"
@@ -131,6 +132,10 @@ type AdminConfig struct {
 	Secret []byte
 	// Approve decides a request whose proofs check out; nil approves all.
 	Approve func(Request) bool
+	// Answered, if set, remembers the rejoiners this invite answered with
+	// the roster alone (Issued.Answered), so their retries are answered
+	// again: such an answer leaves no trace in the roster.
+	Answered *Answered
 	// Now is the clock the invite's expiry is checked against; nil means
 	// time.Now.
 	Now func() time.Time
@@ -205,17 +210,52 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 			return w.Add(req.Member, req.Name, roster.Member, cfg.Invite.Key)
 		})
 	}
-	return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+	op, err := stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
 		op, err := w.Deliver(req.Member, cfg.Invite.Key)
 		if errors.Is(err, roster.ErrNotAllowed) {
 			// Everything else Deliver checks was just checked, against the
-			// same roster and instant: the rejoiner holds every key
-			// already, so it needs only the roster, and the invite isn't
-			// spent.
+			// same roster and instant: the roster holds every key sealed to
+			// the rejoiner already, so it needs only the roster (which
+			// carries those seals: it may lack them locally, having been
+			// away), and the invite isn't spent.
 			return nil, nil
 		}
 		return op, err
 	})
+	if err == nil && op == nil {
+		cfg.Answered.add(req.Member)
+	}
+	return op, err
+}
+
+// Answered is the rejoiners an invite answered with the roster alone. Such
+// an answer writes nothing, so if it is lost the roster can't show the
+// rejoiner was approved; the admin remembers it instead, for as long as it
+// serves the invite. Safe for concurrent use; the zero value is empty.
+type Answered struct {
+	mu   sync.Mutex
+	keys map[keys.PublicKey]bool
+}
+
+func (a *Answered) add(k keys.PublicKey) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.keys == nil {
+		a.keys = map[keys.PublicKey]bool{}
+	}
+	a.keys[k] = true
+}
+
+func (a *Answered) has(k keys.PublicKey) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.keys[k]
 }
 
 // stage writes an answer's operation, if any, on a copy of the roster at
@@ -273,7 +313,7 @@ func admit(cfg AdminConfig, req Request, t time.Time) (replay bool, err error) {
 		return false, ErrNoKeys
 	}
 	member := f.Roles[req.Member] != roster.None
-	if member && answered(f, cfg.Invite.Key, req.Member) {
+	if member && (answered(f, cfg.Invite.Key, req.Member) || cfg.Answered.has(req.Member)) {
 		return true, nil
 	}
 	if s := f.Invites[cfg.Invite.Key]; s == nil || !s.Usable(t) {
