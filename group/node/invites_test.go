@@ -520,6 +520,52 @@ func TestRejoinMergesSavedRoster(t *testing.T) {
 	if entries != 1 {
 		t.Fatalf("the rejoined node holds %d of the member's entries, want 1", entries)
 	}
+	// It runs on the secret the owner uses, so it can reach the owner, and
+	// pass it the rekey.
+	if n.cfg.Group != x.g {
+		t.Fatal("the rejoined node took the saved rekey's secret, which the owner doesn't use")
+	}
+	eventually(t, "the rejoined node's listener was never published", func() bool {
+		var ok bool
+		n.h.Endpoint().DHT().Inspect(ctx, func(d *dht.Node) {
+			ok = len(d.HoldersFor(x.m1.Rendezvous(x.g, keys.PeriodOf(time.Now())).Public())) > 0
+		})
+		return ok
+	})
+	if err := n.Call(ctx, x.owner.Public()); err != nil {
+		t.Fatalf("the rejoined member couldn't reach the owner: %v", err)
+	}
+}
+
+// TestRejoinRefusedBySavedRemoval: a saved roster holding the member's
+// removal, unseen by the admin, refuses the rejoin rather than make a node
+// off the roster.
+func TestRejoinRefusedBySavedRemoval(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	saved := copyRoster(t, x.r)
+	if _, err := (&roster.Writer{R: saved, Me: x.owner}).Remove(x.m1.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := joinCfg
+	cfg.Roster = saved
+	h := host(t, seed)
+	if _, err := h.Rejoin(ctx, issued.Invite, x.m1, cfg); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("a rejoin whose saved roster removes the member: %v", err)
+	}
+	h.mu.Lock()
+	groups := len(h.groups)
+	h.mu.Unlock()
+	if groups != 0 {
+		t.Fatal("a refused rejoin left a node on the host")
+	}
 }
 
 // TestInvitePartlyListened: with room for only one of an invite's two

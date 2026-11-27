@@ -209,7 +209,9 @@ func (h *Host) JoinByInvite(ctx context.Context, iv join.Invite, me *keys.Identi
 // (the admin may lack operations it holds, such as a rekey on a branch the
 // admin hasn't seen), and the logs brought up to the merge, so the
 // member's own log carries on rather than losing entries or restarting
-// (which members would take as a fork).
+// (which members would take as a fork). The node runs on the answer's
+// group secret, and a saved removal of the member refuses the rejoin
+// (ErrNotMember).
 func (h *Host) Rejoin(ctx context.Context, iv join.Invite, me *keys.Identity, cfg Config) (*Node, error) {
 	return h.byInvite(ctx, iv, me, "", true, cfg)
 }
@@ -227,6 +229,18 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 	r, err := h.joinSession(ctx, iv, me, name, rejoin, cfg)
 	if err != nil {
 		return nil, err
+	}
+	// The node runs on the answer's group secret, the one the admin and
+	// the members it knows of use: a saved rekey merged below may make
+	// another current, which no one here listens under until a running
+	// node can move to a new secret (DESIGN.md, step 8).
+	fa, err := r.Fold()
+	if err != nil {
+		return nil, err
+	}
+	g, ok := r.Keyring(me).Secrets[fa.Current]
+	if !ok {
+		return nil, join.ErrBadAnswer
 	}
 	if cfg.Roster != nil {
 		if cfg.Roster.Group() != r.Group() {
@@ -246,6 +260,9 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 	if err != nil {
 		return nil, err
 	}
+	if f.Roles[me.Public()] == roster.None {
+		return nil, ErrNotMember // the saved roster holds this member's removal
+	}
 	logs := cfg.Logs
 	if logs == nil {
 		logs = memberlog.NewSet(r.Group())
@@ -253,7 +270,7 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 	if err := logs.Update(f); err != nil {
 		return nil, err
 	}
-	cfg.Me, cfg.Group, cfg.Roster, cfg.Logs = me, r.Keyring(me).Secrets[f.Current], r, logs
+	cfg.Me, cfg.Group, cfg.Roster, cfg.Logs = me, g, r, logs
 	return h.Join(ctx, cfg)
 }
 
