@@ -590,3 +590,106 @@ func TestManyHeadsCapped(t *testing.T) {
 		t.Fatalf("a roster with more heads than a hello names: %v / %v", ea, eb)
 	}
 }
+
+// TestRemovedMidSession: a peer whose sync carries its own removal (it got
+// the remove but hasn't acted on it) is cut off as soon as this side learns
+// it: the removal is kept, and nothing more is served, so the peer doesn't
+// get an entry it lacked.
+func TestRemovedMidSession(t *testing.T) {
+	x := newGroup(t)
+	a := x.member(t, x.m1, x.r) // the one being removed
+	if _, err := (&roster.Writer{R: a.r, Me: x.owner}).Remove(x.m1.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	b := x.member(t, x.m2, x.r) // hasn't heard of the removal
+	f, _ := b.r.Fold()
+	e, err := memberlog.Write(x.m2, b.r.Group(), nil, f.Current, b.r.Keyring(x.m2).Epochs[f.Current], memberlog.App, []byte("not for a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.logs.Add(e); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ea, eb := x.call(t, a, b, x.rendezvous(x.m1))
+	if !errors.Is(eb, ErrRemoved) {
+		t.Fatalf("the callee: %v, want ErrRemoved", eb)
+	}
+	if ea == nil {
+		t.Fatal("the removed caller's session ended well")
+	}
+	bf, _ := b.r.Fold()
+	if bf.Roles[x.m1.Public()] != roster.None {
+		t.Fatal("the callee didn't keep the removal it learned")
+	}
+	if l := a.logs.Log(x.m2.Public()); l != nil && len(l.Entries()) != 0 {
+		t.Fatal("the removed peer was served an entry after its removal was learned")
+	}
+}
+
+// TestThirdRemovalMidSession: a removal of someone else, learned during a
+// session, doesn't stop it.
+func TestThirdRemovalMidSession(t *testing.T) {
+	x := newGroup(t)
+	m3 := me(4)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(m3.Public(), "m3", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	a := x.member(t, x.m1, x.r)
+	if _, err := (&roster.Writer{R: a.r, Me: x.owner}).Remove(m3.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	b := x.member(t, x.m2, x.r)
+	if _, _, ea, eb := x.call(t, a, b, x.rendezvous(x.m1)); ea != nil || eb != nil {
+		t.Fatalf("a third member's removal stopped the session: %v / %v", ea, eb)
+	}
+	if bf, _ := b.r.Fold(); bf.Roles[m3.Public()] != roster.None {
+		t.Fatal("the removal didn't sync")
+	}
+}
+
+// TestRemovalVoidedInLaterChunk: a removal arriving in one chunk of the
+// peer's operations and voided by a later chunk (the remover's concurrent
+// demotion) doesn't cut the peer off: the decision waits for the whole
+// batch.
+func TestRemovalVoidedInLaterChunk(t *testing.T) {
+	x := newGroup(t)
+	a2 := me(5)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(a2.Public(), "a2", roster.Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	b := x.member(t, x.m2, x.r) // has seen none of what follows
+	peer := copyRoster(t, x.r)
+	branch := copyRoster(t, x.r)
+	rm, err := (&roster.Writer{R: branch, Me: a2}).Remove(x.m1.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Over a megabyte of the owner's operations, then the demotion, so the
+	// removal and the demotion travel in different chunks.
+	ow := &roster.Writer{R: peer, Me: x.owner}
+	exp := time.Now().Add(time.Hour).Unix()
+	for i := range 6000 {
+		if _, err := ow.Invite(keys.IdentityFromSeed([32]byte{0xa0, byte(i), byte(i >> 8)}).Public(), 1, exp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ow.SetRole(a2.Public(), roster.Member); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := peer.Fold(); f.Roles[x.m1.Public()] == roster.None {
+		t.Fatal("the setup: the demotion didn't void the removal")
+	}
+	a := &member{id: x.m1, r: peer, logs: memberlog.NewSet(peer.Group())}
+	if f, err := peer.Fold(); err != nil || a.logs.Update(f) != nil {
+		t.Fatal("the setup: logs")
+	}
+	if _, _, ea, eb := x.call(t, a, b, x.rendezvous(x.m1)); ea != nil || eb != nil {
+		t.Fatalf("a removal voided in a later chunk cut the peer off: %v / %v", ea, eb)
+	}
+	if f, _ := b.r.Fold(); f.Roles[x.m1.Public()] == roster.None {
+		t.Fatal("the callee holds the peer as removed")
+	}
+}

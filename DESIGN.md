@@ -1002,7 +1002,12 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       table full, the current secret takes the listeners of the superseded
       one whose window ends soonest); calls try the current secret, then the superseded ones,
       for a member that hasn't moved yet;
-   2. session teardown on removal;
+   2. session teardown on removal (built): a session whose sync adds
+      roster operations checks the peer is still a member, and stops
+      (`session.ErrRemoved`) before sending anything more if not. A group
+      runs one session at a time, so this is every session the removed
+      key has; once content and swarming bring longer-lived ones, applying
+      a removal must also close any others with that key;
    3. the publish pause until a corrective rekey;
    4. mirrors, once content and swarming exist.
 
