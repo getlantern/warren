@@ -190,9 +190,11 @@ type Config struct {
 	SessionTimeout time.Duration
 	// Approve decides a join or rejoin request under one of this node's
 	// invites, its proofs checked; nil approves every request the invite
-	// covers. It runs with the group held, and is given the session's
-	// context (bounded by SessionTimeout): it should return when that ends,
-	// and nothing is committed once it has.
+	// covers. It runs with the group free, so it may run alongside sessions
+	// and other approvals: it must reach the roster and logs only through
+	// Node.Do. It is given the session's context (bounded by
+	// SessionTimeout), should return when that ends, and nothing is
+	// committed once it has. A retry after a lost answer isn't put to it.
 	Approve func(context.Context, join.Request) bool
 }
 

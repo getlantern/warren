@@ -180,6 +180,7 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 		if err != nil {
 			return
 		}
+		approved := n.cfg.Approve == nil
 		if ask && n.cfg.Approve != nil {
 			if !n.cfg.Approve(ctx, req) {
 				_ = join.Refuse(ctx, stream, join.ErrNotApproved)
@@ -188,12 +189,19 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 			if ctx.Err() != nil {
 				return // the session ended while Approve decided
 			}
+			approved = true
 		}
 		_ = n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
 			if !n.onCurrentSecret(r) {
 				return join.Refuse(ctx, stream, join.ErrAdminBehind)
 			}
-			_, err := join.Answer(ctx, stream, cfg(r), req)
+			// Fail closed: the answer asks for approval whenever it isn't
+			// a retry, and gets yes only if the app gave it above. A check
+			// that failed at the first Do and passes now (an issuer
+			// promoted between them, say) is refused, not admitted unasked.
+			c := cfg(r)
+			c.Approve = func(context.Context, join.Request) bool { return approved }
+			_, err := join.Answer(ctx, stream, c, req)
 			return err
 		})
 	})

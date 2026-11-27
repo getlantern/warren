@@ -724,7 +724,13 @@ func TestApproveRunsWithGroupFree(t *testing.T) {
 		_, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(52), "j", joinCfg)
 		joined <- err
 	}()
-	<-deciding
+	select {
+	case <-deciding:
+	case err := <-joined:
+		t.Fatalf("the join ended before Approve was asked: %v", err)
+	case <-ctx.Done():
+		t.Fatal("Approve was never asked")
+	}
 	if o.active.Load() {
 		t.Fatal("the group is held while Approve decides")
 	}
@@ -791,5 +797,54 @@ func TestRetryNotPutToApprove(t *testing.T) {
 	}
 	if asked.Load() != 0 {
 		t.Fatal("a retry was put to Approve")
+	}
+}
+
+// TestApprovalFailsClosed: a request whose first check fails (so Approve
+// isn't asked) but whose final check passes is refused, not admitted
+// without approval.
+func TestApprovalFailsClosed(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	base := time.Now()
+	// The first clock read once the joiner calls is NeedsApproval's (Verify
+	// reads none): it sees the invite expired, so Approve isn't asked; every
+	// later read, the final answer's included, sees it usable.
+	var calls, target atomic.Int64
+	target.Store(-1)
+	clock := func() time.Time {
+		if calls.Add(1) == target.Load() {
+			return base.Add(2 * time.Hour)
+		}
+		return base
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c), Now: clock,
+		CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second,
+		Approve: func(context.Context, join.Request) bool { t.Error("Approve was asked"); return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := o.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiner := me(54)
+	jh := host(t, seed)
+	target.Store(calls.Load() + 1)
+	_, err = jh.JoinByInvite(ctx, issued.Invite, joiner, "j", joinCfg)
+	var added bool
+	if derr := o.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		f, _ := r.Fold()
+		added = f.Roles[joiner.Public()] != roster.None
+		return nil
+	}); derr != nil {
+		t.Fatal(derr)
+	}
+	if added || err == nil {
+		t.Fatalf("a request never put to Approve was admitted (err %v)", err)
 	}
 }
