@@ -297,6 +297,10 @@ type Node struct {
 	// flush's failure, nil once one succeeds. mu held.
 	queue    []*heldPost
 	flushErr error
+	// logsAt is the roster's size (it only grows) when Post or a flush
+	// last gave the logs its fold, so an unchanged roster isn't applied
+	// again: Set.Update re-walks every log. mu held.
+	logsAt int
 }
 
 // sighting is a session with a member: when, and under which group secret.

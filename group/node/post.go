@@ -45,7 +45,7 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 		var key keys.EpochKey
 		ok := false
 		if err == nil {
-			if err := logs.Update(f); err != nil {
+			if err := n.updateLogs(r, logs, f); err != nil {
 				return err
 			}
 			if err := n.ownLog(logs); err != nil {
@@ -116,6 +116,22 @@ func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, ke
 	return err
 }
 
+// updateLogs gives logs f, r's fold, unless they were given a fold of r
+// at its present size already: Set.Update re-walks every log, which each
+// post would otherwise repeat. Logs a session updated since are only
+// updated again. mu held.
+func (n *Node) updateLogs(r *roster.Roster, logs *memberlog.Set, f *roster.Result) error {
+	size := r.Len()
+	if size == n.logsAt {
+		return nil
+	}
+	if err := logs.Update(f); err != nil {
+		return err
+	}
+	n.logsAt = size
+	return nil
+}
+
 // ownLog reports why nothing appended to this member's own log now would
 // show: memberlog.ErrForked if it's forked, ErrHidden if it holds entries
 // past what shows (under an epoch that stopped counting, say, or past a
@@ -161,7 +177,7 @@ func (n *Node) flush() {
 	if !ok {
 		return
 	}
-	if err := logs.Update(f); err != nil {
+	if err := n.updateLogs(r, logs, f); err != nil {
 		n.flushErr = err
 		return
 	}
@@ -175,6 +191,7 @@ func (n *Node) flush() {
 			return
 		}
 		n.queue[0].written = true
+		n.queue[0] = nil // so the backing array doesn't keep the body
 		n.queue = n.queue[1:]
 	}
 	n.flushErr = nil
