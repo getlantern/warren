@@ -131,7 +131,9 @@ type AdminConfig struct {
 	// Secret is the connection's shared secret (endpoint.Conn.Secret).
 	Secret []byte
 	// Approve decides a request whose proofs check out; nil approves all.
-	Approve func(Request) bool
+	// It is given the session's context, and should return when that
+	// ends: nothing is committed once it has, whatever it returns.
+	Approve func(context.Context, Request) bool
 	// Answered, if set, remembers the rejoiners this invite answered with
 	// the roster alone (Issued.Answered), so their retries are answered
 	// again: such an answer leaves no trace in the roster.
@@ -189,7 +191,7 @@ func Answer(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig, req R
 	if cfg.Now != nil {
 		now = cfg.Now
 	}
-	op, err := decide(cfg, now, req)
+	op, err := decide(ctx, cfg, now, req)
 	if err != nil {
 		_ = writeAnswer(conn, codeOf(err), nil)
 		return nil, err
@@ -203,7 +205,7 @@ func Answer(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig, req R
 
 // decide checks a request whose proofs Verify passed and, if it is
 // approved, writes its operation.
-func decide(cfg AdminConfig, now func() time.Time, req Request) (*roster.Op, error) {
+func decide(ctx context.Context, cfg AdminConfig, now func() time.Time, req Request) (*roster.Op, error) {
 	replay, err := admit(cfg, req, now())
 	if err != nil {
 		return nil, err
@@ -216,8 +218,11 @@ func decide(cfg AdminConfig, now func() time.Time, req Request) (*roster.Op, err
 		// sent: don't ask Approve.
 		return nil, ErrTooLarge
 	}
-	if cfg.Approve != nil && !cfg.Approve(req) {
+	if cfg.Approve != nil && !cfg.Approve(ctx, req) {
 		return nil, ErrNotApproved
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err // the session ended while Approve decided
 	}
 	// Approve may have taken a while, or changed the roster: check again,
 	// on a fresh fold and at the one instant the writer then uses too.

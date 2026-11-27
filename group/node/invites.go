@@ -194,8 +194,8 @@ var ErrNoListener = errors.New("node: the invite's admin didn't answer")
 
 // JoinByInvite joins the group an invite is for as a new member, me (a
 // fresh identity), named name, and returns the group's node on h. cfg
-// gives its clock and timeouts; its Me, Group and Roster are filled in
-// from the answer, and its Logs too unless given. The DHT is bootstrapped
+// gives its clock, timeouts and Approve; its Me, Group, Roster and Logs are
+// filled in from the answer, whatever they held. The DHT is bootstrapped
 // from the invite's hints, if any.
 func (h *Host) JoinByInvite(ctx context.Context, iv join.Invite, me *keys.Identity, name string, cfg Config) (*Node, error) {
 	return h.byInvite(ctx, iv, me, name, false, cfg)
@@ -242,7 +242,7 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 	if !ok {
 		return nil, join.ErrBadAnswer
 	}
-	if cfg.Roster != nil {
+	if rejoin && cfg.Roster != nil {
 		if cfg.Roster.Group() != r.Group() {
 			return nil, ErrNotMember // another group's state
 		}
@@ -264,7 +264,7 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 		return nil, ErrNotMember // the saved roster holds this member's removal
 	}
 	logs := cfg.Logs
-	if logs == nil {
+	if !rejoin || logs == nil { // a new member has no log to carry on
 		logs = memberlog.NewSet(r.Group())
 	}
 	if err := logs.Update(f); err != nil {

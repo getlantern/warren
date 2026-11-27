@@ -118,7 +118,7 @@ func TestJoinRefusals(t *testing.T) {
 	logs := owner.cfg.Logs
 	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: logs, Now: func() time.Time { return time.Unix(0, clock.Load()) },
 		CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second,
-		Approve: func(join.Request) bool { return !declined.Load() }})
+		Approve: func(context.Context, join.Request) bool { return !declined.Load() }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestSlowApproval(t *testing.T) {
 	defer cancel()
 	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c),
 		CallTimeout: time.Second, SessionTimeout: 15 * time.Second,
-		Approve: func(join.Request) bool { time.Sleep(3 * time.Second); return true }})
+		Approve: func(context.Context, join.Request) bool { time.Sleep(3 * time.Second); return true }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,5 +595,63 @@ func TestInvitePartlyListened(t *testing.T) {
 	n.lmu.Unlock()
 	if !held {
 		t.Fatal("the node doesn't hold the invite to retry its listener")
+	}
+}
+
+// TestApprovalPastSessionTimeout: an approval that outlives the session
+// commits nothing, even if it then says yes, and frees the group.
+func TestApprovalPastSessionTimeout(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c),
+		CallTimeout: time.Second, SessionTimeout: 3 * time.Second,
+		Approve: func(ctx context.Context, _ join.Request) bool { <-ctx.Done(); return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := o.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiner := me(47)
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, joiner, "late", joinCfg); err == nil {
+		t.Fatal("a join approved after the session ended went through")
+	}
+	eventually(t, "the group stayed held after the session ended", func() bool { return !o.active.Load() })
+	var added bool
+	_ = o.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		f, _ := r.Fold()
+		added = f.Roles[joiner.Public()] != roster.None
+		return nil
+	})
+	if added {
+		t.Fatal("an approval past the session's end was committed")
+	}
+}
+
+// TestJoinIgnoresSavedState: JoinByInvite fills the roster and logs from
+// the answer, whatever cfg held (here, another group's).
+func TestJoinIgnoresSavedState(t *testing.T) {
+	seed := network(t, 10)
+	x, y := newGroup(t), newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := joinCfg
+	cfg.Roster, cfg.Logs = y.r, memberlogSet(t, y.r)
+	n, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(48), "n", cfg)
+	if err != nil {
+		t.Fatalf("a join given another group's state: %v", err)
+	}
+	if n.cfg.Roster.Group() != x.r.Group() {
+		t.Fatal("the joined node runs on the wrong roster")
 	}
 }
