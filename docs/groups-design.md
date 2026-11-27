@@ -550,7 +550,9 @@ finds an approver's `add` or `deliver` naming the invite to that key, still
 a member, answers with the roster again, plus a plain `deliver` (naming no
 invite, spending nothing) of any keys it has since come to lack, so a spent
 or expired invite can't strand it. The admin keeps the invite key, and
-keeps listening, until the invite expires, even once it is spent. Nothing else changes: no `add`, no
+keeps listening, until an hour past the invite's expiry
+(`join.RetryGrace`), even once it is spent; a retry is answered while it
+listens. Nothing else changes: no `add`, no
 removal, no rekey, and its log carries on. A removed member can't do this:
 its key is off the roster. A stolen device can, as it could use any member
 key; the admin sees which member is rejoining, and the answer to a stolen

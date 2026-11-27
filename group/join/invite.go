@@ -110,10 +110,15 @@ func ParseLink(s string) (Invite, error) {
 	return iv, nil
 }
 
+// RetryGrace is how long past an invite's expiry its admin keeps the
+// invite key and keeps listening, so a joiner whose answer was lost near
+// the expiry can still ask again.
+const RetryGrace = time.Hour
+
 // Issued is an invite with the admin's private half: the invite key it
-// listens under. The admin keeps it, and keeps listening, until the invite
-// expires, even once it is spent, so a joiner whose answer was lost can ask
-// again (Serve answers it whatever the invite's state).
+// listens under. The admin keeps it, and keeps listening, until RetryGrace
+// past the invite's expiry, even once it is spent, so a joiner whose answer
+// was lost can ask again (Serve answers it whatever the invite's state).
 type Issued struct {
 	Invite Invite
 	Key    *keys.Identity
