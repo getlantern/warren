@@ -40,6 +40,9 @@ var (
 	// ErrTooLarge means the roster wouldn't fit in an answer the joiner
 	// takes.
 	ErrTooLarge = errors.New("join: roster too large to answer")
+	// ErrAdminBehind means the admin's runtime isn't on the group's current
+	// secret yet, so it can't give a joiner one it can reach it with.
+	ErrAdminBehind = errors.New("join: admin not on the current group secret")
 	// ErrFrame means a malformed or oversized frame.
 	ErrFrame = errors.New("join: malformed frame")
 	// ErrBadAnswer means the admin's answer doesn't hold this joiner's
@@ -67,7 +70,7 @@ const (
 )
 
 // Refusal codes in an answer, each an error a joiner gets back.
-var codes = []error{nil, ErrBadProof, ErrInviteUnusable, ErrNotApproved, ErrNotMember, ErrAlreadyMember, ErrNotAdmin, ErrNoKeys, ErrTooLarge}
+var codes = []error{nil, ErrBadProof, ErrInviteUnusable, ErrNotApproved, ErrNotMember, ErrAlreadyMember, ErrNotAdmin, ErrNoKeys, ErrTooLarge, ErrAdminBehind}
 
 func codeOf(err error) int64 {
 	for i, e := range codes {
@@ -201,6 +204,31 @@ func Answer(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig, req R
 		return op, err
 	}
 	return op, writeAnswer(conn, 0, f.Order)
+}
+
+// NeedsApproval reports whether Answer would put req to Approve: it passes
+// the roster's checks now and isn't a retry. A caller deciding approval
+// itself, outside whatever holds the roster, asks this first (holding it
+// briefly), decides, then calls Answer with no Approve, which checks
+// everything again.
+func NeedsApproval(cfg AdminConfig, req Request) bool {
+	now := time.Now
+	if cfg.Now != nil {
+		now = cfg.Now
+	}
+	replay, err := admit(cfg, req, now())
+	if err != nil || replay {
+		return false
+	}
+	f, err := cfg.Roster.Fold()
+	return err == nil && fits(f.Order)
+}
+
+// Refuse answers a request Verify passed with err's refusal code (say,
+// ErrNotApproved, for a caller that decided approval itself).
+func Refuse(ctx context.Context, conn io.ReadWriteCloser, err error) error {
+	defer watch(ctx, conn)()
+	return writeAnswer(conn, codeOf(err), nil)
 }
 
 // decide checks a request whose proofs Verify passed and, if it is

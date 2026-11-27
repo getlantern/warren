@@ -30,7 +30,10 @@ type invite struct {
 
 // Invite issues an invite admitting up to uses joiners and rejoiners for
 // ttl, records it in the roster, and listens for it; the returned invite's
-// Link is what the app hands out. n's member must be an owner or admin. If
+// Link is what the app hands out. n's member must be an owner or admin. It
+// serves joins only while n runs on the group's current secret: after a
+// rekey, until n can move to the new one (step 8), it refuses them
+// (join.ErrAdminBehind). If
 // a listener fails (a full listener table, say), the invite is still
 // returned, with the error: it is recorded and held, and Tick retries the
 // listener.
@@ -155,11 +158,42 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 		if err != nil {
 			return
 		}
+		cfg := func(r *roster.Roster) join.AdminConfig {
+			return join.AdminConfig{Roster: r, Me: n.cfg.Me, Invite: issued.Invite, Secret: c.Secret,
+				Now: n.now, Answered: &issued.Answered}
+		}
+		// Approve is the app's, and may take a while: it runs with the
+		// group free, between a brief check of whether it's needed and the
+		// answer, which checks everything again.
+		var ask bool
+		err = n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+			if !n.onCurrentSecret(r) {
+				return join.ErrAdminBehind
+			}
+			ask = join.NeedsApproval(cfg(r), req)
+			return nil
+		})
+		if errors.Is(err, join.ErrAdminBehind) {
+			_ = join.Refuse(ctx, stream, err)
+			return
+		}
+		if err != nil {
+			return
+		}
+		if ask && n.cfg.Approve != nil {
+			if !n.cfg.Approve(ctx, req) {
+				_ = join.Refuse(ctx, stream, join.ErrNotApproved)
+				return
+			}
+			if ctx.Err() != nil {
+				return // the session ended while Approve decided
+			}
+		}
 		_ = n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
-			_, err := join.Answer(ctx, stream, join.AdminConfig{
-				Roster: r, Me: n.cfg.Me, Invite: issued.Invite, Secret: c.Secret,
-				Approve: n.cfg.Approve, Now: n.now, Answered: &issued.Answered,
-			}, req)
+			if !n.onCurrentSecret(r) {
+				return join.Refuse(ctx, stream, join.ErrAdminBehind)
+			}
+			_, err := join.Answer(ctx, stream, cfg(r), req)
 			return err
 		})
 	})
@@ -169,7 +203,16 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 	select {
 	case <-done:
 	case <-idle.C:
-		once.Do(func() {}) // a stream arriving now finds the session taken
+		won := false
+		once.Do(func() { won = true }) // a stream arriving now finds the session taken
+		if !won {
+			// A stream claimed it just as the timer fired: the session is
+			// under way, and SessionTimeout bounds it.
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+		}
 	case <-ctx.Done():
 	}
 	cancel()
@@ -178,6 +221,19 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 	returned = true
 	hmu.Unlock()
 	handlers.Wait()
+}
+
+// onCurrentSecret reports whether n runs on r's current group secret. A
+// node keeps the secret it joined with until it can move to a new one
+// (DESIGN.md, step 8), and a joiner given the new one couldn't reach it.
+// mu held.
+func (n *Node) onCurrentSecret(r *roster.Roster) bool {
+	f, err := r.Fold()
+	if err != nil {
+		return false
+	}
+	g, ok := r.Keyring(n.cfg.Me).Secrets[f.Current]
+	return ok && g == n.cfg.Group
 }
 
 // holdAnswer holds stream, after an answer (or refusal) was written to it,
@@ -305,24 +361,35 @@ func (h *Host) joinSession(ctx context.Context, iv join.Invite, me *keys.Identit
 		}
 		r, err := runJoin(ctx, c, iv, me, name, rejoin, cfg)
 		_ = c.Close()
+		var t transportErr
+		if errors.As(err, &t) && ctx.Err() == nil {
+			errs = append(errs, err) // before the request was sent: try the next
+			continue
+		}
 		return r, err
 	}
 	return nil, errors.Join(append([]error{ErrNoListener}, errs...)...)
 }
+
+// transportErr is a failure before a join request was sent, so another
+// period's listener may still be tried.
+type transportErr struct{ error }
+
+func (e transportErr) Unwrap() error { return e.error }
 
 func runJoin(ctx context.Context, c *endpoint.Conn, iv join.Invite, me *keys.Identity, name string, rejoin bool, cfg Config) (*roster.Roster, error) {
 	sctx, cancel := context.WithTimeout(ctx, cfg.SessionTimeout)
 	defer cancel()
 	cl, err := hy2.Dial(sctx, c, c.Remote, c.PeerKey, hy2.FromSecret(c.Secret, hy2.ObfsUTP))
 	if err != nil {
-		return nil, err
+		return nil, transportErr{err}
 	}
 	defer func() { _ = cl.Close() }()
 	dctx, dcancel := context.WithTimeout(sctx, cfg.CallTimeout)
 	stream, err := cl.DialConn(dctx, joinStream)
 	dcancel()
 	if err != nil {
-		return nil, err
+		return nil, transportErr{err}
 	}
 	defer stream.Close()
 	return join.Join(sctx, stream, join.JoinConfig{Invite: iv, Me: me, Name: name, Rejoin: rejoin, Secret: c.Secret})

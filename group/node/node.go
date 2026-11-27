@@ -614,6 +614,9 @@ func (n *Node) Do(ctx context.Context, fn func(*roster.Roster, *memberlog.Set) e
 	}
 	n.mu.Lock()
 	defer n.end()
+	if err := ctx.Err(); err != nil {
+		return err // ended while Do waited for the group
+	}
 	err := fn(n.cfg.Roster, n.cfg.Logs)
 	n.refresh()
 	return err
@@ -649,6 +652,9 @@ func (n *Node) linger(ctx context.Context, stream net.Conn) {
 // key for calling it. A member that answers, or that isn't listening at
 // all, isn't called again.
 func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
+	if n.left.Load() {
+		return ErrLeft
+	}
 	ctx, finished, err := n.h.call(ctx)
 	if err != nil {
 		return err
@@ -742,6 +748,9 @@ func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) (time.
 	}
 	defer stream.Close() // unwritten, the callee never sees it
 	if !n.begin() {
+		if n.left.Load() {
+			return 0, ErrLeft
+		}
 		return 0, ErrBusy // see active
 	}
 	start := time.Now()

@@ -141,7 +141,7 @@ func TestJoinRefusals(t *testing.T) {
 		t.Fatalf("expired: %v, want ErrInviteUnusable", err)
 	}
 	var added int
-	_ = o.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+	if err := o.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
 		f, _ := r.Fold()
 		for _, k := range []*keys.Identity{me(41), me(42), me(43)} {
 			if f.Roles[k.Public()] != roster.None {
@@ -149,7 +149,9 @@ func TestJoinRefusals(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if added != 0 {
 		t.Fatal("a refused joiner was added")
 	}
@@ -244,16 +246,25 @@ func TestLeave(t *testing.T) {
 func TestJoinAcrossPeriodBoundary(t *testing.T) {
 	seed := network(t, 10)
 	x := newGroup(t)
-	owner := x.join(t, host(t, seed), x.owner, x.r)
+	// One fixed instant, mid-period, for the admin and both joiners, so the
+	// real hour turning mid-test can't move the admin's listeners.
+	mid := time.Unix(int64(keys.PeriodOf(time.Now()))*int64(keys.Period/time.Second), 0).Add(keys.Period / 2)
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	owner, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c),
+		Now: func() time.Time { return mid }, CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
 	issued, err := owner.Invite(ctx, 2, 3*time.Hour, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i, skew := range []time.Duration{-time.Hour, 2 * time.Hour} {
 		cfg := joinCfg
-		cfg.Now = func() time.Time { return time.Now().Add(skew) }
+		cfg.Now = func() time.Time { return mid.Add(skew) }
 		if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(byte(50+i)), "s", cfg); err != nil {
 			t.Fatalf("a joiner %v off the admin's clock: %v", skew, err)
 		}
@@ -653,5 +664,132 @@ func TestJoinIgnoresSavedState(t *testing.T) {
 	}
 	if n.cfg.Roster.Group() != x.r.Group() {
 		t.Fatal("the joined node runs on the wrong roster")
+	}
+}
+
+// TestAdminBehindRefuses: an admin whose node still runs on an old group
+// secret after a rekey refuses joins, rather than hand out a secret it
+// doesn't listen under.
+func TestAdminBehindRefuses(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		_, err := (&roster.Writer{R: r, Me: x.owner}).Rekey()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(49), "b", joinCfg); !errors.Is(err, join.ErrAdminBehind) {
+		t.Fatalf("an admin behind the current secret: %v, want ErrAdminBehind", err)
+	}
+}
+
+// TestApproveRunsWithGroupFree: while Approve decides, the group is free,
+// so members still sync; the join completes once it says yes.
+func TestApproveRunsWithGroupFree(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	deciding, release := make(chan struct{}), make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c),
+		CallTimeout: 3 * time.Second, SessionTimeout: 30 * time.Second,
+		Approve: func(ctx context.Context, _ join.Request) bool {
+			close(deciding)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return true
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1 := x.join(t, host(t, seed), x.m1, x.r)
+	issued, err := o.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := make(chan error, 1)
+	go func() {
+		_, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(52), "j", joinCfg)
+		joined <- err
+	}()
+	<-deciding
+	if o.active.Load() {
+		t.Fatal("the group is held while Approve decides")
+	}
+	if err := m1.Call(ctx, x.owner.Public()); err != nil {
+		t.Fatalf("a member couldn't sync while Approve decided: %v", err)
+	}
+	close(release)
+	if err := <-joined; err != nil {
+		t.Fatalf("the join: %v", err)
+	}
+}
+
+// TestDoAfterContextEnds: a Do whose context ended doesn't run its
+// callback, and a left node's Call returns ErrLeft.
+func TestDoAfterContextEnds(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	n := x.join(t, host(t, seed), x.owner, x.r)
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	ran := false
+	if err := n.Do(ended, func(*roster.Roster, *memberlog.Set) error { ran = true; return nil }); !errors.Is(err, context.Canceled) || ran {
+		t.Fatalf("a Do with an ended context: %v, ran=%v", err, ran)
+	}
+	ctx, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+	if err := n.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Call(ctx, x.m1.Public()); !errors.Is(err, ErrLeft) {
+		t.Fatalf("a call from a left node: %v, want ErrLeft", err)
+	}
+}
+
+// TestRetryNotPutToApprove: a joiner retrying after a lost answer gets the
+// roster again without the app being asked to approve it a second time.
+func TestRetryNotPutToApprove(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	var asked atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c),
+		CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second,
+		Approve: func(context.Context, join.Request) bool { asked.Add(1); return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := o.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiner := me(53)
+	if err := o.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error { // as if its answer was lost
+		_, err := (&roster.Writer{R: r, Me: x.owner}).Add(joiner.Public(), "j", roster.Member, issued.Invite.Key)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, joiner, "j", joinCfg); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if asked.Load() != 0 {
+		t.Fatal("a retry was put to Approve")
 	}
 }
