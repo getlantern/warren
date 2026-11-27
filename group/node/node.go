@@ -260,11 +260,13 @@ type Node struct {
 	gmu        sync.Mutex
 	current    keys.Secret
 	superseded []supersededSecret
-	// seenKeys is the key-making operations whose secrets the node has
-	// seen; a newly seen one that isn't current was superseded since (in a
-	// batch of rekeys learned at once, say). nil until the first refresh,
-	// which takes the roster's history as seen. mu held.
-	seenKeys map[roster.ID]bool
+	// seenKeys is, per counting key-making operation the node has seen,
+	// until when its secret is kept once superseded: Grace from when the
+	// node first saw the operation, whether or not it held the secret then.
+	// The roster's history at the first refresh is past its window, so a
+	// secret delivered late (even a hand-made deliver of an old one) never
+	// starts one. nil until the first refresh. mu held.
+	seenKeys map[roster.ID]time.Time
 	// rekeyed is set when refresh moves to a new secret, so whoever ends
 	// the session or Do rotates the listeners onto it.
 	rekeyed atomic.Bool
@@ -310,31 +312,36 @@ func (n *Node) secrets(now time.Time) []keys.Secret {
 }
 
 // follow moves n to g if it isn't on it already, keeping the secret it
-// leaves, and any others newly superseded, for Grace. It reports whether
-// the secrets n listens under changed.
-func (n *Node) follow(g keys.Secret, newly []keys.Secret, now time.Time) bool {
+// leaves for Grace, and keeps each of cands (superseded secrets, with
+// their own deadlines) not kept already. It reports whether the secrets n
+// listens under changed.
+func (n *Node) follow(g keys.Secret, cands []supersededSecret, now time.Time) bool {
 	n.gmu.Lock()
 	defer n.gmu.Unlock()
-	add := newly
-	if g != n.current {
-		add = append(add, n.current)
+	changed := false
+	var kept []supersededSecret
+	has := func(x keys.Secret) bool {
+		return slices.ContainsFunc(kept, func(s supersededSecret) bool { return s.g == x })
 	}
-	if len(add) == 0 {
-		return false
-	}
-	kept := n.superseded[:0]
 	for _, s := range n.superseded {
-		if now.Before(s.until) && s.g != g && !slices.Contains(add, s.g) {
+		if now.Before(s.until) && s.g != g {
 			kept = append(kept, s)
 		}
 	}
-	for _, a := range add {
-		if a != g {
-			kept = append(kept, supersededSecret{g: a, until: now.Add(Grace)})
+	if g != n.current {
+		changed = true
+		if !has(n.current) {
+			kept = append(kept, supersededSecret{g: n.current, until: now.Add(Grace)})
+		}
+	}
+	for _, c := range cands {
+		if c.g != g && now.Before(c.until) && !has(c.g) {
+			kept = append(kept, c)
+			changed = true
 		}
 	}
 	n.superseded, n.current = kept, g
-	return true
+	return changed
 }
 
 // Join listens for cfg's group on the host under this and the next
@@ -507,29 +514,42 @@ func (n *Node) refresh() {
 	// while it was current may hold no other.
 	if err == nil {
 		k := n.cfg.Roster.Keyring(n.cfg.Me)
-		var newly []keys.Secret
 		first := n.seenKeys == nil
 		if first {
-			n.seenKeys = map[roster.ID]bool{}
+			n.seenKeys = map[roster.ID]time.Time{}
 		}
-		for id, g := range k.Secrets {
-			// Only a counting operation's secret: a keyring holds rejected
-			// ones too, and a member could otherwise fill the listener table
-			// with secrets of rekeys it had no authority to write.
-			if !n.seenKeys[id] && f.Counts[id] {
-				n.seenKeys[id] = true
-				if !first && id != f.Current {
-					newly = append(newly, g)
+		for _, o := range f.Order {
+			// Only a counting key-making operation (the kinds that commit a
+			// secret): a keyring holds rejected ones' secrets too, and a
+			// member could otherwise fill the listener table with secrets
+			// of rekeys it had no authority to write.
+			if o.CommitSecret == ([32]byte{}) || !f.Counts[o.ID()] {
+				continue
+			}
+			if _, ok := n.seenKeys[o.ID()]; !ok {
+				if first {
+					n.seenKeys[o.ID()] = time.Time{} // history: its window is over
+				} else {
+					n.seenKeys[o.ID()] = now.Add(Grace)
 				}
 			}
 		}
-		// Newly superseded secrets are kept even when the current one isn't
-		// held yet (pending a deliver), as they're marked seen now.
+		var cands []supersededSecret
+		for id, until := range n.seenKeys {
+			if id == f.Current || !now.Before(until) {
+				continue
+			}
+			if g, ok := k.Secrets[id]; ok {
+				cands = append(cands, supersededSecret{g: g, until: until})
+			}
+		}
+		// Kept even while the current secret isn't held yet (pending a
+		// deliver).
 		g, ok := k.Secrets[f.Current]
 		if !ok {
 			g = n.Group()
 		}
-		if n.follow(g, newly, now) {
+		if n.follow(g, cands, now) {
 			n.rekeyed.Store(true)
 		}
 	}

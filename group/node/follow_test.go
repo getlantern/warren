@@ -379,3 +379,28 @@ func TestSightingsPublishedUnderTheirSecret(t *testing.T) {
 		t.Fatal("a member reached under the old secret was published under the new one")
 	}
 }
+
+// TestHistoryNotListened: a node starting on a roster rekeyed before it
+// started holds the old secret but doesn't listen under it: the roster's
+// history is past its window, so only a replacement it sees runs one.
+func TestHistoryNotListened(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	old := x.g
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := x.r.Fold()
+	x.g = x.r.Keyring(x.owner).Secrets[f.Current]
+	n := x.join(t, host(t, seed), x.owner, x.r)
+	if _, held := x.r.Keyring(x.owner).Secrets[x.r.Group()]; !held {
+		t.Fatal("the setup: the owner doesn't hold the old secret")
+	}
+	p := keys.PeriodOf(time.Now())
+	if n.listensUnder(x.owner.Rendezvous(old, p).Public()) {
+		t.Fatal("a node listens under a secret superseded before it started")
+	}
+	if !n.listensUnder(x.owner.Rendezvous(x.g, p).Public()) {
+		t.Fatal("not listening under the current secret")
+	}
+}
