@@ -317,7 +317,10 @@ type InviteState struct {
 	Op      ID // the invite operation
 	Expires int64
 	Uses    uint32
-	Used    uint32 // counting adds and rejoins' delivers that named it
+	// Used is the approvals that named it: counting adds and rejoins'
+	// delivers by an owner or admin, and an authorized add concurrent with
+	// the one that admitted its target, which doesn't count but was given.
+	Used uint32
 	// Dead is set once a counting remove comes after the invite in the
 	// total order: invites issued before a removal are refused after it.
 	Dead bool
