@@ -148,39 +148,62 @@ type AdminConfig struct {
 // the operation written, if any, for the caller to share with members. It
 // closes conn if ctx ends.
 func Serve(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig) (Request, *roster.Op, error) {
+	req, err := Verify(ctx, conn, cfg.Invite, cfg.Secret)
+	if err != nil {
+		return req, nil, err
+	}
+	op, err := Answer(ctx, conn, cfg, req)
+	return req, op, err
+}
+
+// Verify reads a join request on conn and checks its proofs (the MAC with
+// the invite secret, and the member-key signature), refusing a bad one. It
+// touches no roster, so a caller can bound it and run it before taking
+// the roster for Answer: a caller that can't prove the invite secret never
+// gets that far. It closes conn if ctx ends.
+func Verify(ctx context.Context, conn io.ReadWriteCloser, iv Invite, secret []byte) (Request, error) {
+	defer watch(ctx, conn)()
+	kind, b, err := readFrame(conn)
+	if err != nil {
+		return Request{}, err
+	}
+	if kind != frameRequest {
+		return Request{}, ErrFrame
+	}
+	req, mac, sig, err := decodeRequest(b)
+	if err != nil {
+		return Request{}, err
+	}
+	if !hmac.Equal(mac, macOf(iv, secret, req)) || !req.Member.Verify(proofOf(iv, secret, req), sig) {
+		_ = writeAnswer(conn, codeOf(ErrBadProof), nil)
+		return req, ErrBadProof
+	}
+	return req, nil
+}
+
+// Answer decides a request Verify passed and answers it on conn, as Serve
+// describes. It closes conn if ctx ends.
+func Answer(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig, req Request) (*roster.Op, error) {
 	defer watch(ctx, conn)()
 	now := time.Now
 	if cfg.Now != nil {
 		now = cfg.Now
 	}
-	kind, b, err := readFrame(conn)
-	if err != nil {
-		return Request{}, nil, err
-	}
-	if kind != frameRequest {
-		return Request{}, nil, ErrFrame
-	}
-	req, mac, sig, err := decodeRequest(b)
-	if err != nil {
-		return Request{}, nil, err
-	}
-	op, err := decide(cfg, now, req, mac, sig)
+	op, err := decide(cfg, now, req)
 	if err != nil {
 		_ = writeAnswer(conn, codeOf(err), nil)
-		return req, nil, err
+		return nil, err
 	}
 	f, err := cfg.Roster.Fold()
 	if err != nil {
-		return req, op, err
+		return op, err
 	}
-	return req, op, writeAnswer(conn, 0, f.Order)
+	return op, writeAnswer(conn, 0, f.Order)
 }
 
-// decide checks a request and, if it is approved, writes its operation.
-func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte) (*roster.Op, error) {
-	if !hmac.Equal(mac, macOf(cfg.Invite, cfg.Secret, req)) || !req.Member.Verify(proofOf(cfg.Invite, cfg.Secret, req), sig) {
-		return nil, ErrBadProof
-	}
+// decide checks a request whose proofs Verify passed and, if it is
+// approved, writes its operation.
+func decide(cfg AdminConfig, now func() time.Time, req Request) (*roster.Op, error) {
 	replay, err := admit(cfg, req, now())
 	if err != nil {
 		return nil, err

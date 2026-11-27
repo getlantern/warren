@@ -2,16 +2,21 @@ package node
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
+	"net"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/getlantern/warren/dht"
+	"github.com/getlantern/warren/endpoint"
 	"github.com/getlantern/warren/group/join"
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/memberlog"
 	"github.com/getlantern/warren/group/roster"
+	"github.com/getlantern/warren/transport/hy2"
 )
 
 // memberlogSet is a log set brought up to r's fold.
@@ -252,5 +257,113 @@ func TestJoinAcrossPeriodBoundary(t *testing.T) {
 		if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(byte(50+i)), "s", cfg); err != nil {
 			t.Fatalf("a joiner %v off the admin's clock: %v", skew, err)
 		}
+	}
+}
+
+// TestStalledInviteCaller: a caller on an invite listener that never
+// finishes its request doesn't take the group: members still sync.
+func TestStalledInviteCaller(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	m1 := x.join(t, host(t, seed), x.m1, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, _ := issued.Invite.Listener(keys.PeriodOf(time.Now()))
+	caller, _ := keys.NewIdentity(crand.Reader)
+	c, err := m1.h.ep.Connect(ctx, keys.CryptoSigner(caller), listener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	cl, err := hy2.Dial(ctx, c, c.Remote, c.PeerKey, hy2.FromSecret(c.Secret, hy2.ObfsUTP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	stream, err := cl.DialConn(ctx, joinStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if _, err := stream.Write([]byte{0, 0}); err != nil { // part of a frame header
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if owner.active.Load() || owner.doWaiting.Load() != 0 {
+		t.Fatal("an unverified caller took the group")
+	}
+	if err := m1.Call(ctx, x.owner.Public()); err != nil {
+		t.Fatalf("a member couldn't sync while an invite caller stalled: %v", err)
+	}
+}
+
+// TestSlowApproval: a join whose Approve takes longer than the idle bound
+// (twice CallTimeout) but within SessionTimeout still completes.
+func TestSlowApproval(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c),
+		CallTimeout: time.Second, SessionTimeout: 15 * time.Second,
+		Approve: func(join.Request) bool { time.Sleep(3 * time.Second); return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := o.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(44), "slow", joinCfg); err != nil {
+		t.Fatalf("a slowly approved join: %v", err)
+	}
+}
+
+// TestNothingBeginsAfterLeave: once a node has left, a Do or session
+// refuses, so the roster and logs stay the caller's.
+func TestNothingBeginsAfterLeave(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	n := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := n.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	if err := n.Do(ctx, func(*roster.Roster, *memberlog.Set) error { ran = true; return nil }); !errors.Is(err, ErrLeft) || ran {
+		t.Fatalf("a Do after Leave: %v, ran=%v", err, ran)
+	}
+	if n.begin() {
+		t.Fatal("a session began after Leave")
+	}
+}
+
+// TestJoinFromHints: a joiner whose host has never bootstrapped finds the
+// admin through the invite's hints alone.
+func TestJoinFromHints(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, []netip.AddrPort{seed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cold, err := NewHost(endpoint.Config{DHT: dhtConfig(true), DHTAddr: "127.0.0.1:0", DataIP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cold.Close() })
+	if _, err := cold.JoinByInvite(ctx, issued.Invite, me(45), "cold", joinCfg); err != nil {
+		t.Fatalf("joining from hints alone: %v", err)
 	}
 }

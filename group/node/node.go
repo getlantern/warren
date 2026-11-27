@@ -62,6 +62,8 @@ var (
 	// ErrJoined means the host has already joined the group as that
 	// member: the two would listen under the same keys.
 	ErrJoined = errors.New("node: already joined")
+	// ErrLeft means the node has left its host (Node.Leave).
+	ErrLeft = errors.New("node: left")
 )
 
 // Host owns a warren endpoint and routes its listeners and connections to
@@ -217,6 +219,8 @@ type Node struct {
 	active atomic.Bool
 	// doWaiting counts Do calls waiting for the group; see Do.
 	doWaiting atomic.Int32
+	// left is set by Leave, under the group: no session or Do begins after.
+	left atomic.Bool
 
 	lmu       sync.Mutex
 	listening map[uint64]keys.Signer     // period → the rendezvous key listened under
@@ -538,6 +542,10 @@ func (n *Node) begin() bool {
 	if n.doWaiting.Load() > 0 || !n.active.CompareAndSwap(false, true) {
 		return false // a session, or a Do running or waiting
 	}
+	if n.left.Load() {
+		n.active.Store(false)
+		return false
+	}
 	n.mu.Lock() // held otherwise only by a refresh, briefly
 	return true
 }
@@ -588,6 +596,10 @@ func (n *Node) Do(ctx context.Context, fn func(*roster.Roster, *memberlog.Set) e
 		}
 	}
 	n.doWaiting.Add(-1)
+	if n.left.Load() {
+		n.active.Store(false)
+		return ErrLeft
+	}
 	n.mu.Lock()
 	defer n.end()
 	err := fn(n.cfg.Roster, n.cfg.Logs)

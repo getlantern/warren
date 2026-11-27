@@ -106,13 +106,18 @@ func (n *Node) isInviteKey(key keys.PublicKey) bool {
 	return is != nil
 }
 
-// serveJoin runs one join session on c, a call to an invite listener: the
-// roster is the session's alone (Do), and the answer is held until the
-// joiner hangs up, so it isn't lost with the teardown.
+// serveJoin runs one join session on c, a call to an invite listener. The
+// request's proofs are checked first, within a call's time and without the
+// roster, so a caller that can't prove the invite secret never takes the
+// group; the answer is then decided with the roster to itself (Do), and
+// the stream, a refusal's too, is held until the joiner hangs up, so the
+// answer isn't lost with the teardown.
 func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Issued, signer keys.Signer) {
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.SessionTimeout)
 	defer cancel()
 	done := make(chan struct{})
+	idle := time.NewTimer(2 * n.cfg.CallTimeout) // no stream: let it go
+	defer idle.Stop()
 	var (
 		once     sync.Once
 		hmu      sync.Mutex
@@ -132,34 +137,31 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 		defer stream.Close()
 		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 		defer stop()
-		ran := false
-		once.Do(func() { ran = true })
-		if !ran || dest != joinStream {
+		claimed := false
+		once.Do(func() { claimed = true })
+		if !claimed || dest != joinStream {
 			return // one join session per connection
 		}
+		idle.Stop() // the session is under way: SessionTimeout bounds it
 		defer close(done)
-		var served bool
+		defer n.holdAnswer(stream)
+		vctx, vcancel := context.WithTimeout(ctx, n.cfg.CallTimeout)
+		req, err := join.Verify(vctx, stream, issued.Invite, c.Secret)
+		vcancel()
+		if err != nil {
+			return
+		}
 		_ = n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
-			_, _, err := join.Serve(ctx, stream, join.AdminConfig{
+			_, err := join.Answer(ctx, stream, join.AdminConfig{
 				Roster: r, Me: n.cfg.Me, Invite: issued.Invite, Secret: c.Secret,
 				Approve: n.cfg.Approve, Now: n.now, Answered: &issued.Answered,
-			})
-			served = err == nil
+			}, req)
 			return err
 		})
-		if served {
-			// Hold the stream until the joiner, having read the answer,
-			// hangs up, for no longer than a call.
-			t := time.AfterFunc(n.cfg.CallTimeout, func() { _ = stream.Close() })
-			defer t.Stop()
-			_, _ = io.Copy(io.Discard, stream)
-		}
 	})
 	if err != nil {
 		return
 	}
-	idle := time.NewTimer(2 * n.cfg.CallTimeout) // no stream: let it go
-	defer idle.Stop()
 	select {
 	case <-done:
 	case <-idle.C:
@@ -172,6 +174,14 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 	returned = true
 	hmu.Unlock()
 	handlers.Wait()
+}
+
+// holdAnswer holds stream, after an answer (or refusal) was written to it,
+// until the joiner, having read it, hangs up, for no longer than a call.
+func (n *Node) holdAnswer(stream net.Conn) {
+	t := time.AfterFunc(n.cfg.CallTimeout, func() { _ = stream.Close() })
+	defer t.Stop()
+	_, _ = io.Copy(io.Discard, stream)
 }
 
 // ErrNoListener means no listener for the invite answered in this or a
@@ -277,9 +287,11 @@ func runJoin(ctx context.Context, c *endpoint.Conn, iv join.Invite, me *keys.Ide
 
 // Leave takes the group off its host: it waits for a running session or Do
 // to end (or ctx), then drops its listeners, invites included. The roster
-// and logs are the caller's again.
+// and logs are the caller's again: no session or Do begins after, even one
+// already waiting (ErrLeft).
 func (n *Node) Leave(ctx context.Context) error {
 	return n.Do(ctx, func(*roster.Roster, *memberlog.Set) error {
+		n.left.Store(true)
 		n.ready.Store(false)
 		n.leave()
 		return nil
