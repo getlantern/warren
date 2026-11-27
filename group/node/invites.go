@@ -35,16 +35,20 @@ func (n *Node) Invite(ctx context.Context, uses uint32, ttl time.Duration, hints
 	var issued *join.Issued
 	err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
 		var err error
-		issued, _, err = join.Issue(&roster.Writer{R: r, Me: n.cfg.Me, Now: n.now}, uses, ttl, hints, nil)
-		return err
+		if issued, _, err = join.Issue(&roster.Writer{R: r, Me: n.cfg.Me, Now: n.now}, uses, ttl, hints, nil); err != nil {
+			return err
+		}
+		// Registered and listened for within the Do, so a Leave (also a
+		// Do) comes wholly before or after it.
+		n.lmu.Lock()
+		n.invites[issued.Invite.Key] = &invite{issued: issued, listening: map[uint64]keys.Signer{}}
+		n.lmu.Unlock()
+		return n.rotate(ctx)
 	})
 	if err != nil {
 		return nil, err
 	}
-	n.lmu.Lock()
-	n.invites[issued.Invite.Key] = &invite{issued: issued, listening: map[uint64]keys.Signer{}}
-	n.lmu.Unlock()
-	return issued, n.rotate(ctx)
+	return issued, nil
 }
 
 // rotateInvites listens under each invite's key blinded for this and the
@@ -190,9 +194,9 @@ var ErrNoListener = errors.New("node: the invite's admin didn't answer")
 
 // JoinByInvite joins the group an invite is for as a new member, me (a
 // fresh identity), named name, and returns the group's node on h. cfg
-// gives its clock and timeouts; its Me, Group, Roster and Logs are filled
-// in from the answer. The DHT is bootstrapped from the invite's hints, if
-// any.
+// gives its clock and timeouts; its Me, Group and Roster are filled in
+// from the answer, and its Logs too unless given. The DHT is bootstrapped
+// from the invite's hints, if any.
 func (h *Host) JoinByInvite(ctx context.Context, iv join.Invite, me *keys.Identity, name string, cfg Config) (*Node, error) {
 	return h.byInvite(ctx, iv, me, name, false, cfg)
 }
@@ -200,7 +204,9 @@ func (h *Host) JoinByInvite(ctx context.Context, iv join.Invite, me *keys.Identi
 // Rejoin comes back to a group under an existing member key, me, through
 // an invite: for a member away past the grace window, which lacks the
 // current group secret. It returns a fresh node on h for the group; leave
-// any stale one first (Node.Leave).
+// any stale one first (Node.Leave), and pass its logs as cfg.Logs, so the
+// member's own log carries on rather than restarting (which members would
+// take as a fork).
 func (h *Host) Rejoin(ctx context.Context, iv join.Invite, me *keys.Identity, cfg Config) (*Node, error) {
 	return h.byInvite(ctx, iv, me, "", true, cfg)
 }
@@ -223,7 +229,10 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 	if err != nil {
 		return nil, err
 	}
-	logs := memberlog.NewSet(r.Group())
+	logs := cfg.Logs
+	if logs == nil {
+		logs = memberlog.NewSet(r.Group())
+	}
 	if err := logs.Update(f); err != nil {
 		return nil, err
 	}

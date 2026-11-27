@@ -307,6 +307,9 @@ type rolesView struct {
 // retry grace) dropped, and the admission set rebuilt.
 // Run it every few minutes.
 func (n *Node) Tick(ctx context.Context) error {
+	if n.left.Load() {
+		return ErrLeft // the roster is the caller's again
+	}
 	err := n.rotate(ctx)
 	// After lmu is released, as the host's admission and routing take it.
 	// A session holding mu refreshes when it ends, with the clock then.
@@ -323,6 +326,9 @@ func (n *Node) Tick(ctx context.Context) error {
 func (n *Node) rotate(ctx context.Context) error {
 	n.lmu.Lock()
 	defer n.lmu.Unlock()
+	if n.left.Load() { // Leave sets it before taking lmu to drop the listeners
+		return ErrLeft
+	}
 	p := keys.PeriodOf(n.now()) // under lmu, so an older Tick can't undo a newer
 	// Drop first, so a full listener table doesn't keep the old keys.
 	for q, s := range n.listening {

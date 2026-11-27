@@ -979,8 +979,10 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       3. `group/node` (built): `Node.Invite` issues an invite and listens
          under its key blinded per period, rotating with the clock and
          dropping it `join.RetryGrace` past expiry; the host admits any
-         caller on an invite key and runs a join session (`join.Serve`
-         under `Do`, with `Config.Approve`) instead of a member session;
+         caller on an invite key and runs a join session instead of a
+         member session: `join.Verify` (the request's proofs, within
+         `CallTimeout`, without the roster), then `join.Answer` under `Do`
+         with `Config.Approve`;
          `Host.JoinByInvite` and `Host.Rejoin` call the blinded key (this,
          the next, then the previous period's), run `join.Join`, and join
          the group with the roster and `G` they get; `Node.Leave` drops a

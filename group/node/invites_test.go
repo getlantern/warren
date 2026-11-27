@@ -367,3 +367,111 @@ func TestJoinFromHints(t *testing.T) {
 		t.Fatalf("joining from hints alone: %v", err)
 	}
 }
+
+// TestNoListenersAfterLeave: Tick and Invite after Leave refuse, adding no
+// listeners to a node the host no longer routes.
+func TestNoListenersAfterLeave(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	n := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := n.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Tick(ctx); !errors.Is(err, ErrLeft) {
+		t.Fatalf("Tick after Leave: %v", err)
+	}
+	if _, err := n.Invite(ctx, 1, time.Hour, nil); !errors.Is(err, ErrLeft) {
+		t.Fatalf("Invite after Leave: %v", err)
+	}
+	if n.listensUnder(x.owner.Rendezvous(x.g, keys.PeriodOf(time.Now())).Public()) {
+		t.Fatal("a node that left listens again")
+	}
+	// The roster is the caller's: Tick doesn't read it, so the node's view
+	// doesn't follow a change made after Leave.
+	newcomer := me(46)
+	if _, err := (&roster.Writer{R: n.cfg.Roster, Me: x.owner}).Add(newcomer.Public(), "n", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Tick(ctx)
+	if roles, _ := n.view(); roles[newcomer.Public()] != roster.None {
+		t.Fatal("Tick read the roster after Leave")
+	}
+}
+
+// TestRejoinKeepsLogs: a member that rejoins with its logs keeps its own
+// entries, so its log carries on rather than restarting.
+func TestRejoinKeepsLogs(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	h := host(t, seed)
+	old := x.join(t, h, x.m1, x.r)
+	post(t, old, x.m1, "written before rejoining")
+	if err := old.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := joinCfg
+	cfg.Logs = old.cfg.Logs
+	n, err := h.Rejoin(ctx, issued.Invite, x.m1, cfg)
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	var entries int
+	_ = n.Do(ctx, func(_ *roster.Roster, logs *memberlog.Set) error {
+		if l := logs.Log(x.m1.Public()); l != nil {
+			entries = len(l.Entries())
+		}
+		return nil
+	})
+	if entries != 1 {
+		t.Fatalf("the rejoined node holds %d of the member's entries, want 1", entries)
+	}
+}
+
+// TestRejoinAfterRekey: a member rejoining after a rekey gets a node on the
+// new group secret, and reaches a current member with it.
+func TestRejoinAfterRekey(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := x.r.Fold()
+	oldG := x.g
+	x.g = x.r.Keyring(x.owner).Secrets[f.Current]
+	if x.g == oldG {
+		t.Fatal("the rekey didn't change G")
+	}
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := host(t, seed).Rejoin(ctx, issued.Invite, x.m1, joinCfg)
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	if n.cfg.Group != x.g {
+		t.Fatal("the rejoined node isn't on the current group secret")
+	}
+	eventually(t, "the rejoined node's listener was never published", func() bool {
+		var ok bool
+		n.h.Endpoint().DHT().Inspect(ctx, func(d *dht.Node) {
+			ok = len(d.HoldersFor(x.m1.Rendezvous(x.g, keys.PeriodOf(time.Now())).Public())) > 0
+		})
+		return ok
+	})
+	if err := n.Call(ctx, x.owner.Public()); err != nil {
+		t.Fatalf("the rejoined member couldn't reach the owner: %v", err)
+	}
+}
