@@ -93,6 +93,13 @@ func (k Kind) needsAdmin() bool {
 	return k == Add || k == Remove || k == Rekey || k == SetRole || k == Invite
 }
 
+// needsAdmin reports whether the operation needs admin authority: its kind
+// does, or it is a deliver that answers an invite, which spends one of the
+// invite's uses (any member may deliver otherwise).
+func (o *Op) needsAdmin() bool {
+	return o.Kind.needsAdmin() || (o.Kind == Deliver && o.Invite != keys.PublicKey{})
+}
+
 // Seal is a box of keys sealed to one member key. Holds lists, in the
 // clear, which keys the box carries, so other members can tell what the
 // recipient holds without opening it. Only the recipient can check it, so

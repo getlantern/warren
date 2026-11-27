@@ -306,3 +306,29 @@ func TestDecodeBoundsUses(t *testing.T) {
 		}
 	}
 }
+
+// TestDemotedAdminCantBackdateSpend: an admin demoted after an invite can't
+// spend it with a deliver backdated to before its demotion.
+func TestDemotedAdminCantBackdateSpend(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	inv := invite(t, r, admin, 50, 1)
+	ow := &Writer{R: r, Me: owner, Now: clock}
+	invite(t, r, owner, 51, 1) // so the demotion sorts after the backdated deliver
+	if _, err := ow.SetRole(admin.Public(), Member); err != nil {
+		t.Fatal(err)
+	}
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	invOp := r.Op(f.Invites[inv].Op)
+	o := &Op{Group: r.group, Kind: Deliver, Parents: []ID{invOp.ID()}, Lamport: invOp.Lamport + 1,
+		Target: admin.Public(), Invite: inv}
+	o.Sign(admin)
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); s.Used != 0 {
+		t.Fatalf("a demoted admin's backdated deliver spent the invite: %+v", s)
+	}
+}

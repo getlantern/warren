@@ -465,7 +465,7 @@ func (r *Roster) fold() (*Result, error) {
 		}
 		for k, grants := range res.Grants {
 			ops := byAuthor[k]
-			if !slices.ContainsFunc(ops, func(o *Op) bool { return o.Kind.needsAdmin() }) {
+			if !slices.ContainsFunc(ops, func(o *Op) bool { return o.needsAdmin() }) {
 				continue // nothing of k's needs the authority a demotion takes
 			}
 			for i, d := range grants {
@@ -474,7 +474,7 @@ func (r *Roster) fold() (*Result, error) {
 				}
 				h := r.History(d.id)
 				for _, o := range ops {
-					if !o.Kind.needsAdmin() || h[o.id] {
+					if !o.needsAdmin() || h[o.id] {
 						continue
 					}
 					restored := false
