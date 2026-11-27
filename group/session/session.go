@@ -534,6 +534,13 @@ func (s *session) transportMatches(member keys.PublicKey) bool {
 // brought up to the roster as it now stands: operations taken before the
 // session failed (a removal in a batch the peer never finished) stay in
 // the roster, so the logs must follow them.
+// batchDone reports whether m leaves the peer's roster operations whole:
+// it isn't an Ops message with more to follow.
+func batchDone(m gsync.Message) bool {
+	o, ok := m.(gsync.Ops)
+	return !ok || !o.More
+}
+
 // sync runs group/sync with peer to the end. A message that adds roster
 // operations is checked for peer's removal, which ends the session before
 // anything more is sent: a removed member is served nothing after this
@@ -547,6 +554,7 @@ func (s *session) sync(peer keys.PublicKey) (err error) {
 		}
 	}()
 	x := gsync.New(s.cfg.Roster, s.cfg.Logs)
+	pending := false // roster operations added, peer's membership not yet checked
 	for _, m := range x.Start() {
 		s.send(frameSync, gsync.Encode(m))
 	}
@@ -568,6 +576,14 @@ func (s *session) sync(peer keys.PublicKey) (err error) {
 			return err
 		}
 		if s.cfg.Roster.Len() != before { // only then can peer have been removed
+			pending = true
+		}
+		// Decided on the whole batch: a later chunk can void a removal in
+		// an earlier one (the remover's concurrent demotion, say). The
+		// sync answers no chunk but the last, so nothing is served
+		// meanwhile.
+		if pending && batchDone(m) {
+			pending = false
 			f, err := s.cfg.Roster.Fold()
 			if err != nil {
 				return err

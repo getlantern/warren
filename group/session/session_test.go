@@ -646,3 +646,50 @@ func TestThirdRemovalMidSession(t *testing.T) {
 		t.Fatal("the removal didn't sync")
 	}
 }
+
+// TestRemovalVoidedInLaterChunk: a removal arriving in one chunk of the
+// peer's operations and voided by a later chunk (the remover's concurrent
+// demotion) doesn't cut the peer off: the decision waits for the whole
+// batch.
+func TestRemovalVoidedInLaterChunk(t *testing.T) {
+	x := newGroup(t)
+	a2 := me(5)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(a2.Public(), "a2", roster.Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	b := x.member(t, x.m2, x.r) // has seen none of what follows
+	peer := copyRoster(t, x.r)
+	branch := copyRoster(t, x.r)
+	rm, err := (&roster.Writer{R: branch, Me: a2}).Remove(x.m1.Public(), 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Over a megabyte of the owner's operations, then the demotion, so the
+	// removal and the demotion travel in different chunks.
+	ow := &roster.Writer{R: peer, Me: x.owner}
+	exp := time.Now().Add(time.Hour).Unix()
+	for i := range 6000 {
+		if _, err := ow.Invite(keys.IdentityFromSeed([32]byte{0xa0, byte(i), byte(i >> 8)}).Public(), 1, exp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ow.SetRole(a2.Public(), roster.Member); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.Add(rm); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := peer.Fold(); f.Roles[x.m1.Public()] == roster.None {
+		t.Fatal("the setup: the demotion didn't void the removal")
+	}
+	a := &member{id: x.m1, r: peer, logs: memberlog.NewSet(peer.Group())}
+	if f, err := peer.Fold(); err != nil || a.logs.Update(f) != nil {
+		t.Fatal("the setup: logs")
+	}
+	if _, _, ea, eb := x.call(t, a, b, x.rendezvous(x.m1)); ea != nil || eb != nil {
+		t.Fatalf("a removal voided in a later chunk cut the peer off: %v / %v", ea, eb)
+	}
+	if f, _ := b.r.Fold(); f.Roles[x.m1.Public()] == roster.None {
+		t.Fatal("the callee holds the peer as removed")
+	}
+}
