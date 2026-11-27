@@ -579,13 +579,12 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 				// Concurrent with the add that admitted the key, not a role
 				// change; both sealed their role's keys, so the higher wins.
 				ok = true
-			case cur != None && !sawTarget(o):
+			case cur != None && res.Invites[o.Invite] != nil && !sawTarget(o):
 				// Concurrent with the add that admitted the key, at no higher
 				// a role: it doesn't count, but its approval was given, so it
-				// still spends its invite (see InviteState).
-				if s := res.Invites[o.Invite]; s != nil {
-					s.Used++
-				}
+				// still spends its invite (see InviteState). The invite is
+				// checked first: sawTarget can fold the op's history.
+				res.Invites[o.Invite].Used++
 			}
 			if ok {
 				res.Roles[o.Target] = o.Role

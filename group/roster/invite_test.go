@@ -380,3 +380,29 @@ func TestConcurrentApprovalsOfOneJoiner(t *testing.T) {
 		t.Fatalf("a causal duplicate add spent its invite: %+v", s)
 	}
 }
+
+// TestFoldScalesWithDuplicateAdds: a long chain of same-role duplicate adds
+// naming no invite folds without walking each one's history (only an add
+// with an invite to spend needs that).
+func TestFoldScalesWithDuplicateAdds(t *testing.T) {
+	r, _, admin, member := group(t)
+	w := &Writer{R: r, Me: admin}
+	const n = 6000
+	for range n {
+		o := w.base(Add)
+		o.Target, o.Role, o.Name = member.Public(), Member, "m"
+		o.Sign(admin)
+		if _, err := r.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	if _, err := r.Fold(); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 2*time.Second && !raceEnabled { // quadratic takes seconds; linear, milliseconds
+		t.Fatalf("folding %d duplicate adds took %v", n, d)
+	} else {
+		t.Logf("folded in %v", d)
+	}
+}
