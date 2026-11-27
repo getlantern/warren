@@ -516,7 +516,7 @@ func TestPostOnForkedOwnLog(t *testing.T) {
 // them.
 func TestPostPastGapInOwnLog(t *testing.T) {
 	for _, skip := range []int{1, 0} { // a gap after the head, or no head yet
-		postPastGap(t, skip)
+		t.Run(fmt.Sprintf("missing-%d", skip+1), func(t *testing.T) { postPastGap(t, skip) })
 	}
 }
 

@@ -137,8 +137,8 @@ func (l *Log) Last() *Entry {
 }
 
 // Len returns how many entries the log holds, shown or not. An unforked
-// log that isn't cut holds every entry up to Last, so more than Last's
-// sequence number means entries past a gap it can't chain to yet.
+// log holds every entry up to Last, so more than Last's sequence number
+// means entries past a gap it can't chain to yet.
 func (l *Log) Len() int { return len(l.bySeq) }
 
 // limit is the highest sequence number the app may see: below a fork

@@ -28,7 +28,8 @@ func (n *Node) Paused() bool { return n.paused.Load() }
 // appended would be hidden too. A forked own log refuses posts too
 // (memberlog.ErrForked). Otherwise, if held posts failed to append, a post
 // is refused with that failure (ErrHeldFailed) until they do or TakeHeld
-// clears them.
+// clears them. A roster that won't fold holds a post without these checks;
+// the flush makes them before appending it.
 func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 	if len(body) > memberlog.MaxBody {
 		return false, fmt.Errorf("node: post of %d bytes is over memberlog.MaxBody", len(body))
