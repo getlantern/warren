@@ -537,6 +537,9 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 	}
 	ever := map[keys.PublicKey]bool{}
 	var live []*InviteState // invites recorded since the last counting remove
+	// admitted is each key's counting adds: the one that admitted it, and
+	// any concurrent one at a higher role that won.
+	admitted := map[keys.PublicKey][]ID{}
 	// granted is the operation that made each admin one: its counting add
 	// as admin, or its latest promotion.
 	granted := map[keys.PublicKey]ID{}
@@ -579,16 +582,19 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 				// Concurrent with the add that admitted the key, not a role
 				// change; both sealed their role's keys, so the higher wins.
 				ok = true
-			case cur != None && res.Invites[o.Invite] != nil && !sawTarget(o):
-				// Concurrent with the add that admitted the key, at no higher
-				// a role: it doesn't count, but its approval was given, so it
-				// still spends its invite (see InviteState). The invite is
-				// checked first: sawTarget can fold the op's history.
+			case cur != None && cur != Owner && res.Invites[o.Invite] != nil &&
+				!slices.ContainsFunc(admitted[o.Target], func(a ID) bool { return r.descends(o.id, a) }):
+				// Concurrent with the adds that admitted the key, at no
+				// higher a role: it doesn't count, but its approval was
+				// given, so it still spends its invite (see InviteState).
+				// Descent from those adds is asked, not the op's view: the
+				// fold memoizes it, where a view refolds the op's history.
 				res.Invites[o.Invite].Used++
 			}
 			if ok {
 				res.Roles[o.Target] = o.Role
 				ever[o.Target] = true
+				admitted[o.Target] = append(admitted[o.Target], o.id)
 				if o.Role == Admin {
 					granted[o.Target] = o.id
 				}

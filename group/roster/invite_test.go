@@ -381,28 +381,51 @@ func TestConcurrentApprovalsOfOneJoiner(t *testing.T) {
 	}
 }
 
-// TestFoldScalesWithDuplicateAdds: a long chain of same-role duplicate adds
-// naming no invite folds without walking each one's history (only an add
-// with an invite to spend needs that).
+// TestFoldScalesWithDuplicateAdds: a long chain of same-role duplicate adds,
+// some naming an invite, folds without refolding each one's history.
 func TestFoldScalesWithDuplicateAdds(t *testing.T) {
 	r, _, admin, member := group(t)
+	inv := invite(t, r, admin, 50, 1)
 	w := &Writer{R: r, Me: admin}
 	const n = 6000
-	for range n {
+	for i := range n {
 		o := w.base(Add)
 		o.Target, o.Role, o.Name = member.Public(), Member, "m"
+		if i%2 == 0 { // half name an invite, which asks about their history
+			o.Invite = inv
+		}
 		o.Sign(admin)
 		if _, err := r.Add(o); err != nil {
 			t.Fatal(err)
 		}
 	}
 	start := time.Now()
-	if _, err := r.Fold(); err != nil {
+	f, err := r.Fold()
+	if err != nil {
 		t.Fatal(err)
+	}
+	if f.Invites[inv].Used != 0 {
+		t.Fatal("causal duplicate adds spent the invite")
 	}
 	if d := time.Since(start); d > 2*time.Second && !raceEnabled { // quadratic takes seconds; linear, milliseconds
 		t.Fatalf("folding %d duplicate adds took %v", n, d)
 	} else {
 		t.Logf("folded in %v", d)
+	}
+}
+
+// TestAddOfOwnerSpendsNothing: an add naming the owner, who was never
+// added, can't count and spends nothing.
+func TestAddOfOwnerSpendsNothing(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	inv := invite(t, r, admin, 50, 1)
+	o := (&Writer{R: r, Me: admin}).base(Add)
+	o.Target, o.Role, o.Name, o.Invite = owner.Public(), Member, "o", inv
+	o.Sign(admin)
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); s.Used != 0 {
+		t.Fatalf("an add of the owner spent the invite: %+v", s)
 	}
 }
