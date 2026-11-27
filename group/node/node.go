@@ -259,6 +259,11 @@ type Node struct {
 	gmu        sync.Mutex
 	current    keys.Secret
 	superseded []supersededSecret
+	// seenKeys is the key-making operations whose secrets the node has
+	// seen; a newly seen one that isn't current was superseded since (in a
+	// batch of rekeys learned at once, say). nil until the first refresh,
+	// which takes the roster's history as seen. mu held.
+	seenKeys map[roster.ID]bool
 	// rekeyed is set when refresh moves to a new secret, so whoever ends
 	// the session or Do rotates the listeners onto it.
 	rekeyed atomic.Bool
@@ -298,21 +303,30 @@ func (n *Node) secrets(now time.Time) []keys.Secret {
 }
 
 // follow moves n to g if it isn't on it already, keeping the secret it
-// leaves for Grace, and reports whether it moved.
-func (n *Node) follow(g keys.Secret, now time.Time) bool {
+// leaves, and any others newly superseded, for Grace. It reports whether
+// the secrets n listens under changed.
+func (n *Node) follow(g keys.Secret, newly []keys.Secret, now time.Time) bool {
 	n.gmu.Lock()
 	defer n.gmu.Unlock()
-	if g == n.current {
+	add := newly
+	if g != n.current {
+		add = append(add, n.current)
+	}
+	if len(add) == 0 {
 		return false
 	}
 	kept := n.superseded[:0]
 	for _, s := range n.superseded {
-		if now.Before(s.until) && s.g != g {
+		if now.Before(s.until) && s.g != g && !slices.Contains(add, s.g) {
 			kept = append(kept, s)
 		}
 	}
-	n.superseded = append(kept, supersededSecret{g: n.current, until: now.Add(Grace)})
-	n.current = g
+	for _, a := range add {
+		if a != g {
+			kept = append(kept, supersededSecret{g: a, until: now.Add(Grace)})
+		}
+	}
+	n.superseded, n.current = kept, g
 	return true
 }
 
@@ -327,7 +341,7 @@ func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	n.mu.Unlock()
 	h.mu.Lock()
 	for _, g := range h.groups {
-		if g.cfg.Group == cfg.Group && g.cfg.Me.Public() == cfg.Me.Public() {
+		if g.cfg.Roster.Group() == cfg.Roster.Group() && g.cfg.Me.Public() == cfg.Me.Public() {
 			h.mu.Unlock()
 			return nil, ErrJoined
 		}
@@ -480,9 +494,26 @@ func (n *Node) refresh() {
 	n.roles.Store(&rolesView{roles: roles, err: err})
 	now := n.now()
 	// Follow the roster's current secret once the keyring holds it (a
-	// member added concurrently with a rekey may not, until a deliver).
+	// member added concurrently with a rekey may not, until a deliver), and
+	// keep for Grace every secret superseded since the last refresh, an
+	// intermediate one in a batch of rekeys included: a member admitted
+	// while it was current may hold no other.
 	if err == nil {
-		if g, ok := n.cfg.Roster.Keyring(n.cfg.Me).Secrets[f.Current]; ok && n.follow(g, now) {
+		k := n.cfg.Roster.Keyring(n.cfg.Me)
+		var newly []keys.Secret
+		first := n.seenKeys == nil
+		if first {
+			n.seenKeys = map[roster.ID]bool{}
+		}
+		for id, g := range k.Secrets {
+			if !n.seenKeys[id] {
+				n.seenKeys[id] = true
+				if !first && id != f.Current {
+					newly = append(newly, g)
+				}
+			}
+		}
+		if g, ok := k.Secrets[f.Current]; ok && n.follow(g, newly, now) {
 			n.rekeyed.Store(true)
 		}
 	}
@@ -977,7 +1008,8 @@ func (n *Node) Publish(ctx context.Context) error {
 	}
 	now := n.now()
 	p := keys.PeriodOf(now)
-	g := n.Group()
+	d := n.dir() // one snapshot of the secret, for the entries and the write
+	g := d.Group
 	entries := []directory.Entry{{Key: n.cfg.Me.Rendezvous(g, p).Public(), Seen: now}}
 	for m, t := range n.Seen() {
 		if keys.PeriodOf(t) != p {
@@ -987,7 +1019,7 @@ func (n *Node) Publish(ctx context.Context) error {
 			entries = append(entries, directory.Entry{Key: r, Seen: t})
 		}
 	}
-	return n.dir().Write(ctx, p, members, entries)
+	return d.Write(ctx, p, members, entries)
 }
 
 // Directory reads when each member was last seen, as the directory says

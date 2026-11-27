@@ -231,16 +231,25 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 	handlers.Wait()
 }
 
-// onCurrentSecret reports whether n runs on r's current group secret: it
-// follows the roster's, once its keyring holds it, and a joiner given a
-// secret n isn't on couldn't reach it. mu held.
+// onCurrentSecret reports whether n runs on r's current group secret, and
+// listens under it this period: it follows the roster's once its keyring
+// holds it, and a joiner given a secret n isn't on (or doesn't listen
+// under) couldn't reach it. mu held.
 func (n *Node) onCurrentSecret(r *roster.Roster) bool {
 	f, err := r.Fold()
 	if err != nil {
 		return false
 	}
 	g, ok := r.Keyring(n.cfg.Me).Secrets[f.Current]
-	return ok && g == n.Group()
+	if !ok || g != n.Group() {
+		return false
+	}
+	// And listening under it, or a joiner given it couldn't reach n (a
+	// full listener table can fail the rotation onto a new secret).
+	n.lmu.Lock()
+	defer n.lmu.Unlock()
+	_, listening := n.listening[listenKey{g, keys.PeriodOf(n.now())}]
+	return listening
 }
 
 // holdAnswer holds stream, after an answer (or refusal) was written to it,

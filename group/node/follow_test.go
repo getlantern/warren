@@ -2,9 +2,13 @@ package node
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/getlantern/warren/dht"
+	"github.com/getlantern/warren/group/directory"
+	"github.com/getlantern/warren/group/join"
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/memberlog"
 	"github.com/getlantern/warren/group/roster"
@@ -103,5 +107,137 @@ func TestGraceExpires(t *testing.T) {
 	}
 	if !n.listensUnder(x.owner.Rendezvous(n.Group(), q).Public()) {
 		t.Fatal("not listening under the current secret")
+	}
+}
+
+// TestIntermediateSecretKept: a node that learns two rekeys at once keeps
+// the middle secret for Grace too, so a member admitted while it was
+// current (and holding no other) still reaches it.
+func TestIntermediateSecretKept(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r) // on G0
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// Elsewhere: a rekey to G1, a newcomer admitted under it, a rekey to G2.
+	later := copyRoster(t, x.r)
+	ow := &roster.Writer{R: later, Me: x.owner}
+	rk1, err := ow.Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newcomer := me(55)
+	if _, err := ow.Add(newcomer.Public(), "n", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := copyRoster(t, later) // the newcomer's view: G1 current
+	if _, err := ow.Rekey(); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := later.Fold()
+	ops := f.Order[1:]
+	if err := a.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error { // both rekeys at once
+		for _, o := range ops {
+			if _, err := r.Add(o); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	g1 := later.Keyring(x.owner).Secrets[rk1.ID()]
+	p := keys.PeriodOf(time.Now())
+	if !a.listensUnder(x.m1.Rendezvous(g1, p).Public()) {
+		t.Fatal("the node dropped the intermediate secret")
+	}
+	saved := *x
+	saved.g = g1
+	n := saved.join(t, host(t, seed), newcomer, snapshot)
+	if n.Group() != g1 {
+		t.Fatal("the newcomer isn't on the intermediate secret")
+	}
+	if err := n.Call(ctx, x.m1.Public()); err != nil {
+		t.Fatalf("a member on the intermediate secret couldn't reach the node: %v", err)
+	}
+}
+
+// TestJoinTwiceRefusedAfterRekey: once a node follows a rekey, joining the
+// same group as the same member on the new secret is still refused.
+func TestJoinTwiceRefusedAfterRekey(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	h := host(t, seed)
+	n := x.join(t, h, x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rekey(t, ctx, n)
+	c := copyRoster(t, x.r)
+	if _, err := h.Join(ctx, Config{Me: x.owner, Group: n.Group(), Roster: c, Logs: memberlogSet(t, c)}); !errors.Is(err, ErrJoined) {
+		t.Fatalf("a second join on the new secret: %v, want ErrJoined", err)
+	}
+}
+
+// TestNoJoinsWithoutNewListeners: when the listener table is too full to
+// listen under a new secret, the admin refuses joins rather than hand out
+// a secret it doesn't listen under.
+func TestNoJoinsWithoutNewListeners(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	h := host(t, seed)
+	owner := x.join(t, h, x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range dht.MaxListeners - 4 { // two rendezvous keys, two invite keys
+		if err := h.ep.AddListener(ctx, keys.CryptoSigner(me(byte(100+i)).Rendezvous(x.g, 0))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rekey(t, ctx, owner)
+	if owner.listensUnder(x.owner.Rendezvous(owner.Group(), keys.PeriodOf(time.Now())).Public()) {
+		t.Fatal("the new secret's listeners fit a full table")
+	}
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(56), "n", joinCfg); !errors.Is(err, join.ErrAdminBehind) {
+		t.Fatalf("a join without listeners on the new secret: %v, want ErrAdminBehind", err)
+	}
+}
+
+// TestDirectoryAfterRekey: after a rekey, members publish to and read the
+// new secret's directory.
+func TestDirectoryAfterRekey(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	fixed := time.Now()
+	x.clock = func() time.Time { return fixed }
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	m1 := x.join(t, host(t, seed), x.m1, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rekey(t, ctx, owner)
+	if err := owner.Call(ctx, x.m1.Public()); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the member didn't follow", func() bool { return m1.Group() == owner.Group() })
+	if err := m1.Publish(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := owner.Directory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[x.m1.Public()]; !ok {
+		t.Fatal("the new secret's directory didn't show the member")
+	}
+	// The old secret's directory holds nothing of it.
+	old, err := (&directory.Directory{Group: x.g, Shards: owner.shards, Store: owner.h.ep.DHT(), Now: x.clock}).Read(ctx, keys.PeriodOf(fixed), []keys.PublicKey{x.owner.Public(), x.m1.Public(), x.m2.Public()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := old[x.m1.Public()]; ok {
+		t.Fatal("the member published to the old secret's directory")
 	}
 }
