@@ -30,7 +30,10 @@ type invite struct {
 
 // Invite issues an invite admitting up to uses joiners and rejoiners for
 // ttl, records it in the roster, and listens for it; the returned invite's
-// Link is what the app hands out. n's member must be an owner or admin.
+// Link is what the app hands out. n's member must be an owner or admin. If
+// a listener fails (a full listener table, say), the invite is still
+// returned, with the error: it is recorded and held, and Tick retries the
+// listener.
 func (n *Node) Invite(ctx context.Context, uses uint32, ttl time.Duration, hints []netip.AddrPort) (*join.Issued, error) {
 	var issued *join.Issued
 	err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
@@ -45,10 +48,7 @@ func (n *Node) Invite(ctx context.Context, uses uint32, ttl time.Duration, hints
 		n.lmu.Unlock()
 		return n.rotate(ctx)
 	})
-	if err != nil {
-		return nil, err
-	}
-	return issued, nil
+	return issued, err
 }
 
 // rotateInvites listens under each invite's key blinded for this and the
@@ -204,9 +204,12 @@ func (h *Host) JoinByInvite(ctx context.Context, iv join.Invite, me *keys.Identi
 // Rejoin comes back to a group under an existing member key, me, through
 // an invite: for a member away past the grace window, which lacks the
 // current group secret. It returns a fresh node on h for the group; leave
-// any stale one first (Node.Leave), and pass its logs as cfg.Logs, so the
-// member's own log carries on rather than restarting (which members would
-// take as a fork).
+// any stale one first (Node.Leave), and pass its roster and logs as
+// cfg.Roster and cfg.Logs. The saved roster is merged into the answer's
+// (the admin may lack operations it holds, such as a rekey on a branch the
+// admin hasn't seen), and the logs brought up to the merge, so the
+// member's own log carries on rather than losing entries or restarting
+// (which members would take as a fork).
 func (h *Host) Rejoin(ctx context.Context, iv join.Invite, me *keys.Identity, cfg Config) (*Node, error) {
 	return h.byInvite(ctx, iv, me, "", true, cfg)
 }
@@ -224,6 +227,20 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 	r, err := h.joinSession(ctx, iv, me, name, rejoin, cfg)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Roster != nil {
+		if cfg.Roster.Group() != r.Group() {
+			return nil, ErrNotMember // another group's state
+		}
+		saved, err := cfg.Roster.Fold()
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range saved.Order[1:] { // causal order, past the genesis
+			if _, err := r.Add(o); err != nil {
+				return nil, err
+			}
+		}
 	}
 	f, err := r.Fold()
 	if err != nil {

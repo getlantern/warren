@@ -313,8 +313,12 @@ func (n *Node) Tick(ctx context.Context) error {
 	err := n.rotate(ctx)
 	// After lmu is released, as the host's admission and routing take it.
 	// A session holding mu refreshes when it ends, with the clock then.
+	// Leave may have run meanwhile: checked again under mu, which Leave's
+	// Do held, before reading the roster.
 	if n.mu.TryLock() {
-		n.refresh()
+		if !n.left.Load() {
+			n.refresh()
+		}
 		n.mu.Unlock()
 	}
 	return err

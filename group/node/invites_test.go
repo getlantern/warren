@@ -475,3 +475,79 @@ func TestRejoinAfterRekey(t *testing.T) {
 		t.Fatalf("the rejoined member couldn't reach the owner: %v", err)
 	}
 }
+
+// TestRejoinMergesSavedRoster: a rejoiner's saved roster holds a rekey the
+// admin hasn't seen, and its saved logs an entry under that epoch; the
+// rejoin merges the saved roster, so the entry survives.
+func TestRejoinMergesSavedRoster(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// The member's saved state: the roster plus a rekey (on a branch the
+	// admin's node never received), and an entry under its epoch.
+	saved := copyRoster(t, x.r)
+	rk, err := (&roster.Writer{R: saved, Me: x.owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := memberlogSet(t, saved)
+	e, err := memberlog.Write(x.m1, saved.Group(), nil, rk.ID(), saved.Keyring(x.m1).Epochs[rk.ID()], memberlog.App, []byte("under the newer epoch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := logs.Add(e); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := joinCfg
+	cfg.Roster, cfg.Logs = saved, logs
+	n, err := host(t, seed).Rejoin(ctx, issued.Invite, x.m1, cfg)
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	var entries int
+	_ = n.Do(ctx, func(r *roster.Roster, logs *memberlog.Set) error {
+		if l := logs.Log(x.m1.Public()); l != nil {
+			entries = len(l.Entries())
+		}
+		return nil
+	})
+	if entries != 1 {
+		t.Fatalf("the rejoined node holds %d of the member's entries, want 1", entries)
+	}
+}
+
+// TestInvitePartlyListened: with room for only one of an invite's two
+// listeners, Invite returns the invite with the error, holding it so Tick
+// can retry.
+func TestInvitePartlyListened(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	h := host(t, seed)
+	n := x.join(t, h, x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for i := range dht.MaxListeners - 3 { // two rendezvous keys, one slot left
+		if err := h.ep.AddListener(ctx, keys.CryptoSigner(me(byte(100+i)).Rendezvous(x.g, 0))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	issued, err := n.Invite(ctx, 1, time.Hour, nil)
+	if err == nil {
+		t.Fatal("both listeners fit in one free slot")
+	}
+	if issued == nil {
+		t.Fatal("a recorded invite's link was lost with the listener error")
+	}
+	n.lmu.Lock()
+	held := n.invites[issued.Invite.Key] != nil
+	n.lmu.Unlock()
+	if !held {
+		t.Fatal("the node doesn't hold the invite to retry its listener")
+	}
+}
