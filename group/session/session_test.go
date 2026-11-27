@@ -590,3 +590,59 @@ func TestManyHeadsCapped(t *testing.T) {
 		t.Fatalf("a roster with more heads than a hello names: %v / %v", ea, eb)
 	}
 }
+
+// TestRemovedMidSession: a peer whose sync carries its own removal (it got
+// the remove but hasn't acted on it) is cut off as soon as this side learns
+// it: the removal is kept, and nothing more is served, so the peer doesn't
+// get an entry it lacked.
+func TestRemovedMidSession(t *testing.T) {
+	x := newGroup(t)
+	a := x.member(t, x.m1, x.r) // the one being removed
+	if _, err := (&roster.Writer{R: a.r, Me: x.owner}).Remove(x.m1.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	b := x.member(t, x.m2, x.r) // hasn't heard of the removal
+	f, _ := b.r.Fold()
+	e, err := memberlog.Write(x.m2, b.r.Group(), nil, f.Current, b.r.Keyring(x.m2).Epochs[f.Current], memberlog.App, []byte("not for a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.logs.Add(e); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ea, eb := x.call(t, a, b, x.rendezvous(x.m1))
+	if !errors.Is(eb, ErrRemoved) {
+		t.Fatalf("the callee: %v, want ErrRemoved", eb)
+	}
+	if ea == nil {
+		t.Fatal("the removed caller's session ended well")
+	}
+	bf, _ := b.r.Fold()
+	if bf.Roles[x.m1.Public()] != roster.None {
+		t.Fatal("the callee didn't keep the removal it learned")
+	}
+	if l := a.logs.Log(x.m2.Public()); l != nil && len(l.Entries()) != 0 {
+		t.Fatal("the removed peer was served an entry after its removal was learned")
+	}
+}
+
+// TestThirdRemovalMidSession: a removal of someone else, learned during a
+// session, doesn't stop it.
+func TestThirdRemovalMidSession(t *testing.T) {
+	x := newGroup(t)
+	m3 := me(4)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(m3.Public(), "m3", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	a := x.member(t, x.m1, x.r)
+	if _, err := (&roster.Writer{R: a.r, Me: x.owner}).Remove(m3.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	b := x.member(t, x.m2, x.r)
+	if _, _, ea, eb := x.call(t, a, b, x.rendezvous(x.m1)); ea != nil || eb != nil {
+		t.Fatalf("a third member's removal stopped the session: %v / %v", ea, eb)
+	}
+	if bf, _ := b.r.Fold(); bf.Roles[m3.Public()] != roster.None {
+		t.Fatal("the removal didn't sync")
+	}
+}

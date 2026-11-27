@@ -38,6 +38,10 @@ var (
 	// ErrBacklog means the peer let more than maxQueued bytes of this
 	// side's frames pile up unread.
 	ErrBacklog = errors.New("session: peer isn't reading")
+	// ErrRemoved means the peer's removal reached this side during the
+	// session (through the session's own sync), which then stopped serving
+	// it (docs/groups-design.md, *Removal*, step 2).
+	ErrRemoved = errors.New("session: peer removed during the session")
 	// ErrChainTooLarge means a sync session's add chain is past what a
 	// callee takes from a peer it hasn't admitted yet.
 	ErrChainTooLarge = errors.New("session: add chain too large")
@@ -319,7 +323,7 @@ func (s *session) run() (keys.PublicKey, error) {
 			return peer, err
 		}
 	}
-	return peer, s.sync()
+	return peer, s.sync(peer)
 }
 
 type hello struct {
@@ -530,7 +534,11 @@ func (s *session) transportMatches(member keys.PublicKey) bool {
 // brought up to the roster as it now stands: operations taken before the
 // session failed (a removal in a batch the peer never finished) stay in
 // the roster, so the logs must follow them.
-func (s *session) sync() (err error) {
+// sync runs group/sync with peer to the end. A message that adds roster
+// operations is checked for peer's removal, which ends the session before
+// anything more is sent: a removed member is served nothing after this
+// side learns of it, whoever it learned it from.
+func (s *session) sync(peer keys.PublicKey) (err error) {
 	defer func() {
 		if err != nil {
 			if f, ferr := s.cfg.Roster.Fold(); ferr == nil {
@@ -554,9 +562,19 @@ func (s *session) sync() (err error) {
 		if err != nil {
 			return err
 		}
+		before := s.cfg.Roster.Len()
 		out, err := x.Handle(m)
 		if err != nil {
 			return err
+		}
+		if s.cfg.Roster.Len() != before { // only then can peer have been removed
+			f, err := s.cfg.Roster.Fold()
+			if err != nil {
+				return err
+			}
+			if f.Roles[peer] == roster.None {
+				return ErrRemoved
+			}
 		}
 		for _, o := range out {
 			s.send(frameSync, gsync.Encode(o))
