@@ -830,9 +830,10 @@ func TestApprovalFailsClosed(t *testing.T) {
 	h := host(t, seed)
 	c := copyRoster(t, x.r)
 	base := time.Now()
-	// The first clock read once the joiner calls is NeedsApproval's (Verify
-	// reads none): it sees the invite expired, so Approve isn't asked; every
-	// later read, the final answer's included, sees it usable.
+	// Once the joiner calls, the first Do's reads are onCurrentSecret's,
+	// then NeedsApproval's (Verify reads none): NeedsApproval's sees the
+	// invite expired, so Approve isn't asked; every later read, the final
+	// answer's included, sees it usable.
 	var calls, target atomic.Int64
 	target.Store(-1)
 	clock := func() time.Time {
@@ -855,7 +856,7 @@ func TestApprovalFailsClosed(t *testing.T) {
 	}
 	joiner := me(54)
 	jh := host(t, seed)
-	target.Store(calls.Load() + 1)
+	target.Store(calls.Load() + 2)
 	_, err = jh.JoinByInvite(ctx, issued.Invite, joiner, "j", joinCfg)
 	var added bool
 	if derr := o.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
@@ -865,7 +866,7 @@ func TestApprovalFailsClosed(t *testing.T) {
 	}); derr != nil {
 		t.Fatal(derr)
 	}
-	if added || err == nil {
-		t.Fatalf("a request never put to Approve was admitted (err %v)", err)
+	if added || !errors.Is(err, join.ErrNotApproved) {
+		t.Fatalf("a request never put to Approve: added=%v err=%v, want ErrNotApproved", added, err)
 	}
 }

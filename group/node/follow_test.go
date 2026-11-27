@@ -241,3 +241,141 @@ func TestDirectoryAfterRekey(t *testing.T) {
 		t.Fatal("the member published to the old secret's directory")
 	}
 }
+
+// TestRejectedRekeyNotListened: a rekey that doesn't count (here, by an
+// admin demoted concurrently, which the demotion rule drops) adds no
+// listener, though the node can open its secret.
+func TestRejectedRekeyNotListened(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	a2 := me(57)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(a2.Public(), "a2", roster.Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	n := x.join(t, host(t, seed), x.m1, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stale := copyRoster(t, x.r)
+	rk, err := (&roster.Writer{R: stale, Me: a2}).Rekey() // a2 doesn't know of its demotion
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).SetRole(a2.Public(), roster.Member); err != nil {
+		t.Fatal(err)
+	}
+	f0, _ := x.r.Fold()
+	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		for _, o := range append(f0.Order[1:], rk) {
+			if _, err := r.Add(o); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var counts, held bool
+	var bogus keys.Secret
+	_ = n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		f, _ := r.Fold()
+		counts = f.Counts[rk.ID()]
+		bogus, held = r.Keyring(x.m1).Secrets[rk.ID()]
+		return nil
+	})
+	if counts || !held {
+		t.Fatalf("the setup: the rekey counts=%v, its secret held=%v", counts, held)
+	}
+	if n.listensUnder(x.m1.Rendezvous(bogus, keys.PeriodOf(time.Now())).Public()) {
+		t.Fatal("a rekey that doesn't count got a listener")
+	}
+}
+
+// TestIntermediateKeptBeforeCurrentDelivered: a newcomer that learns an
+// intermediate secret while it doesn't yet hold the current one (a rekey
+// made without it, pending a deliver) still keeps the intermediate one.
+func TestIntermediateKeptBeforeCurrentDelivered(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	newcomer := me(58)
+	ow := &roster.Writer{R: x.r, Me: x.owner}
+	pre := copyRoster(t, x.r) // before the newcomer's add
+	if _, err := ow.Add(newcomer.Public(), "n", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	n := x.join(t, host(t, seed), newcomer, x.r) // on G0
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rk1, err := ow.Rekey() // G1, sealed to the newcomer
+	if err != nil {
+		t.Fatal(err)
+	}
+	// G2, concurrent, made without the newcomer, and later in the order.
+	pw := &roster.Writer{R: pre, Me: x.owner}
+	for i := range 4 {
+		if _, err := pw.Invite(me(byte(200+i)).Public(), 1, time.Now().Add(time.Hour).Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rk2, err := pw.Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp, _ := pre.Fold()
+	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		for _, o := range append(fp.Order[1:], rk1, rk2) {
+			if _, err := r.Add(o); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var current roster.ID
+	var g1 keys.Secret
+	var holdsCurrent bool
+	_ = n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		f, _ := r.Fold()
+		current = f.Current
+		k := r.Keyring(newcomer)
+		g1 = k.Secrets[rk1.ID()]
+		_, holdsCurrent = k.Secrets[f.Current]
+		return nil
+	})
+	if current != rk2.ID() || holdsCurrent {
+		t.Fatalf("the setup: current is rk2=%v, held=%v", current == rk2.ID(), holdsCurrent)
+	}
+	if !n.listensUnder(newcomer.Rendezvous(g1, keys.PeriodOf(time.Now())).Public()) {
+		t.Fatal("the intermediate secret was dropped while the current one was pending")
+	}
+}
+
+// TestSightingsPublishedUnderTheirSecret: a member reached under the old
+// secret isn't published as seen under the new one.
+func TestSightingsPublishedUnderTheirSecret(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	fixed := time.Now()
+	x.clock = func() time.Time { return fixed }
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	x.join(t, host(t, seed), x.m1, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := owner.Call(ctx, x.m1.Public()); err != nil { // reached under G0
+		t.Fatal(err)
+	}
+	rekey(t, ctx, owner) // the member hasn't heard
+	if err := owner.Publish(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := owner.Directory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[x.owner.Public()]; !ok {
+		t.Fatal("the owner's own entry is missing")
+	}
+	if _, ok := got[x.m1.Public()]; ok {
+		t.Fatal("a member reached under the old secret was published under the new one")
+	}
+}

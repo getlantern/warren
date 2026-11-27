@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"net"
 	"slices"
@@ -252,7 +253,7 @@ type Node struct {
 	ready atomic.Bool
 
 	smu  sync.Mutex
-	seen map[keys.PublicKey]time.Time // member → last session with it
+	seen map[keys.PublicKey]sighting // member → last session with it
 
 	// gmu holds the group secrets: the current one and those superseded
 	// within Grace. It is taken last, under mu or lmu.
@@ -267,6 +268,12 @@ type Node struct {
 	// rekeyed is set when refresh moves to a new secret, so whoever ends
 	// the session or Do rotates the listeners onto it.
 	rekeyed atomic.Bool
+}
+
+// sighting is a session with a member: when, and under which group secret.
+type sighting struct {
+	at time.Time
+	g  keys.Secret
 }
 
 // listenKey is a rendezvous listener's secret and period.
@@ -335,7 +342,7 @@ func (n *Node) follow(g keys.Secret, newly []keys.Secret, now time.Time) bool {
 func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	cfg = withDefaults(cfg)
 	n := &Node{h: h, cfg: cfg, listening: map[listenKey]keys.Signer{}, invites: map[keys.PublicKey]*invite{},
-		seen: map[keys.PublicKey]time.Time{}, shards: cfg.Roster.Op(cfg.Roster.Group()).Shards, current: cfg.Group}
+		seen: map[keys.PublicKey]sighting{}, shards: cfg.Roster.Op(cfg.Roster.Group()).Shards, current: cfg.Group}
 	n.mu.Lock()
 	n.refresh()
 	n.mu.Unlock()
@@ -506,14 +513,23 @@ func (n *Node) refresh() {
 			n.seenKeys = map[roster.ID]bool{}
 		}
 		for id, g := range k.Secrets {
-			if !n.seenKeys[id] {
+			// Only a counting operation's secret: a keyring holds rejected
+			// ones too, and a member could otherwise fill the listener table
+			// with secrets of rekeys it had no authority to write.
+			if !n.seenKeys[id] && f.Counts[id] {
 				n.seenKeys[id] = true
 				if !first && id != f.Current {
 					newly = append(newly, g)
 				}
 			}
 		}
-		if g, ok := k.Secrets[f.Current]; ok && n.follow(g, newly, now) {
+		// Newly superseded secrets are kept even when the current one isn't
+		// held yet (pending a deliver), as they're marked seen now.
+		g, ok := k.Secrets[f.Current]
+		if !ok {
+			g = n.Group()
+		}
+		if n.follow(g, newly, now) {
 			n.rekeyed.Store(true)
 		}
 	}
@@ -710,7 +726,7 @@ func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, c
 	})
 	if err == nil {
 		n.smu.Lock()
-		n.seen[peer] = n.now()
+		n.seen[peer] = sighting{at: n.now(), g: g}
 		n.smu.Unlock()
 	}
 	n.refresh() // even a failed session may have kept a newcomer's add chain
@@ -945,7 +961,7 @@ func (n *Node) Seen() map[keys.PublicKey]time.Time {
 	defer n.smu.Unlock()
 	out := make(map[keys.PublicKey]time.Time, len(n.seen))
 	for k, v := range n.seen {
-		out[k] = v
+		out[k] = v.at
 	}
 	return out
 }
@@ -1011,8 +1027,14 @@ func (n *Node) Publish(ctx context.Context) error {
 	d := n.dir() // one snapshot of the secret, for the entries and the write
 	g := d.Group
 	entries := []directory.Entry{{Key: n.cfg.Me.Rendezvous(g, p).Public(), Seen: now}}
-	for m, t := range n.Seen() {
-		if keys.PeriodOf(t) != p {
+	n.smu.Lock()
+	seen := maps.Clone(n.seen)
+	n.smu.Unlock()
+	for m, sg := range seen {
+		// A member reached this period under this secret: one reached under
+		// another may not be on this one, so it isn't published under it.
+		t := sg.at
+		if keys.PeriodOf(t) != p || sg.g != g {
 			continue
 		}
 		if r, err := keys.Rendezvous(g, p, m); err == nil {
