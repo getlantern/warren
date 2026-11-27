@@ -429,3 +429,44 @@ func TestAddOfOwnerSpendsNothing(t *testing.T) {
 		t.Fatalf("an add of the owner spent the invite: %+v", s)
 	}
 }
+
+// TestDuplicateOfLosingAdmissionSpendsNothing: a duplicate descending only
+// from the concurrent add that lost has still seen the key admitted, so it
+// spends nothing.
+func TestDuplicateOfLosingAdmissionSpendsNothing(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	inv := invite(t, r, admin, 50, 1)
+	c := r.Clone()
+	joiner := me(60).Public()
+	x, err := (&Writer{R: r, Me: admin}).Add(joiner, "j", Member, keys.PublicKey{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := (&Writer{R: c, Me: owner}).Add(joiner, "j", Member, keys.PublicKey{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(y); err != nil {
+		t.Fatal(err)
+	}
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loser := x
+	if !f.Counts[y.ID()] {
+		loser = y
+	}
+	if f.Counts[loser.ID()] {
+		t.Fatal("both adds counted")
+	}
+	o := &Op{Group: r.group, Kind: Add, Parents: []ID{loser.ID()}, Lamport: loser.Lamport + 1,
+		Target: joiner, Role: Member, Name: "j", Invite: inv}
+	o.Sign(admin)
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); s.Used != 0 {
+		t.Fatalf("a duplicate of the losing admission spent the invite: %+v", s)
+	}
+}

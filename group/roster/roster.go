@@ -537,9 +537,39 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 	}
 	ever := map[keys.PublicKey]bool{}
 	var live []*InviteState // invites recorded since the last counting remove
-	// admitted is each key's counting adds: the one that admitted it, and
-	// any concurrent one at a higher role that won.
-	admitted := map[keys.PublicKey][]ID{}
+	// attempts is, per key, every add that admitted it in its author's
+	// view: the counting ones, and authorized concurrent duplicates. An op
+	// descending from one has seen the key admitted. sees asks that,
+	// memoized per op and key; ops come in topological order, so an
+	// ancestor's attempts are settled before anyone asks.
+	attempts := map[keys.PublicKey]map[ID]bool{}
+	attempt := func(t keys.PublicKey, id ID) {
+		if attempts[t] == nil {
+			attempts[t] = map[ID]bool{}
+		}
+		attempts[t][id] = true
+	}
+	type seeKey struct {
+		op ID
+		t  keys.PublicKey
+	}
+	seesMemo := map[seeKey]bool{}
+	var sees func(o *Op, t keys.PublicKey) bool
+	sees = func(o *Op, t keys.PublicKey) bool {
+		k := seeKey{o.id, t}
+		if v, ok := seesMemo[k]; ok {
+			return v
+		}
+		v := false
+		for _, p := range o.Parents {
+			if po := r.ops[p]; attempts[t][p] || (po != nil && sees(po, t)) {
+				v = true
+				break
+			}
+		}
+		seesMemo[k] = v
+		return v
+	}
 	// granted is the operation that made each admin one: its counting add
 	// as admin, or its latest promotion.
 	granted := map[keys.PublicKey]ID{}
@@ -582,19 +612,22 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 				// Concurrent with the add that admitted the key, not a role
 				// change; both sealed their role's keys, so the higher wins.
 				ok = true
-			case cur != None && cur != Owner && res.Invites[o.Invite] != nil &&
-				!slices.ContainsFunc(admitted[o.Target], func(a ID) bool { return r.descends(o.id, a) }):
-				// Concurrent with the adds that admitted the key, at no
+			case cur != None && cur != Owner && !sees(o, o.Target):
+				// Concurrent with every add that admitted the key, at no
 				// higher a role: it doesn't count, but its approval was
-				// given, so it still spends its invite (see InviteState).
-				// Descent from those adds is asked, not the op's view: the
-				// fold memoizes it, where a view refolds the op's history.
-				res.Invites[o.Invite].Used++
+				// given, so it still spends its invite (see InviteState),
+				// and an op descending from it has seen the key admitted.
+				// Descent is asked (sees), not the op's view, which would
+				// refold its history.
+				attempt(o.Target, o.id)
+				if s := res.Invites[o.Invite]; s != nil {
+					s.Used++
+				}
 			}
 			if ok {
 				res.Roles[o.Target] = o.Role
 				ever[o.Target] = true
-				admitted[o.Target] = append(admitted[o.Target], o.id)
+				attempt(o.Target, o.id)
 				if o.Role == Admin {
 					granted[o.Target] = o.id
 				}
