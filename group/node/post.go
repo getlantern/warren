@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/getlantern/warren/group/keys"
@@ -41,9 +40,6 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 				return roster.ErrNotAllowed
 			}
 		}
-		if n.flushErr != nil {
-			return fmt.Errorf("%w: %w", ErrHeldFailed, n.flushErr)
-		}
 		var key keys.EpochKey
 		ok := false
 		if err == nil {
@@ -54,6 +50,9 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 				return err
 			}
 			key, ok = r.Keyring(n.cfg.Me).Epochs[f.Current]
+		}
+		if n.flushErr != nil {
+			return fmt.Errorf("%w: %w", ErrHeldFailed, n.flushErr)
 		}
 		// Behind anything held, so posts keep their order.
 		if !ok || n.paused.Load() || len(n.queue) > 0 {
@@ -117,8 +116,9 @@ func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, ke
 
 // ownLog reports why nothing appended to this member's own log now would
 // show: memberlog.ErrForked if it's forked, ErrHidden if it holds entries
-// past what shows (under an epoch that stopped counting, say); nil if
-// something would. logs must have been given the current fold. mu held.
+// past what shows (under an epoch that stopped counting, say, or past a
+// gap: an entry after the head would fork against them); nil if something
+// would. logs must have been given the current fold. mu held.
 func (n *Node) ownLog(logs *memberlog.Set) error {
 	l := logs.Log(n.cfg.Me.Public())
 	if l == nil {
@@ -127,7 +127,11 @@ func (n *Node) ownLog(logs *memberlog.Set) error {
 	if l.Fork() != nil {
 		return memberlog.ErrForked
 	}
-	if h, last := l.Head(), l.Last(); last != nil && (h == nil || h.ID() != last.ID()) {
+	h, last := l.Head(), l.Last()
+	if last != nil && (h == nil || h.ID() != last.ID()) {
+		return ErrHidden
+	}
+	if last == nil && l.MaxSeq() > 0 || last != nil && l.MaxSeq() > last.Seq {
 		return ErrHidden
 	}
 	return nil
@@ -157,12 +161,8 @@ func (n *Node) flush() {
 	}
 	for len(n.queue) > 0 {
 		// Each time: a write that didn't show would make the next fork.
-		if err := n.ownLog(logs); errors.Is(err, ErrHidden) {
-			n.flushErr = nil // held until the log shows again; Post says so
-			return
-		} else if err != nil {
-			n.flushErr = err
-			return
+		if n.ownLog(logs) != nil {
+			return // held until the log can take them; Post says why
 		}
 		if err := n.write(r, logs, f, key, n.queue[0].body); err != nil {
 			n.flushErr = err

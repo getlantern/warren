@@ -509,3 +509,39 @@ func TestPostOnForkedOwnLog(t *testing.T) {
 		t.Fatalf("a post on a forked own log: %v", err)
 	}
 }
+
+// TestPostPastGapInOwnLog: own entries held past a gap (a member restored
+// from older state, syncing its later entries back before the missing
+// one) refuse posts: the next entry after the head would fork against
+// them.
+func TestPostPastGapInOwnLog(t *testing.T) {
+	x := newGroup(t)
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	ctx := context.Background()
+	if err := n.Do(ctx, func(r *roster.Roster, logs *memberlog.Set) error {
+		f, err := r.Fold()
+		if err != nil {
+			return err
+		}
+		key := r.Keyring(x.m1).Epochs[f.Current]
+		var prev *memberlog.Entry
+		for i := range 3 {
+			e, err := memberlog.Write(x.m1, r.Group(), prev, f.Current, key, memberlog.App, []byte{byte(i)})
+			if err != nil {
+				return err
+			}
+			if i != 1 { // the second is the one still missing
+				if _, err := logs.Add(e); err != nil {
+					return err
+				}
+			}
+			prev = e
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Post(ctx, []byte("new")); !errors.Is(err, ErrHidden) {
+		t.Fatalf("a post past a gap in the own log: %v", err)
+	}
+}
