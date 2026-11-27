@@ -178,10 +178,10 @@ func TestJoinTwiceRefusedAfterRekey(t *testing.T) {
 	}
 }
 
-// TestNoJoinsWithoutNewListeners: when the listener table is too full to
-// listen under a new secret, the admin refuses joins rather than hand out
-// a secret it doesn't listen under.
-func TestNoJoinsWithoutNewListeners(t *testing.T) {
+// TestCurrentSecretTakesPriority: with the listener table full, a rekey's
+// new secret takes the old secret's listeners, so joins after it still
+// work.
+func TestCurrentSecretTakesPriority(t *testing.T) {
 	seed := network(t, 10)
 	x := newGroup(t)
 	h := host(t, seed)
@@ -197,12 +197,39 @@ func TestNoJoinsWithoutNewListeners(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	old := owner.Group()
 	rekey(t, ctx, owner)
-	if owner.listensUnder(x.owner.Rendezvous(owner.Group(), keys.PeriodOf(time.Now())).Public()) {
-		t.Fatal("the new secret's listeners fit a full table")
+	p := keys.PeriodOf(time.Now())
+	if !owner.listensUnder(x.owner.Rendezvous(owner.Group(), p).Public()) {
+		t.Fatal("the new secret didn't take the old one's listeners")
 	}
-	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(56), "n", joinCfg); !errors.Is(err, join.ErrAdminBehind) {
-		t.Fatalf("a join without listeners on the new secret: %v, want ErrAdminBehind", err)
+	if owner.listensUnder(x.owner.Rendezvous(old, p).Public()) {
+		t.Fatal("the old secret kept its listeners in a full table")
+	}
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(56), "n", joinCfg); err != nil {
+		t.Fatalf("a join after a rekey in a full table: %v", err)
+	}
+}
+
+// TestNoJoinsWithoutCurrentListener: an admin not listening under the
+// current secret refuses joins rather than hand out a secret it doesn't
+// listen under.
+func TestNoJoinsWithoutCurrentListener(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// As if the rotation onto the current secret had failed this period.
+	owner.lmu.Lock()
+	delete(owner.listening, listenKey{owner.Group(), keys.PeriodOf(time.Now())})
+	owner.lmu.Unlock()
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(57), "n", joinCfg); !errors.Is(err, join.ErrAdminBehind) {
+		t.Fatalf("a join without a listener on the current secret: %v, want ErrAdminBehind", err)
 	}
 }
 

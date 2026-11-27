@@ -464,14 +464,23 @@ func (n *Node) rotate(ctx context.Context) error {
 		}
 	}
 	var errs []error
-	for _, g := range gs {
+	for i, g := range gs {
 		for _, q := range []uint64{p, p + 1} {
 			k := listenKey{g, q}
 			if _, ok := n.listening[k]; ok {
 				continue
 			}
 			s := n.cfg.Me.Rendezvous(g, q)
-			if err := n.h.ep.AddListener(ctx, keys.CryptoSigner(s)); err != nil {
+			err := n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
+			// The current secret is the one every up-to-date member calls:
+			// with the table full, it takes the oldest superseded secret's
+			// listeners (the secret stays in Grace for admission and calls).
+			for j := len(gs) - 1; err != nil && i == 0 && j > 0; j-- {
+				if n.dropListeners(ctx, gs[j]) {
+					err = n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
+				}
+			}
+			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
@@ -480,6 +489,19 @@ func (n *Node) rotate(ctx context.Context) error {
 	}
 	errs = append(errs, n.rotateInvites(ctx, p)...)
 	return errors.Join(errs...)
+}
+
+// dropListeners removes the rendezvous listeners under g, reporting
+// whether it removed any; lmu held.
+func (n *Node) dropListeners(ctx context.Context, g keys.Secret) bool {
+	dropped := false
+	for k, s := range n.listening {
+		if k.g == g && n.h.ep.RemoveListener(ctx, s.Public()) == nil {
+			delete(n.listening, k)
+			dropped = true
+		}
+	}
+	return dropped
 }
 
 func (n *Node) listensUnder(key keys.PublicKey) bool {
