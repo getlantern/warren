@@ -404,3 +404,64 @@ func TestHistoryNotListened(t *testing.T) {
 		t.Fatal("not listening under the current secret")
 	}
 }
+
+// TestStoppedCountingDropped: an intermediate secret kept from a rekey goes
+// once that rekey stops counting (a concurrent demotion of its author
+// arrives), so rejected rekeys can't hold listeners.
+func TestStoppedCountingDropped(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	a2 := me(59)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(a2.Public(), "a2", roster.Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	n := x.join(t, host(t, seed), x.m1, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	branch := copyRoster(t, x.r)
+	rk1, err := (&roster.Writer{R: branch, Me: a2}).Rekey() // G1, by a2
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk2, err := (&roster.Writer{R: branch, Me: x.owner}).Rekey() // G2, after it
+	if err != nil {
+		t.Fatal(err)
+	}
+	g1 := branch.Keyring(x.m1).Secrets[rk1.ID()]
+	add := func(ops ...*roster.Op) {
+		t.Helper()
+		if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+			for _, o := range ops {
+				if _, err := r.Add(o); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(rk1, rk2)
+	p := keys.PeriodOf(time.Now())
+	if !n.listensUnder(x.m1.Rendezvous(g1, p).Public()) {
+		t.Fatal("the setup: the intermediate secret isn't kept")
+	}
+	// The owner demotes a2 without having seen its rekey.
+	dm, err := (&roster.Writer{R: x.r, Me: x.owner}).SetRole(a2.Public(), roster.Member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add(dm)
+	var counts bool
+	_ = n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		f, _ := r.Fold()
+		counts = f.Counts[rk1.ID()]
+		return nil
+	})
+	if counts {
+		t.Fatal("the setup: a2's rekey still counts")
+	}
+	if n.listensUnder(x.m1.Rendezvous(g1, p).Public()) {
+		t.Fatal("a secret whose rekey stopped counting is still listened under")
+	}
+}

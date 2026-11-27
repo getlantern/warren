@@ -287,6 +287,11 @@ type listenKey struct {
 type supersededSecret struct {
 	g     keys.Secret
 	until time.Time
+	// ranOn is set for a secret the node ran on itself, kept for Grace
+	// whatever becomes of its operation (members may still be on it). The
+	// rest come from the roster each refresh, and go when their operation
+	// stops counting.
+	ranOn bool
 }
 
 // Group is the group secret the node runs on now: the roster's current one
@@ -312,36 +317,41 @@ func (n *Node) secrets(now time.Time) []keys.Secret {
 }
 
 // follow moves n to g if it isn't on it already, keeping the secret it
-// leaves for Grace, and keeps each of cands (superseded secrets, with
-// their own deadlines) not kept already. It reports whether the secrets n
-// listens under changed.
+// leaves for Grace, and replaces the secrets kept from the roster with
+// cands (superseded secrets of counting operations, with their own
+// deadlines). It reports whether the secrets n listens under changed.
 func (n *Node) follow(g keys.Secret, cands []supersededSecret, now time.Time) bool {
 	n.gmu.Lock()
 	defer n.gmu.Unlock()
-	changed := false
+	before := map[keys.Secret]bool{n.current: true}
+	for _, s := range n.superseded {
+		if now.Before(s.until) {
+			before[s.g] = true
+		}
+	}
 	var kept []supersededSecret
 	has := func(x keys.Secret) bool {
 		return slices.ContainsFunc(kept, func(s supersededSecret) bool { return s.g == x })
 	}
 	for _, s := range n.superseded {
-		if now.Before(s.until) && s.g != g {
+		if s.ranOn && now.Before(s.until) && s.g != g {
 			kept = append(kept, s)
 		}
 	}
-	if g != n.current {
-		changed = true
-		if !has(n.current) {
-			kept = append(kept, supersededSecret{g: n.current, until: now.Add(Grace)})
-		}
+	if g != n.current && !has(n.current) {
+		kept = append(kept, supersededSecret{g: n.current, until: now.Add(Grace), ranOn: true})
 	}
 	for _, c := range cands {
 		if c.g != g && now.Before(c.until) && !has(c.g) {
 			kept = append(kept, c)
-			changed = true
 		}
 	}
 	n.superseded, n.current = kept, g
-	return changed
+	after := map[keys.Secret]bool{g: true}
+	for _, s := range kept {
+		after[s.g] = true
+	}
+	return !maps.Equal(before, after)
 }
 
 // Join listens for cfg's group on the host under this and the next
@@ -536,7 +546,9 @@ func (n *Node) refresh() {
 		}
 		var cands []supersededSecret
 		for id, until := range n.seenKeys {
-			if id == f.Current || !now.Before(until) {
+			// Still counting: an operation counted when first seen can stop
+			// (a concurrent demotion of its author, say).
+			if id == f.Current || !now.Before(until) || !f.Counts[id] {
 				continue
 			}
 			if g, ok := k.Secrets[id]; ok {
