@@ -118,9 +118,11 @@ A device in several groups listens under one rendezvous key per group.
 `group/node`'s `Host` puts them all on one endpoint, so one socket: a holder
 of two of the device's records sees the same address and port behind both
 and can link the memberships, even behind a shared or carrier-grade NAT.
-Separate hosts, one per group, put each on its own socket; that hides the
-link only where such a NAT puts many devices behind one address, and on a
-public address one IP behind both still links them. That is a stated non-goal for v1 (*Goals*);
+Separate hosts, one per group, give each its own socket, which removes that
+identical address-and-port signal from the records. It doesn't stop a
+holder correlating them by address: behind a shared NAT that signal is weak,
+but on a device-specific public IP one address behind both still links the
+memberships. That is a stated non-goal for v1 (*Goals*);
 routing each group's listening through different relays could close it
 later.
 

@@ -200,6 +200,14 @@ func TestMembersSyncOverNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-ticking
+	// Sightings from this first call, before the reverse call could make them.
+	if _, ok := a.Seen()[x.m2.Public()]; !ok {
+		t.Fatal("the caller didn't record reaching the callee")
+	}
+	eventually(t, "the callee didn't record being reached", func() bool {
+		_, ok := b.Seen()[x.m1.Public()]
+		return ok
+	})
 	eventually(t, "the callee's session didn't end", func() bool { return !b.active.Load() })
 	if err := b.Call(ctx, x.m1.Public()); err != nil {
 		t.Fatalf("a second session, the other way: %v", err)
@@ -551,7 +559,11 @@ func TestBadPreambleEndsServe(t *testing.T) {
 	if _, err := stream.Write([]byte{'?'}); err != nil {
 		t.Fatal(err)
 	}
+	start := time.Now()
 	eventually(t, "the callee kept serving a stream with a bad preamble", func() bool { return b.h.serving.Load() == 0 })
+	if d := time.Since(start); d > b.cfg.CallTimeout {
+		t.Fatalf("the connection lasted %v, as if left to go idle", d)
+	}
 }
 
 // TestCallDoesntWaitOutASession: a call made while the group is in a
@@ -592,6 +604,9 @@ func TestCallAfterClose(t *testing.T) {
 	}
 	if err := a.Call(context.Background(), x.m2.Public()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("got %v, want ErrClosed", err)
+	}
+	if err := a.Call(context.Background(), x.x.Public()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("calling a stranger on a closed host: got %v, want ErrClosed", err)
 	}
 }
 
@@ -840,8 +855,8 @@ func TestJoinTwiceRefused(t *testing.T) {
 	}
 }
 
-// TestDoMakesBusy: while Do holds the roster, a session can't begin, and
-// trying leaves the group not busy.
+// TestDoMakesBusy: while Do holds the roster, a session can't begin (and
+// doesn't wait), and once Do returns, one can.
 func TestDoMakesBusy(t *testing.T) {
 	x := newGroup(t)
 	n := &Node{cfg: Config{Me: me(2), Group: x.g, Roster: copyRoster(t, x.r)}}
@@ -865,11 +880,15 @@ func TestDoMakesBusy(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("begin waited on Do")
 	}
-	if n.active.Load() {
-		t.Fatal("a refused begin left the group busy")
-	}
 	close(release)
 	<-out
+	if n.active.Load() {
+		t.Fatal("the group stayed busy after Do")
+	}
+	if !n.begin() {
+		t.Fatal("a session couldn't begin after Do")
+	}
+	n.end()
 }
 
 // TestNoFallbackForAbsentMember: a member that isn't listening at all isn't

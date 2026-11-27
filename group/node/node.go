@@ -194,8 +194,8 @@ type Node struct {
 	// mu holds the roster, logs and admission set; a session holds it
 	// throughout, and other readers only briefly.
 	mu sync.Mutex
-	// active is set while a session runs: one at a time per group. No
-	// session waits for another: a call in that finds one running is
+	// active is set while a session or a Do runs: one at a time per group.
+	// No session waits for another: a call in that finds one running is
 	// answered busy, and a call out gives up with ErrBusy. A session that
 	// waited could hold up its peer's, and two members calling each other
 	// could each end up waiting on the other until the session timed out.
@@ -409,8 +409,19 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 			finish()
 		}
 	}
+	// The idle timer can fire just as a stream arrives and resets it, so
+	// it checks when the last one came and re-arms if that was too recent.
 	idleFor := 2 * n.cfg.CallTimeout
-	idle := time.AfterFunc(idleFor, giveUp)
+	var lastStream atomic.Int64 // UnixNano
+	lastStream.Store(time.Now().UnixNano())
+	var idle *time.Timer
+	idle = time.AfterFunc(idleFor, func() {
+		if left := idleFor - time.Since(time.Unix(0, lastStream.Load())); left > 0 {
+			idle.Reset(left)
+			return
+		}
+		giveUp()
+	})
 	defer idle.Stop()
 	// Handlers are joined before serve returns, so Host.Close waits for a
 	// session to end and not just for serve.
@@ -433,6 +444,7 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 		stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 		defer stop()
 		// Each try is a stream; one session per connection.
+		lastStream.Store(time.Now().UnixNano())
 		idle.Reset(idleFor)
 		try := streams.Add(1)
 		if dest != streamName || try > busyTries {
@@ -495,14 +507,9 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 // begin starts a session unless one is running; see active.
 func (n *Node) begin() bool {
 	if !n.active.CompareAndSwap(false, true) {
-		return false
+		return false // a session, or a Do
 	}
-	// A Do holding mu makes the group busy too: waiting on it couldn't be
-	// cancelled, not even by Close.
-	if !n.mu.TryLock() {
-		n.active.Store(false)
-		return false
-	}
+	n.mu.Lock() // held otherwise only by a refresh, briefly
 	return true
 }
 
@@ -537,8 +544,14 @@ func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, c
 // with its sessions: change or read them only through Do. It waits for a
 // running session to end, and refreshes what the group admits afterwards.
 func (n *Node) Do(fn func(*roster.Roster, *memberlog.Set) error) error {
+	// Do claims the group as a session does, so a session finds it busy
+	// rather than waiting on a callback nothing can cancel; Do itself waits
+	// its turn.
+	for !n.active.CompareAndSwap(false, true) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	defer n.end()
 	err := fn(n.cfg.Roster, n.cfg.Logs)
 	n.refresh()
 	return err
@@ -574,6 +587,11 @@ func (n *Node) linger(ctx context.Context, stream net.Conn) {
 // key for calling it. A member that answers, or that isn't listening at
 // all, isn't called again.
 func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
+	ctx, finished, err := n.h.call(ctx)
+	if err != nil {
+		return err
+	}
+	defer finished()
 	roles, err := n.view()
 	if err != nil {
 		return err
@@ -581,11 +599,6 @@ func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
 	if roles[member] == roster.None {
 		return ErrNotMember
 	}
-	ctx, finished, err := n.h.call(ctx)
-	if err != nil {
-		return err
-	}
-	defer finished()
 	p := keys.PeriodOf(n.now())
 	callee, err := keys.Rendezvous(n.cfg.Group, p, member)
 	if err != nil {
@@ -685,13 +698,13 @@ func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) (time.
 // answer writes the preamble and reads the callee's answer, waiting no
 // longer than a call.
 func (n *Node) answer(ctx context.Context, stream net.Conn) error {
-	if _, err := stream.Write([]byte{preamble}); err != nil {
-		return err
-	}
 	t := time.AfterFunc(n.cfg.CallTimeout, func() { _ = stream.Close() })
 	defer t.Stop()
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
+	if _, err := stream.Write([]byte{preamble}); err != nil {
+		return err
+	}
 	var b [1]byte
 	if _, err := io.ReadFull(stream, b[:]); err != nil {
 		return err
