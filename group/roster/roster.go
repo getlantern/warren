@@ -6,6 +6,7 @@ import (
 	"container/heap"
 	"errors"
 	"slices"
+	"time"
 
 	"github.com/getlantern/warren/group/keys"
 )
@@ -303,6 +304,35 @@ type Result struct {
 	Owner   keys.PublicKey
 	Current ID // the key-making operation whose keys are current
 	Passes  int
+	// Invites is each recorded invite's state, by its public key.
+	Invites map[keys.PublicKey]*InviteState
+}
+
+// InviteState is an invite as the roster records it. The fold counts uses
+// and doesn't drop: two admins approving one invite at once both admit
+// their joiner, and the invite reads as overspent (Used > Uses). Every add
+// an owner or admin signs naming an invite spends a use, whether or not it
+// counts (it may duplicate a concurrent admission of the same key): an
+// approver can always spend an invite by admitting some key, so this spends
+// nothing it couldn't, and it needs no fold of the add's own view. Expiry
+// is checked by the approving admin's clock (Usable), as operations carry
+// no time.
+type InviteState struct {
+	Op      ID // the invite operation
+	Expires int64
+	Uses    uint32
+	// Used is the approvals that named it: every add an owner or admin
+	// signed naming it, counting or not, and counting rejoins' delivers by
+	// an owner or admin.
+	Used uint32
+	// Dead is set once a counting remove comes after the invite in the
+	// total order: invites issued before a removal are refused after it.
+	Dead bool
+}
+
+// Usable reports whether the invite may admit another joiner at now.
+func (s *InviteState) Usable(now time.Time) bool {
+	return !s.Dead && s.Used < s.Uses && now.Unix() < s.Expires
 }
 
 // tiebreak orders operations the total order can't tell apart otherwise.
@@ -325,6 +355,35 @@ func (h *ready) Pop() any {
 	o := old[len(old)-1]
 	*h = old[:len(old)-1]
 	return o
+}
+
+// countInvite applies a counting operation, by an author counting in role
+// author, to the invites: records an invite, spends one of a rejoin's
+// deliver, or kills those before a remove (an add spends in apply). Only an
+// owner or admin, who approves invites, spends one: any member may deliver,
+// and a member's deliver naming an invite would otherwise use it up with
+// no one joining.
+// live holds the invites recorded since the last counting remove, the only
+// ones a remove has left to kill, and is returned updated.
+func countInvite(res *Result, live []*InviteState, o *Op, author Role) []*InviteState {
+	switch o.Kind {
+	case Invite:
+		if _, ok := res.Invites[o.Invite]; !ok { // the first record stands
+			s := &InviteState{Op: o.id, Expires: o.Expires, Uses: o.Uses}
+			res.Invites[o.Invite] = s
+			live = append(live, s)
+		}
+	case Deliver:
+		if s := res.Invites[o.Invite]; s != nil && (author == Owner || author == Admin) {
+			s.Used++
+		}
+	case Remove:
+		for _, s := range live {
+			s.Dead = true
+		}
+		live = live[:0]
+	}
+	return live
 }
 
 // order is the total order: a topological order of the causal graph that,
@@ -420,7 +479,7 @@ func (r *Roster) fold() (*Result, error) {
 		}
 		for k, grants := range res.Grants {
 			ops := byAuthor[k]
-			if !slices.ContainsFunc(ops, func(o *Op) bool { return o.Kind.needsAdmin() }) {
+			if !slices.ContainsFunc(ops, func(o *Op) bool { return o.needsAdmin() }) {
 				continue // nothing of k's needs the authority a demotion takes
 			}
 			for i, d := range grants {
@@ -429,7 +488,7 @@ func (r *Roster) fold() (*Result, error) {
 				}
 				h := r.History(d.id)
 				for _, o := range ops {
-					if !o.Kind.needsAdmin() || h[o.id] {
+					if !o.needsAdmin() || h[o.id] {
 						continue
 					}
 					restored := false
@@ -482,8 +541,10 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 	res := &Result{
 		Order: order, Counts: map[ID]bool{}, Roles: map[keys.PublicKey]Role{},
 		Removed: map[keys.PublicKey]ID{}, Grants: map[keys.PublicKey][]*Op{}, As: map[ID]Role{},
+		Invites: map[keys.PublicKey]*InviteState{},
 	}
 	ever := map[keys.PublicKey]bool{}
+	var live []*InviteState // invites recorded since the last counting remove
 	// granted is the operation that made each admin one: its counting add
 	// as admin, or its latest promotion.
 	granted := map[keys.PublicKey]ID{}
@@ -517,6 +578,11 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 			can := author == Owner || (author == Admin && o.Role != Admin)
 			if !can || (o.Role != Member && o.Role != Mirror && o.Role != Admin) {
 				break
+			}
+			// An approver's add spends the invite it names, whether or not
+			// it counts (see InviteState).
+			if s := res.Invites[o.Invite]; s != nil {
+				s.Used++
 			}
 			cur := res.Roles[o.Target]
 			switch {
@@ -564,6 +630,7 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 		}
 		res.Counts[o.id] = ok
 		if ok {
+			live = countInvite(res, live, o, author)
 			res.As[o.id] = author
 			if o.Kind == Genesis {
 				res.As[o.id] = Owner

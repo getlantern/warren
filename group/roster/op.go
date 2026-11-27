@@ -19,6 +19,8 @@ const (
 	MaxName = 256
 	// MaxShards bounds the directory's shard count.
 	MaxShards = 1 << 16
+	// MaxUses bounds an invite's uses.
+	MaxUses = 1 << 16
 	// MaxOpBytes bounds an operation's encoding: room for a rekey sealed to
 	// thousands of members, or an add carrying thousands of epoch keys.
 	MaxOpBytes = 1 << 20
@@ -91,6 +93,13 @@ func (k Kind) needsAdmin() bool {
 	return k == Add || k == Remove || k == Rekey || k == SetRole || k == Invite
 }
 
+// needsAdmin reports whether the operation needs admin authority: its kind
+// does, or it is a deliver that answers an invite, which spends one of the
+// invite's uses (any member may deliver otherwise).
+func (o *Op) needsAdmin() bool {
+	return o.Kind.needsAdmin() || (o.Kind == Deliver && o.Invite != keys.PublicKey{})
+}
+
 // Seal is a box of keys sealed to one member key. Holds lists, in the
 // clear, which keys the box carries, so other members can tell what the
 // recipient holds without opening it. Only the recipient can check it, so
@@ -132,7 +141,8 @@ type Op struct {
 	// Invite is, in an invite, the invite's public key; in an add or a
 	// rejoin's deliver, the invite it answers, if any.
 	Invite  keys.PublicKey
-	Expires int64 // invite: Unix seconds
+	Expires int64  // invite: Unix seconds
+	Uses    uint32 // invite: how many adds and rejoins it admits
 
 	// CommitSecret and CommitEpoch commit to the keys a key-making
 	// operation makes (keys.CommitSecret, keys.CommitEpoch).
@@ -226,6 +236,9 @@ func (o *Op) encode(withSig bool) []byte {
 	if o.Expires != 0 {
 		d = append(d, pair("e", num(o.Expires)))
 	}
+	if o.Uses != 0 {
+		d = append(d, pair("u", num(int64(o.Uses))))
+	}
 	if o.Kind.makesKeys() {
 		d = append(d, pair("cg", str(o.CommitSecret[:])), pair("ce", str(o.CommitEpoch[:])))
 	}
@@ -260,6 +273,7 @@ func (o *Op) fieldsFitKind() bool {
 		!has(o.LogSeq != 0 || o.LogHead != [32]byte{}, Remove),
 		!has(o.Invite != zero, Invite, Add, Deliver),
 		!has(o.Expires != 0, Invite),
+		!has(o.Uses != 0, Invite),
 		!has(len(o.Seals) != 0, Genesis, Add, Remove, Rekey, Deliver):
 		return false
 	}
@@ -269,7 +283,7 @@ func (o *Op) fieldsFitKind() bool {
 	case Add, SetRole:
 		return o.Role != None
 	case Invite:
-		return o.Invite != zero && o.Expires > 0
+		return o.Invite != zero && o.Expires > 0 && o.Uses > 0
 	}
 	return true
 }
@@ -365,6 +379,10 @@ func Decode(b []byte) (*Op, error) {
 			n, good := nonneg(val)
 			ok = good
 			o.Expires = n
+		case "u":
+			n, good := nonneg(val)
+			ok = good && n <= MaxUses
+			o.Uses = uint32(n)
 		case "cg":
 			ok = key32(o.CommitSecret[:], val)
 		case "ce":

@@ -501,7 +501,8 @@ secret** `I`, an expiry, the group's display name, and a few bootstrap hints
 carries neither `G` nor any member key.
 
 - The admin records the invite in the roster as an `invite` operation (the
-  invite public key and expiry).
+  invite public key, its uses, and its expiry). An invite key is recorded
+  once; the first record stands.
 - While the invite is valid, the admin listens under the invite key blinded
   per period, as in *Identity* but with the factor derived from
   `HKDF(I, "invite blind" ‖ p)` instead of from `G`. The invitee computes
@@ -521,7 +522,17 @@ carries neither `G` nor any member key.
   invite's uses, so a single-use invite is spent by the first of either;
   since both are roster operations, every admin counts the uses alike. All
   invites are refused after expiry, and invites issued before a removal
-  are refused after it (*Removal*).
+  are refused after it (*Removal*): every member folds the same total
+  order, so they agree which invites a removal came after.
+- The fold counts uses and doesn't drop: two admins approving one invite at
+  once both admit their joiner, and the invite reads as overspent. Dropping
+  the second `add` would undo an admission its joiner was already told of.
+  Every `add` an owner or admin signs naming an invite spends a use, even
+  one that doesn't count (two admins admitting one joiner at once): an
+  approver can always spend an invite by admitting some key, so this
+  spends nothing it couldn't, and needs no fold of the `add`'s own view.
+  Operations carry no time, so expiry is the approving admin's check, by
+  its clock, not the fold's.
 
 **Rejoining.** A member offline past the grace window (*Removal*, step 4)
 comes back through an invite too, issued after it was last online and

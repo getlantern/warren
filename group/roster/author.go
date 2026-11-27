@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"time"
 
 	"github.com/getlantern/warren/group/keys"
 )
@@ -33,6 +34,26 @@ func Found(founder *keys.Identity, name string, shards uint32) (*Roster, error) 
 type Writer struct {
 	R  *Roster
 	Me *keys.Identity
+	// Now is the clock an invite's expiry is checked against; nil means
+	// time.Now.
+	Now func() time.Time
+}
+
+func (w *Writer) now() time.Time {
+	if w.Now != nil {
+		return w.Now()
+	}
+	return time.Now()
+}
+
+// inviteUsable reports whether an add or deliver may name invite: none, or
+// one the roster records that is still usable (InviteState.Usable).
+func (w *Writer) inviteUsable(f *Result, invite keys.PublicKey) bool {
+	if invite == (keys.PublicKey{}) {
+		return true
+	}
+	s := f.Invites[invite]
+	return invite.Valid() == nil && s != nil && s.Usable(w.now())
 }
 
 func (w *Writer) base(kind Kind) *Op {
@@ -124,7 +145,7 @@ func (w *Writer) Add(target keys.PublicKey, name string, role Role, invite keys.
 	}
 	a := f.Roles[w.Me.Public()]
 	can := a == Owner || (a == Admin && role != Admin)
-	if invite != (keys.PublicKey{}) && invite.Valid() != nil {
+	if !w.inviteUsable(f, invite) {
 		return nil, ErrNotAllowed
 	}
 	_, haveG := k.Secrets[f.Current]
@@ -186,15 +207,16 @@ func (w *Writer) Rekey() (*Op, error) {
 
 // Deliver seals target the current group secret and, unless it is a
 // mirror, every epoch key the author holds that target lacks. invite names
-// the invite a rejoin answers, if any.
+// the invite a rejoin answers, if any; only an owner or admin may name one.
 func (w *Writer) Deliver(target keys.PublicKey, invite keys.PublicKey) (*Op, error) {
 	f, k, err := w.foldWithKeys()
 	if err != nil {
 		return nil, err
 	}
 	t := f.Roles[target]
-	if f.Roles[w.Me.Public()] == None || t == None || target == w.Me.Public() ||
-		(invite != (keys.PublicKey{}) && invite.Valid() != nil) {
+	a := f.Roles[w.Me.Public()]
+	if a == None || t == None || target == w.Me.Public() || !w.inviteUsable(f, invite) ||
+		(invite != (keys.PublicKey{}) && a != Owner && a != Admin) { // only an approver answers an invite
 		return nil, ErrNotAllowed
 	}
 	has := w.holdings(f, target)
@@ -280,16 +302,19 @@ func (w *Writer) SetRole(target keys.PublicKey, role Role) (*Op, error) {
 	return w.finish(o)
 }
 
-// Invite records an invite's public key and expiry.
-func (w *Writer) Invite(invite keys.PublicKey, expires int64) (*Op, error) {
+// Invite records an invite's public key, how many adds and rejoins it
+// admits, and its expiry (Unix seconds). A key the roster already records
+// can't be reused.
+func (w *Writer) Invite(invite keys.PublicKey, uses uint32, expires int64) (*Op, error) {
 	f, err := w.fold()
 	if err != nil {
 		return nil, err
 	}
-	if a := f.Roles[w.Me.Public()]; (a != Owner && a != Admin) || invite.Valid() != nil || expires <= 0 {
+	if a := f.Roles[w.Me.Public()]; (a != Owner && a != Admin) || invite.Valid() != nil || expires <= 0 ||
+		uses == 0 || uses > MaxUses || f.Invites[invite] != nil {
 		return nil, ErrNotAllowed
 	}
 	o := w.base(Invite)
-	o.Invite, o.Expires = invite, expires
+	o.Invite, o.Expires, o.Uses = invite, expires, uses
 	return w.finish(o)
 }
