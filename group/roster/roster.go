@@ -310,16 +310,20 @@ type Result struct {
 
 // InviteState is an invite as the roster records it. The fold counts uses
 // and doesn't drop: two admins approving one invite at once both admit
-// their joiner, and the invite reads as overspent (Used > Uses). Expiry is
-// checked by the approving admin's clock (Usable), as operations carry no
-// time.
+// their joiner, and the invite reads as overspent (Used > Uses). Every add
+// an owner or admin signs naming an invite spends a use, whether or not it
+// counts (it may duplicate a concurrent admission of the same key): an
+// approver can always spend an invite by admitting some key, so this spends
+// nothing it couldn't, and it needs no fold of the add's own view. Expiry
+// is checked by the approving admin's clock (Usable), as operations carry
+// no time.
 type InviteState struct {
 	Op      ID // the invite operation
 	Expires int64
 	Uses    uint32
-	// Used is the approvals that named it: counting adds and rejoins'
-	// delivers by an owner or admin, and an authorized add concurrent with
-	// the one that admitted its target, which doesn't count but was given.
+	// Used is the approvals that named it: every add an owner or admin
+	// signed naming it, counting or not, and counting rejoins' delivers by
+	// an owner or admin.
 	Used uint32
 	// Dead is set once a counting remove comes after the invite in the
 	// total order: invites issued before a removal are refused after it.
@@ -354,10 +358,11 @@ func (h *ready) Pop() any {
 }
 
 // countInvite applies a counting operation, by an author counting in role
-// author, to the invites: records an invite, spends one of an add's or
-// deliver's, or kills those before a remove. Only an owner or admin, who
-// approves invites, spends one: any member may deliver, and a member's
-// deliver naming an invite would otherwise use it up with no one joining.
+// author, to the invites: records an invite, spends one of a rejoin's
+// deliver, or kills those before a remove (an add spends in apply). Only an
+// owner or admin, who approves invites, spends one: any member may deliver,
+// and a member's deliver naming an invite would otherwise use it up with
+// no one joining.
 // live holds the invites recorded since the last counting remove, the only
 // ones a remove has left to kill, and is returned updated.
 func countInvite(res *Result, live []*InviteState, o *Op, author Role) []*InviteState {
@@ -368,7 +373,7 @@ func countInvite(res *Result, live []*InviteState, o *Op, author Role) []*Invite
 			res.Invites[o.Invite] = s
 			live = append(live, s)
 		}
-	case Add, Deliver:
+	case Deliver:
 		if s := res.Invites[o.Invite]; s != nil && (author == Owner || author == Admin) {
 			s.Used++
 		}
@@ -540,39 +545,6 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 	}
 	ever := map[keys.PublicKey]bool{}
 	var live []*InviteState // invites recorded since the last counting remove
-	// attempts is, per key, every add that admitted it in its author's
-	// view: the counting ones, and authorized concurrent duplicates. An op
-	// descending from one has seen the key admitted. sees asks that,
-	// memoized per op and key; ops come in topological order, so an
-	// ancestor's attempts are settled before anyone asks.
-	attempts := map[keys.PublicKey]map[ID]bool{}
-	attempt := func(t keys.PublicKey, id ID) {
-		if attempts[t] == nil {
-			attempts[t] = map[ID]bool{}
-		}
-		attempts[t][id] = true
-	}
-	type seeKey struct {
-		op ID
-		t  keys.PublicKey
-	}
-	seesMemo := map[seeKey]bool{}
-	var sees func(o *Op, t keys.PublicKey) bool
-	sees = func(o *Op, t keys.PublicKey) bool {
-		k := seeKey{o.id, t}
-		if v, ok := seesMemo[k]; ok {
-			return v
-		}
-		v := false
-		for _, p := range o.Parents {
-			if po := r.ops[p]; attempts[t][p] || (po != nil && sees(po, t)) {
-				v = true
-				break
-			}
-		}
-		seesMemo[k] = v
-		return v
-	}
 	// granted is the operation that made each admin one: its counting add
 	// as admin, or its latest promotion.
 	granted := map[keys.PublicKey]ID{}
@@ -607,6 +579,11 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 			if !can || (o.Role != Member && o.Role != Mirror && o.Role != Admin) {
 				break
 			}
+			// An approver's add spends the invite it names, whether or not
+			// it counts (see InviteState).
+			if s := res.Invites[o.Invite]; s != nil {
+				s.Used++
+			}
 			cur := res.Roles[o.Target]
 			switch {
 			case cur == None && !ever[o.Target] && !sawTarget(o):
@@ -615,22 +592,10 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 				// Concurrent with the add that admitted the key, not a role
 				// change; both sealed their role's keys, so the higher wins.
 				ok = true
-			case cur != None && cur != Owner && !sees(o, o.Target):
-				// Concurrent with every add that admitted the key, at no
-				// higher a role: it doesn't count, but its approval was
-				// given, so it still spends its invite (see InviteState),
-				// and an op descending from it has seen the key admitted.
-				// Descent is asked (sees), not the op's view, which would
-				// refold its history.
-				attempt(o.Target, o.id)
-				if s := res.Invites[o.Invite]; s != nil {
-					s.Used++
-				}
 			}
 			if ok {
 				res.Roles[o.Target] = o.Role
 				ever[o.Target] = true
-				attempt(o.Target, o.id)
 				if o.Role == Admin {
 					granted[o.Target] = o.id
 				}

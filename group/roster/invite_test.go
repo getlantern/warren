@@ -368,7 +368,8 @@ func TestConcurrentApprovalsOfOneJoiner(t *testing.T) {
 			t.Fatalf("uses: %d and %d, want 1 each", f.Invites[a].Used, f.Invites[b].Used)
 		}
 	}
-	// A causal duplicate (the admin had seen the admission) spends nothing.
+	// Even a causal duplicate, hand-made (the writer refuses one), spends:
+	// any approval does, and an approver could spend it anyway.
 	d := invite(t, r, admin, 52, 1)
 	o := (&Writer{R: r, Me: admin}).base(Add)
 	o.Target, o.Role, o.Name, o.Invite = joiner, Member, "j", d
@@ -376,13 +377,17 @@ func TestConcurrentApprovalsOfOneJoiner(t *testing.T) {
 	if _, err := r.Add(o); err != nil {
 		t.Fatal(err)
 	}
-	if s := inviteState(t, r, d); s.Used != 0 {
-		t.Fatalf("a causal duplicate add spent its invite: %+v", s)
+	if s := inviteState(t, r, d); s.Used != 1 {
+		t.Fatalf("an approver's duplicate add didn't spend its invite: %+v", s)
+	}
+	if _, err := (&Writer{R: r, Me: admin, Now: clock}).Add(joiner, "j", Member, keys.PublicKey{}); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("the writer made a duplicate add: %v", err)
 	}
 }
 
 // TestFoldScalesWithDuplicateAdds: a long chain of same-role duplicate adds,
 // some naming an invite, folds without refolding each one's history.
+// Each approval naming the invite spends it.
 func TestFoldScalesWithDuplicateAdds(t *testing.T) {
 	r, _, admin, member := group(t)
 	inv := invite(t, r, admin, 50, 1)
@@ -404,8 +409,8 @@ func TestFoldScalesWithDuplicateAdds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.Invites[inv].Used != 0 {
-		t.Fatal("causal duplicate adds spent the invite")
+	if f.Invites[inv].Used != n/2 {
+		t.Fatalf("%d of %d approvals naming the invite spent it", f.Invites[inv].Used, n/2)
 	}
 	if d := time.Since(start); d > 2*time.Second && !raceEnabled { // quadratic takes seconds; linear, milliseconds
 		t.Fatalf("folding %d duplicate adds took %v", n, d)
@@ -414,59 +419,43 @@ func TestFoldScalesWithDuplicateAdds(t *testing.T) {
 	}
 }
 
-// TestAddOfOwnerSpendsNothing: an add naming the owner, who was never
-// added, can't count and spends nothing.
-func TestAddOfOwnerSpendsNothing(t *testing.T) {
-	r, owner, admin, _ := group(t)
-	inv := invite(t, r, admin, 50, 1)
-	o := (&Writer{R: r, Me: admin}).base(Add)
-	o.Target, o.Role, o.Name, o.Invite = owner.Public(), Member, "o", inv
-	o.Sign(admin)
-	if _, err := r.Add(o); err != nil {
+// TestFoldScalesWithManyDuplicateTargets: N admissions followed by one
+// same-role duplicate of each: the duplicates walk no history.
+func TestFoldScalesWithManyDuplicateTargets(t *testing.T) {
+	r, _, admin, _ := group(t)
+	w := &Writer{R: r, Me: admin}
+	const n = 500
+	var targets []keys.PublicKey
+	for i := range n {
+		var seed [32]byte
+		seed[0], seed[1] = byte(i), byte(i>>8)
+		seed[2] = 0xd7
+		k := keys.IdentityFromSeed(seed).Public()
+		targets = append(targets, k)
+		o := w.base(Add)
+		o.Target, o.Role, o.Name = k, Member, "m"
+		o.Sign(admin)
+		if _, err := r.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, k := range targets {
+		o := w.base(Add)
+		o.Target, o.Role, o.Name = k, Member, "m"
+		o.Sign(admin)
+		if _, err := r.Add(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	if _, err := r.Fold(); err != nil {
 		t.Fatal(err)
 	}
-	if s := inviteState(t, r, inv); s.Used != 0 {
-		t.Fatalf("an add of the owner spent the invite: %+v", s)
-	}
-}
-
-// TestDuplicateOfLosingAdmissionSpendsNothing: a duplicate descending only
-// from the concurrent add that lost has still seen the key admitted, so it
-// spends nothing.
-func TestDuplicateOfLosingAdmissionSpendsNothing(t *testing.T) {
-	r, owner, admin, _ := group(t)
-	inv := invite(t, r, admin, 50, 1)
-	c := r.Clone()
-	joiner := me(60).Public()
-	x, err := (&Writer{R: r, Me: admin}).Add(joiner, "j", Member, keys.PublicKey{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	y, err := (&Writer{R: c, Me: owner}).Add(joiner, "j", Member, keys.PublicKey{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Add(y); err != nil {
-		t.Fatal(err)
-	}
-	f, err := r.Fold()
-	if err != nil {
-		t.Fatal(err)
-	}
-	loser := x
-	if !f.Counts[y.ID()] {
-		loser = y
-	}
-	if f.Counts[loser.ID()] {
-		t.Fatal("both adds counted")
-	}
-	o := &Op{Group: r.group, Kind: Add, Parents: []ID{loser.ID()}, Lamport: loser.Lamport + 1,
-		Target: joiner, Role: Member, Name: "j", Invite: inv}
-	o.Sign(admin)
-	if _, err := r.Add(o); err != nil {
-		t.Fatal(err)
-	}
-	if s := inviteState(t, r, inv); s.Used != 0 {
-		t.Fatalf("a duplicate of the losing admission spent the invite: %+v", s)
+	// The admissions dominate, as in TestFoldScalesWithAdmissions; the
+	// duplicates, naming no invite, add almost nothing.
+	if d := time.Since(start); d > time.Second && !raceEnabled {
+		t.Fatalf("folding %d admissions and their duplicates took %v", n, d)
+	} else {
+		t.Logf("folded in %v", d)
 	}
 }
