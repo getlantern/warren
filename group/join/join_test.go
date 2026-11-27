@@ -163,7 +163,7 @@ func TestRefusals(t *testing.T) {
 			}, want: ErrBadProof},
 		"declined": {id: func(*fixture) *keys.Identity { return me(9) },
 			adjust: func(*fixture) func(*AdminConfig, *JoinConfig) {
-				return func(a *AdminConfig, _ *JoinConfig) { a.Approve = func(Request) bool { return false } }
+				return func(a *AdminConfig, _ *JoinConfig) { a.Approve = func(context.Context, Request) bool { return false } }
 			}, want: ErrNotApproved},
 		"expired": {id: func(*fixture) *keys.Identity { return me(9) },
 			adjust: func(*fixture) func(*AdminConfig, *JoinConfig) {
@@ -431,7 +431,7 @@ func TestExpiresDuringApproval(t *testing.T) {
 		}
 		_, _, op, jerr, serr := x.run(t, id, rejoin, func(a *AdminConfig, _ *JoinConfig) {
 			a.Now = func() time.Time { return clockNow }
-			a.Approve = func(Request) bool { clockNow = now.Add(time.Hour); return true }
+			a.Approve = func(context.Context, Request) bool { clockNow = now.Add(time.Hour); return true }
 		})
 		if !errors.Is(jerr, ErrInviteUnusable) || !errors.Is(serr, ErrInviteUnusable) || op != nil {
 			t.Fatalf("rejoin=%v: got %v / %v, want ErrInviteUnusable", rejoin, jerr, serr)
@@ -565,7 +565,7 @@ func TestAnswerLimits(t *testing.T) {
 func TestApproveRemovesRejoiner(t *testing.T) {
 	x := group(t, 2)
 	r, _, op, jerr, serr := x.run(t, x.member, true, func(a *AdminConfig, _ *JoinConfig) {
-		a.Approve = func(Request) bool {
+		a.Approve = func(context.Context, Request) bool {
 			if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Remove(x.member.Public(), 0, [32]byte{}); err != nil {
 				t.Error(err)
 			}
@@ -589,7 +589,7 @@ func TestRetryAfterLostAnswer(t *testing.T) {
 	before := len(x.r.IDs())
 	r, _, op, jerr, serr := x.run(t, id, false, func(a *AdminConfig, _ *JoinConfig) {
 		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
-		a.Approve = func(Request) bool { t.Error("a retry was put to Approve again"); return false }
+		a.Approve = func(context.Context, Request) bool { t.Error("a retry was put to Approve again"); return false }
 	})
 	if jerr != nil || serr != nil {
 		t.Fatalf("retry: %v / %v", jerr, serr)
@@ -745,7 +745,7 @@ func TestRetryRejoin(t *testing.T) {
 	before := len(x.r.IDs())
 	r, _, op, jerr, serr := x.run(t, x.member, true, func(a *AdminConfig, _ *JoinConfig) {
 		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
-		a.Approve = func(Request) bool { t.Error("a retry was put to Approve"); return false }
+		a.Approve = func(context.Context, Request) bool { t.Error("a retry was put to Approve"); return false }
 	})
 	if jerr != nil || serr != nil || r == nil {
 		t.Fatalf("retry: %v / %v", jerr, serr)
@@ -940,7 +940,7 @@ func TestRetryRosterOnlyRejoin(t *testing.T) {
 	late := func(a *AdminConfig, j *JoinConfig) {
 		remember(a, j)
 		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
-		a.Approve = func(Request) bool { t.Error("a retry was put to Approve"); return false }
+		a.Approve = func(context.Context, Request) bool { t.Error("a retry was put to Approve"); return false }
 	}
 	if r, _, op, jerr, serr := x.run(t, x.member, true, late); jerr != nil || serr != nil || r == nil || op != nil {
 		t.Fatalf("retry of a roster-only rejoin: %v / %v", jerr, serr)
@@ -955,5 +955,55 @@ func TestRetryRosterOnlyRejoin(t *testing.T) {
 		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
 	}); !errors.Is(jerr, ErrInviteUnusable) {
 		t.Fatalf("a member the invite never answered rode on another's: %v", jerr)
+	}
+}
+
+// TestApproveAfterCancel: an approval that returns yes after the session's
+// context ended commits nothing.
+func TestApproveAfterCancel(t *testing.T) {
+	x := group(t, 1)
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	iv := x.issued.Invite
+	id := me(9)
+	go func() { _, _ = Join(context.Background(), a, JoinConfig{Invite: iv, Me: id, Secret: secret}) }()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := Verify(ctx, b, iv, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(x.r.IDs())
+	op, err := Answer(ctx, b, AdminConfig{Roster: x.r, Me: x.admin, Invite: iv, Secret: secret, Now: clock,
+		Approve: func(context.Context, Request) bool { cancel(); return true }}, req)
+	if !errors.Is(err, context.Canceled) || op != nil || len(x.r.IDs()) != before {
+		t.Fatalf("an approval after cancellation: op=%v err=%v", op, err)
+	}
+}
+
+// TestCancelledRetryCommitsNothing: a retry that would redeliver missed
+// keys commits nothing once the session's context has ended.
+func TestCancelledRetryCommitsNothing(t *testing.T) {
+	x := group(t, 1)
+	joiner := me(9)
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin, Now: clock}).Add(joiner.Public(), "j", roster.Member, x.issued.Invite.Key); err != nil {
+		t.Fatal(err) // as if the answer to this add was lost
+	}
+	x.missRekey(t) // so a retry would deliver
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	iv := x.issued.Invite
+	go func() { _, _ = Join(context.Background(), a, JoinConfig{Invite: iv, Me: joiner, Secret: secret}) }()
+	req, err := Verify(context.Background(), b, iv, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := len(x.r.IDs())
+	op, err := Answer(ctx, b, AdminConfig{Roster: x.r, Me: x.admin, Invite: iv, Secret: secret, Now: clock}, req)
+	if op != nil || len(x.r.IDs()) != before || !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled retry: op=%v err=%v, roster grew %d", op, err, len(x.r.IDs())-before)
 	}
 }

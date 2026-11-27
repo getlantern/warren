@@ -40,6 +40,9 @@ var (
 	// ErrTooLarge means the roster wouldn't fit in an answer the joiner
 	// takes.
 	ErrTooLarge = errors.New("join: roster too large to answer")
+	// ErrAdminBehind means the admin's runtime isn't on the group's current
+	// secret yet, so it can't give a joiner one it can reach it with.
+	ErrAdminBehind = errors.New("join: admin not on the current group secret")
 	// ErrFrame means a malformed or oversized frame.
 	ErrFrame = errors.New("join: malformed frame")
 	// ErrBadAnswer means the admin's answer doesn't hold this joiner's
@@ -67,7 +70,7 @@ const (
 )
 
 // Refusal codes in an answer, each an error a joiner gets back.
-var codes = []error{nil, ErrBadProof, ErrInviteUnusable, ErrNotApproved, ErrNotMember, ErrAlreadyMember, ErrNotAdmin, ErrNoKeys, ErrTooLarge}
+var codes = []error{nil, ErrBadProof, ErrInviteUnusable, ErrNotApproved, ErrNotMember, ErrAlreadyMember, ErrNotAdmin, ErrNoKeys, ErrTooLarge, ErrAdminBehind}
 
 func codeOf(err error) int64 {
 	for i, e := range codes {
@@ -131,7 +134,9 @@ type AdminConfig struct {
 	// Secret is the connection's shared secret (endpoint.Conn.Secret).
 	Secret []byte
 	// Approve decides a request whose proofs check out; nil approves all.
-	Approve func(Request) bool
+	// It is given the session's context, and should return when that
+	// ends: nothing is committed once it has, whatever it returns.
+	Approve func(context.Context, Request) bool
 	// Answered, if set, remembers the rejoiners this invite answered with
 	// the roster alone (Issued.Answered), so their retries are answered
 	// again: such an answer leaves no trace in the roster.
@@ -148,53 +153,107 @@ type AdminConfig struct {
 // the operation written, if any, for the caller to share with members. It
 // closes conn if ctx ends.
 func Serve(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig) (Request, *roster.Op, error) {
+	req, err := Verify(ctx, conn, cfg.Invite, cfg.Secret)
+	if err != nil {
+		return req, nil, err
+	}
+	op, err := Answer(ctx, conn, cfg, req)
+	return req, op, err
+}
+
+// Verify reads a join request on conn and checks its proofs (the MAC with
+// the invite secret, and the member-key signature), refusing a bad one. It
+// touches no roster, so a caller can bound it and run it before taking
+// the roster for Answer: a caller that can't prove the invite secret never
+// gets that far. It closes conn if ctx ends.
+func Verify(ctx context.Context, conn io.ReadWriteCloser, iv Invite, secret []byte) (Request, error) {
+	defer watch(ctx, conn)()
+	kind, b, err := readFrame(conn)
+	if err != nil {
+		return Request{}, err
+	}
+	if kind != frameRequest {
+		return Request{}, ErrFrame
+	}
+	req, mac, sig, err := decodeRequest(b)
+	if err != nil {
+		return Request{}, err
+	}
+	if !hmac.Equal(mac, macOf(iv, secret, req)) || !req.Member.Verify(proofOf(iv, secret, req), sig) {
+		_ = writeAnswer(conn, codeOf(ErrBadProof), nil)
+		return req, ErrBadProof
+	}
+	return req, nil
+}
+
+// Answer decides a request Verify passed and answers it on conn, as Serve
+// describes. It closes conn if ctx ends.
+func Answer(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig, req Request) (*roster.Op, error) {
 	defer watch(ctx, conn)()
 	now := time.Now
 	if cfg.Now != nil {
 		now = cfg.Now
 	}
-	kind, b, err := readFrame(conn)
-	if err != nil {
-		return Request{}, nil, err
-	}
-	if kind != frameRequest {
-		return Request{}, nil, ErrFrame
-	}
-	req, mac, sig, err := decodeRequest(b)
-	if err != nil {
-		return Request{}, nil, err
-	}
-	op, err := decide(cfg, now, req, mac, sig)
+	op, err := decide(ctx, cfg, now, req)
 	if err != nil {
 		_ = writeAnswer(conn, codeOf(err), nil)
-		return req, nil, err
+		return nil, err
 	}
 	f, err := cfg.Roster.Fold()
 	if err != nil {
-		return req, op, err
+		return op, err
 	}
-	return req, op, writeAnswer(conn, 0, f.Order)
+	return op, writeAnswer(conn, 0, f.Order)
 }
 
-// decide checks a request and, if it is approved, writes its operation.
-func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte) (*roster.Op, error) {
-	if !hmac.Equal(mac, macOf(cfg.Invite, cfg.Secret, req)) || !req.Member.Verify(proofOf(cfg.Invite, cfg.Secret, req), sig) {
-		return nil, ErrBadProof
+// NeedsApproval reports whether Answer would put req to Approve: it passes
+// the roster's checks now and isn't a retry. A caller deciding approval
+// itself, outside whatever holds the roster, asks this first (holding it
+// briefly), decides, then calls Answer with an Approve that returns its
+// decision: false if it never decided because this said no. Answer checks
+// everything again, and asks Approve for any request that isn't a retry,
+// so a check that failed here but passes there is refused rather than
+// admitted unasked. Answer with no Approve approves all.
+func NeedsApproval(cfg AdminConfig, req Request) bool {
+	now := time.Now
+	if cfg.Now != nil {
+		now = cfg.Now
 	}
+	replay, err := admit(cfg, req, now())
+	if err != nil || replay {
+		return false
+	}
+	f, err := cfg.Roster.Fold()
+	return err == nil && fits(f.Order)
+}
+
+// Refuse answers a request Verify passed with err's refusal code (say,
+// ErrNotApproved, for a caller that decided approval itself).
+func Refuse(ctx context.Context, conn io.ReadWriteCloser, err error) error {
+	defer watch(ctx, conn)()
+	return writeAnswer(conn, codeOf(err), nil)
+}
+
+// decide checks a request whose proofs Verify passed and, if it is
+// approved, writes its operation.
+func decide(ctx context.Context, cfg AdminConfig, now func() time.Time, req Request) (*roster.Op, error) {
 	replay, err := admit(cfg, req, now())
 	if err != nil {
 		return nil, err
 	}
 	if replay {
-		return redeliver(cfg, req, now())
+		return redeliver(ctx, cfg, req, now())
 	}
 	if f, err := cfg.Roster.Fold(); err != nil || !fits(f.Order) {
 		// Even without the op it would write, the answer couldn't be
 		// sent: don't ask Approve.
 		return nil, ErrTooLarge
 	}
-	if cfg.Approve != nil && !cfg.Approve(req) {
+	if cfg.Approve != nil && !cfg.Approve(ctx, req) {
 		return nil, ErrNotApproved
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err // the session ended while Approve decided
 	}
 	// Approve may have taken a while, or changed the roster: check again,
 	// on a fresh fold and at the one instant the writer then uses too.
@@ -203,14 +262,14 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 		return nil, err
 	}
 	if replay {
-		return redeliver(cfg, req, t)
+		return redeliver(ctx, cfg, req, t)
 	}
 	if !req.Rejoin {
-		return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+		return stage(ctx, cfg, t, func(w *roster.Writer) (*roster.Op, error) {
 			return w.Add(req.Member, req.Name, roster.Member, cfg.Invite.Key)
 		})
 	}
-	op, err := stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+	op, err := stage(ctx, cfg, t, func(w *roster.Writer) (*roster.Op, error) {
 		op, err := w.Deliver(req.Member, cfg.Invite.Key)
 		if errors.Is(err, roster.ErrNotAllowed) {
 			// Everything else Deliver checks was just checked, against the
@@ -260,9 +319,9 @@ func (a *Answered) has(k keys.PublicKey) bool {
 
 // stage writes an answer's operation, if any, on a copy of the roster at
 // t, and commits it only if the answer it makes fits what the joiner
-// takes: an approval committed that can't be sent would spend the invite
-// for nothing.
-func stage(cfg AdminConfig, t time.Time, write func(*roster.Writer) (*roster.Op, error)) (*roster.Op, error) {
+// takes (an approval committed that can't be sent would spend the invite
+// for nothing) and the session's context hasn't ended.
+func stage(ctx context.Context, cfg AdminConfig, t time.Time, write func(*roster.Writer) (*roster.Op, error)) (*roster.Op, error) {
 	c := cfg.Roster.Clone()
 	op, err := write(&roster.Writer{R: c, Me: cfg.Me, Now: func() time.Time { return t }})
 	if err != nil {
@@ -274,6 +333,9 @@ func stage(cfg AdminConfig, t time.Time, write func(*roster.Writer) (*roster.Op,
 	}
 	if !fits(f.Order) {
 		return nil, ErrTooLarge
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err // the session ended: commit nothing
 	}
 	if op != nil {
 		if _, err := cfg.Roster.Add(op); err != nil {
@@ -349,8 +411,8 @@ func answered(f *roster.Result, invite, member keys.PublicKey) bool {
 // keys the member has since come to lack (a rekey made without it, say).
 // That deliver names no invite, so it spends nothing and needs no usable
 // invite; any member may be delivered to.
-func redeliver(cfg AdminConfig, req Request, t time.Time) (*roster.Op, error) {
-	return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+func redeliver(ctx context.Context, cfg AdminConfig, req Request, t time.Time) (*roster.Op, error) {
+	return stage(ctx, cfg, t, func(w *roster.Writer) (*roster.Op, error) {
 		op, err := w.Deliver(req.Member, keys.PublicKey{})
 		if errors.Is(err, roster.ErrNotAllowed) {
 			return nil, nil // it holds every key
