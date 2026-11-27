@@ -136,15 +136,10 @@ func (l *Log) Last() *Entry {
 	return l.bySeq[seq].clone()
 }
 
-// MaxSeq returns the highest sequence number held, shown or not; 0 for
-// none. Past Last's, the log holds entries it can't chain to yet.
-func (l *Log) MaxSeq() uint64 {
-	var m uint64
-	for seq := range l.bySeq {
-		m = max(m, seq)
-	}
-	return m
-}
+// Len returns how many entries the log holds, shown or not. An unforked
+// log that isn't cut holds every entry up to Last, so more than Last's
+// sequence number means entries past a gap it can't chain to yet.
+func (l *Log) Len() int { return len(l.bySeq) }
 
 // limit is the highest sequence number the app may see: below a fork
 // point, except where a removal's head has anchored the chain past it, and

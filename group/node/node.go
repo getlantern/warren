@@ -86,9 +86,10 @@ var (
 	// error wraps why.
 	ErrHeldFailed = errors.New("node: held posts failed to append")
 	// ErrHidden means a post wasn't appended because this member's own log
-	// holds entries that don't show (under an epoch that stopped counting,
-	// say: an admin's rekey racing its demotion), and memberlog hides
-	// everything after them too.
+	// holds entries that don't show: under an epoch that stopped counting
+	// (an admin's rekey racing its demotion), which memberlog hides with
+	// everything after, or past a gap sync hasn't filled, which a new entry
+	// would fork against.
 	ErrHidden = errors.New("node: own log stalled behind entries that don't show")
 )
 

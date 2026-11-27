@@ -26,8 +26,9 @@ func (n *Node) Paused() bool { return n.paused.Load() }
 // While this member's own log holds entries past what shows, a post is
 // refused (ErrHidden), held or not, and held posts stay held: anything
 // appended would be hidden too. A forked own log refuses posts too
-// (memberlog.ErrForked). If held posts failed to append, a post is refused
-// with that failure (ErrHeldFailed) until they do or TakeHeld clears them.
+// (memberlog.ErrForked). Otherwise, if held posts failed to append, a post
+// is refused with that failure (ErrHeldFailed) until they do or TakeHeld
+// clears them.
 func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 	if len(body) > memberlog.MaxBody {
 		return false, fmt.Errorf("node: post of %d bytes is over memberlog.MaxBody", len(body))
@@ -131,8 +132,12 @@ func (n *Node) ownLog(logs *memberlog.Set) error {
 	if last != nil && (h == nil || h.ID() != last.ID()) {
 		return ErrHidden
 	}
-	if last == nil && l.MaxSeq() > 0 || last != nil && l.MaxSeq() > last.Seq {
-		return ErrHidden
+	var shown uint64
+	if last != nil {
+		shown = last.Seq
+	}
+	if uint64(l.Len()) > shown {
+		return ErrHidden // past a gap
 	}
 	return nil
 }

@@ -515,6 +515,13 @@ func TestPostOnForkedOwnLog(t *testing.T) {
 // one) refuse posts: the next entry after the head would fork against
 // them.
 func TestPostPastGapInOwnLog(t *testing.T) {
+	for _, skip := range []int{1, 0} { // a gap after the head, or no head yet
+		postPastGap(t, skip)
+	}
+}
+
+func postPastGap(t *testing.T, skip int) {
+	t.Helper()
 	x := newGroup(t)
 	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
 	ctx := context.Background()
@@ -530,7 +537,7 @@ func TestPostPastGapInOwnLog(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if i != 1 { // the second is the one still missing
+			if i != skip { // the one still missing
 				if _, err := logs.Add(e); err != nil {
 					return err
 				}
@@ -542,6 +549,6 @@ func TestPostPastGapInOwnLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := n.Post(ctx, []byte("new")); !errors.Is(err, ErrHidden) {
-		t.Fatalf("a post past a gap in the own log: %v", err)
+		t.Fatalf("a post past a gap in the own log (entry %d missing): %v", skip+1, err)
 	}
 }
