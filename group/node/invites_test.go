@@ -64,7 +64,7 @@ func TestJoinByInvite(t *testing.T) {
 	eventually(t, "the newcomer's listener was never published", func() bool {
 		var ok bool
 		n.h.Endpoint().DHT().Inspect(ctx, func(d *dht.Node) {
-			ok = len(d.HoldersFor(newcomer.Rendezvous(n.cfg.Group, keys.PeriodOf(time.Now())).Public())) > 0
+			ok = len(d.HoldersFor(newcomer.Rendezvous(n.Group(), keys.PeriodOf(time.Now())).Public())) > 0
 		})
 		return ok
 	})
@@ -472,7 +472,7 @@ func TestRejoinAfterRekey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rejoin: %v", err)
 	}
-	if n.cfg.Group != x.g {
+	if n.Group() != x.g {
 		t.Fatal("the rejoined node isn't on the current group secret")
 	}
 	eventually(t, "the rejoined node's listener was never published", func() bool {
@@ -531,10 +531,12 @@ func TestRejoinMergesSavedRoster(t *testing.T) {
 	if entries != 1 {
 		t.Fatalf("the rejoined node holds %d of the member's entries, want 1", entries)
 	}
-	// It runs on the secret the owner uses, so it can reach the owner, and
-	// pass it the rekey.
-	if n.cfg.Group != x.g {
-		t.Fatal("the rejoined node took the saved rekey's secret, which the owner doesn't use")
+	// It follows the merged roster to the saved rekey's secret, keeping the
+	// owner's (the answer's) for Grace, so it still reaches the owner, and
+	// passes it the rekey.
+	newG := saved.Keyring(x.m1).Secrets[rk.ID()]
+	if n.Group() != newG {
+		t.Fatal("the rejoined node didn't follow the merged roster's current secret")
 	}
 	eventually(t, "the rejoined node's listener was never published", func() bool {
 		var ok bool
@@ -667,10 +669,10 @@ func TestJoinIgnoresSavedState(t *testing.T) {
 	}
 }
 
-// TestAdminBehindRefuses: an admin whose node still runs on an old group
-// secret after a rekey refuses joins, rather than hand out a secret it
-// doesn't listen under.
-func TestAdminBehindRefuses(t *testing.T) {
+// TestAdminFollowsRekey: an admin node follows a rekey written through it,
+// so a joiner given the new secret reaches it (once, before nodes followed
+// a rekey, such an admin had to refuse joins).
+func TestAdminFollowsRekey(t *testing.T) {
 	seed := network(t, 10)
 	x := newGroup(t)
 	owner := x.join(t, host(t, seed), x.owner, x.r)
@@ -680,14 +682,33 @@ func TestAdminBehindRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	old := owner.Group()
 	if err := owner.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
 		_, err := (&roster.Writer{R: r, Me: x.owner}).Rekey()
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(49), "b", joinCfg); !errors.Is(err, join.ErrAdminBehind) {
-		t.Fatalf("an admin behind the current secret: %v, want ErrAdminBehind", err)
+	if owner.Group() == old {
+		t.Fatal("the admin didn't follow its own rekey")
+	}
+	joiner := me(49)
+	n, err := host(t, seed).JoinByInvite(ctx, issued.Invite, joiner, "b", joinCfg)
+	if err != nil {
+		t.Fatalf("a join after the admin's rekey: %v", err)
+	}
+	if n.Group() != owner.Group() {
+		t.Fatal("the joiner isn't on the admin's secret")
+	}
+	eventually(t, "the joiner's listener was never published", func() bool {
+		var ok bool
+		n.h.Endpoint().DHT().Inspect(ctx, func(d *dht.Node) {
+			ok = len(d.HoldersFor(joiner.Rendezvous(n.Group(), keys.PeriodOf(time.Now())).Public())) > 0
+		})
+		return ok
+	})
+	if err := n.Call(ctx, x.owner.Public()); err != nil {
+		t.Fatalf("the joiner couldn't reach the admin: %v", err)
 	}
 }
 

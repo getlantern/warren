@@ -290,10 +290,10 @@ func TestBusyCalleeAnswers(t *testing.T) {
 	a.active.Store(true)
 	p := keys.PeriodOf(time.Now())
 	callee := x.m2.Rendezvous(x.g, p).Public()
-	answered, err2 := a.callAs(ctx, x.m1.Rendezvous(x.g, p), callee)
+	connected, err2 := a.callAs(ctx, x.m1.Rendezvous(x.g, p), callee, x.g)
 	a.active.Store(false)
-	if !answered || !errors.Is(err2, ErrBusy) {
-		t.Fatalf("a busy caller: answered=%v err=%v, want ErrBusy", answered, err2)
+	if !connected || !errors.Is(err2, ErrBusy) {
+		t.Fatalf("a busy caller: connected=%v err=%v, want ErrBusy", connected, err2)
 	}
 	// None of those tries reached the callee, which lets the idle
 	// connection go well before the session would have timed out.
