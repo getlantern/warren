@@ -174,15 +174,20 @@ func TestInviteFirstRecordStands(t *testing.T) {
 }
 
 // missKeys has the owner rekey in a copy of r holding only the genesis and
-// the admin's add, so m lacks the new keys once r takes the rekey.
-func missKeys(t *testing.T, r *Roster, m *keys.Identity) {
+// the adds of the admin and also, so m lacks the new keys once r takes the
+// rekey and they hold them.
+func missKeys(t *testing.T, r *Roster, m *keys.Identity, also ...*keys.Identity) {
 	t.Helper()
 	stale, err := New(r.Op(r.Group()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, o := range r.ops {
-		if o.Kind == Add && o.Target == me(2).Public() {
+	holders := map[keys.PublicKey]bool{me(2).Public(): true}
+	for _, id := range also {
+		holders[id.Public()] = true
+	}
+	for _, o := range r.order() { // parents before children
+		if o.Kind == Add && holders[o.Target] {
 			if _, err := stale.Add(o); err != nil {
 				t.Fatal(err)
 			}
@@ -216,5 +221,88 @@ func TestInviteOnlyCounting(t *testing.T) {
 	}
 	if f.Invites[me(50).Public()] != nil {
 		t.Fatal("a member's invite was recorded")
+	}
+}
+
+// TestMemberCantSpendInvite: a member's deliver naming an invite, even an
+// empty one made by hand, spends nothing, and the writer won't make one.
+func TestMemberCantSpendInvite(t *testing.T) {
+	r, _, admin, member := group(t)
+	inv := invite(t, r, admin, 50, 1)
+	o := (&Writer{R: r, Me: member}).base(Deliver)
+	o.Target, o.Invite = member.Public(), inv
+	o.Sign(member)
+	if _, err := Decode(o.Encode()); err != nil {
+		t.Fatalf("the hand-made deliver doesn't decode: %v", err)
+	}
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); s.Used != 0 || !s.Usable(inviteNow) {
+		t.Fatalf("a member's deliver spent the invite: %+v", s)
+	}
+	other := me(61)
+	if _, err := (&Writer{R: r, Me: admin}).Add(other.Public(), "other", Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	missKeys(t, r, other, member) // the member holds keys other lacks
+	mw := &Writer{R: r, Me: member, Now: clock}
+	if _, err := mw.Deliver(other.Public(), inv); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("a member's writer answered an invite: %v", err)
+	}
+	if _, err := mw.Deliver(other.Public(), keys.PublicKey{}); err != nil {
+		t.Fatalf("a member's deliver with no invite: %v", err)
+	}
+}
+
+// TestDeliverRefusesUnusableInvite: a rejoin's deliver, to a member that
+// does lack keys, refuses an invite that isn't usable.
+func TestDeliverRefusesUnusableInvite(t *testing.T) {
+	r, owner, admin, member := group(t)
+	missKeys(t, r, member)
+	expired := invite(t, r, admin, 50, 1)
+	spent := invite(t, r, admin, 51, 1)
+	if _, err := (&Writer{R: r, Me: admin, Now: clock}).Add(me(60).Public(), "a", Member, spent); err != nil {
+		t.Fatal(err)
+	}
+	w := &Writer{R: r, Me: admin, Now: clock}
+	late := &Writer{R: r, Me: admin, Now: func() time.Time { return inviteNow.Add(time.Hour) }}
+	for name, try := range map[string]func() error{
+		"expired":    func() error { _, err := late.Deliver(member.Public(), expired); return err },
+		"spent":      func() error { _, err := w.Deliver(member.Public(), spent); return err },
+		"unrecorded": func() error { _, err := w.Deliver(member.Public(), me(59).Public()); return err },
+	} {
+		if err := try(); !errors.Is(err, ErrNotAllowed) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	victim := me(70)
+	if _, err := w.Add(victim.Public(), "victim", Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: owner}).Remove(victim.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	missKeys(t, r, member) // the remove's rekey reached the member; miss another
+	if _, err := w.Deliver(member.Public(), expired); !errors.Is(err, ErrNotAllowed) {
+		t.Errorf("dead: %v", err)
+	}
+	if _, err := w.Deliver(member.Public(), keys.PublicKey{}); err != nil {
+		t.Fatalf("a deliver with no invite, to the same member: %v", err)
+	}
+}
+
+func TestDecodeBoundsUses(t *testing.T) {
+	r, _, admin, _ := group(t)
+	for _, c := range []struct {
+		uses uint32
+		ok   bool
+	}{{MaxUses, true}, {MaxUses + 1, false}} {
+		o := (&Writer{R: r, Me: admin}).base(Invite)
+		o.Invite, o.Expires, o.Uses = me(50).Public(), inviteNow.Add(time.Hour).Unix(), c.uses
+		o.Sign(admin)
+		if _, err := Decode(o.Encode()); (err == nil) != c.ok {
+			t.Errorf("uses %d: %v", c.uses, err)
+		}
 	}
 }

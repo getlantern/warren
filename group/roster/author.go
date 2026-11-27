@@ -207,14 +207,16 @@ func (w *Writer) Rekey() (*Op, error) {
 
 // Deliver seals target the current group secret and, unless it is a
 // mirror, every epoch key the author holds that target lacks. invite names
-// the invite a rejoin answers, if any.
+// the invite a rejoin answers, if any; only an owner or admin may name one.
 func (w *Writer) Deliver(target keys.PublicKey, invite keys.PublicKey) (*Op, error) {
 	f, k, err := w.foldWithKeys()
 	if err != nil {
 		return nil, err
 	}
 	t := f.Roles[target]
-	if f.Roles[w.Me.Public()] == None || t == None || target == w.Me.Public() || !w.inviteUsable(f, invite) {
+	a := f.Roles[w.Me.Public()]
+	if a == None || t == None || target == w.Me.Public() || !w.inviteUsable(f, invite) ||
+		(invite != (keys.PublicKey{}) && a != Owner && a != Admin) { // only an approver answers an invite
 		return nil, ErrNotAllowed
 	}
 	has := w.holdings(f, target)

@@ -350,17 +350,19 @@ func (h *ready) Pop() any {
 	return o
 }
 
-// countInvite applies a counting operation to the invites: records an
-// invite, spends one of an add's or deliver's, or kills those before a
-// remove.
-func (r *Roster) countInvite(res *Result, o *Op) {
+// countInvite applies a counting operation, by an author counting in role
+// author, to the invites: records an invite, spends one of an add's or
+// deliver's, or kills those before a remove. Only an owner or admin, who
+// approves invites, spends one: any member may deliver, and a member's
+// deliver naming an invite would otherwise use it up with no one joining.
+func (r *Roster) countInvite(res *Result, o *Op, author Role) {
 	switch o.Kind {
 	case Invite:
 		if _, ok := res.Invites[o.Invite]; !ok { // the first record stands
 			res.Invites[o.Invite] = &InviteState{Op: o.id, Expires: o.Expires, Uses: o.Uses}
 		}
 	case Add, Deliver:
-		if s := res.Invites[o.Invite]; s != nil {
+		if s := res.Invites[o.Invite]; s != nil && (author == Owner || author == Admin) {
 			s.Used++
 		}
 	case Remove:
@@ -608,7 +610,7 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 		}
 		res.Counts[o.id] = ok
 		if ok {
-			r.countInvite(res, o)
+			r.countInvite(res, o, author)
 			res.As[o.id] = author
 			if o.Kind == Genesis {
 				res.As[o.id] = Owner
