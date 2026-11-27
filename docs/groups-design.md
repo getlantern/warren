@@ -511,8 +511,9 @@ carries neither `G` nor any member key.
   key. Only the admin holds the invite's private key, so only the admin can
   listen there, and one listener means no clash at holders.
 - That **join session** carries the invitee's new member key, display name,
-  and a proof that it knows `I` (a MAC over the session's secret), and
-  nothing else. The admin approves with an `add`, which delivers `G` and the
+  a proof that it knows `I` (a MAC over the session's secret), and a
+  signature over the session's secret with the member key, so no one can
+  get another's key added; nothing else. The admin approves with an `add`, which delivers `G` and the
   epoch keys sealed to the new member. The join answer also carries the
   genesis and the roster's operations (small for v1 groups), so the invitee
   can check its own `add` and compute the members' rendezvous keys. The
@@ -522,7 +523,8 @@ carries neither `G` nor any member key.
   invite's uses, so a single-use invite is spent by the first of either;
   since both are roster operations, every admin counts the uses alike. All
   invites are refused after expiry, and invites issued before a removal
-  are refused after it (*Removal*): every member folds the same total
+  are refused after it (*Removal*), but for a retry by a key the invite
+  already admitted (below): every member folds the same total
   order, so they agree which invites a removal came after.
 - The fold counts uses and doesn't drop: two admins approving one invite at
   once both admit their joiner, and the invite reads as overspent. Dropping
@@ -542,7 +544,19 @@ with it as well as proving it knows `I`. The admin checks that key is on its
 roster and not removed, and answers with a `deliver` of the current `G` and
 every epoch key it lacks (mirrors get `G` only), naming the invite and so
 spending one of its uses, plus the genesis and the roster's operations, as
-for a new member. Nothing else changes: no `add`, no
+for a new member. A rejoiner already holding every key gets the roster
+alone, with no `deliver`, and the invite isn't spent. A join or rejoin
+whose answer was lost can be asked again with the same key: an admin that
+finds an approver's `add` or `deliver` naming the invite to that key, still
+a member, answers with the roster again, plus a plain `deliver` (naming no
+invite, spending nothing) of any keys it has since come to lack, so a spent
+or expired invite can't strand it. A rejoin answered with the roster
+alone leaves no trace in the roster (the rejoiner may still need it: away
+past the grace window, it may lack the rekeys sealed to it), so the admin
+remembers such rejoiners while it serves the invite. The admin keeps the
+invite key, and keeps listening, until an hour past the invite's expiry
+(`join.RetryGrace`), even once it is spent; a retry is answered while it
+listens. Nothing else changes: no `add`, no
 removal, no rekey, and its log carries on. A removed member can't do this:
 its key is off the roster. A stolen device can, as it could use any member
 key; the admin sees which member is rejoining, and the answer to a stolen
