@@ -37,7 +37,9 @@ const streamName = "warren-group:1"
 // from, the superseded secret: a member that missed the change reaches it
 // there and gets the change by gossip (docs/groups-design.md, *Removal*,
 // step 4). Operations carry no time, so it runs from this node's own
-// observation.
+// observation. With the listener table full, the current secret takes
+// the oldest superseded one's listeners: that secret is still admitted and
+// called under for Grace, but no longer listened under.
 const Grace = 24 * time.Hour
 
 // busyTries and busyWait bound a call's tries of a busy group.
@@ -473,9 +475,10 @@ func (n *Node) rotate(ctx context.Context) error {
 			s := n.cfg.Me.Rendezvous(g, q)
 			err := n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
 			// The current secret is the one every up-to-date member calls:
-			// with the table full, it takes the oldest superseded secret's
+			// with the table full (and only then: not on a cancelled
+			// context, say), it takes the oldest superseded secret's
 			// listeners (the secret stays in Grace for admission and calls).
-			for j := len(gs) - 1; err != nil && i == 0 && j > 0; j-- {
+			for j := len(gs) - 1; errors.Is(err, dht.ErrTooManyListeners) && i == 0 && j > 0; j-- {
 				if n.dropListeners(ctx, gs[j]) {
 					err = n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
 				}

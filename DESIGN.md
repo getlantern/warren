@@ -998,9 +998,10 @@ line, B runs alongside it, C waits on device time, D is maintenance.
    1. following `G` (built): a running node moves to the roster's current
       group secret once its keyring holds it, and for `node.Grace` (24
       hours) after it first sees one replaced keeps listening under, and
-      admitting members' keys from, the superseded one; calls try the
-      current secret, then the superseded ones, for a member that hasn't
-      moved yet;
+      admitting members' keys from, the superseded one (with the listener
+      table full, the current secret takes the oldest superseded one's
+      listeners); calls try the current secret, then the superseded ones,
+      for a member that hasn't moved yet;
    2. session teardown on removal;
    3. the publish pause until a corrective rekey;
    4. mirrors, once content and swarming exist.
