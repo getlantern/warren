@@ -753,3 +753,136 @@ func TestRetryRejoin(t *testing.T) {
 		t.Fatal("a retry with nothing to deliver wrote to the roster")
 	}
 }
+
+// TestApprovalEvidenceIsHistorical: an add its author had no authority to
+// write isn't evidence once the author is promoted, and a legitimate
+// approval stays evidence once its author is demoted.
+func TestApprovalEvidenceIsHistorical(t *testing.T) {
+	x := group(t, 1)
+	m2 := me(32)
+	ow := &roster.Writer{R: x.r, Me: x.owner}
+	if _, err := ow.Add(m2.Public(), "m2", roster.Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	// m2, a member, signs an add of the member naming the invite.
+	o := &roster.Op{Group: x.r.Group(), Kind: roster.Add, Parents: x.r.Heads(), Target: x.member.Public(),
+		Role: roster.Member, Name: "m", Invite: x.issued.Invite.Key}
+	for _, p := range o.Parents {
+		o.Lamport = max(o.Lamport, x.r.Op(p).Lamport)
+	}
+	o.Lamport++
+	o.Sign(m2)
+	if _, err := x.r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ow.SetRole(m2.Public(), roster.Admin); err != nil {
+		t.Fatal(err)
+	}
+	late := func(a *AdminConfig, _ *JoinConfig) { a.Now = func() time.Time { return now.Add(2 * time.Hour) } }
+	if _, _, _, jerr, _ := x.run(t, x.member, true, late); !errors.Is(jerr, ErrInviteUnusable) {
+		t.Fatalf("an unauthorized add became evidence on promotion: %v", jerr)
+	}
+
+	// Two admins admit one joiner at once; the loser's author is demoted,
+	// and a retry under its invite still gets the roster.
+	y := group(t, 1)
+	admin2 := me(33)
+	if _, err := (&roster.Writer{R: y.r, Me: y.owner}).Add(admin2.Public(), "a2", roster.Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := Issue(&roster.Writer{R: y.r, Me: admin2, Now: clock}, 1, time.Hour, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiner := me(9)
+	c := y.r.Clone()
+	a, err := (&roster.Writer{R: y.r, Me: y.admin, Now: clock}).Add(joiner.Public(), "j", roster.Member, y.issued.Invite.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := (&roster.Writer{R: c, Me: admin2, Now: clock}).Add(joiner.Public(), "j", roster.Member, other.Invite.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := y.r.Add(b); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := y.r.Fold()
+	loser, loserAuthor := other, admin2
+	if f.Counts[b.ID()] {
+		loser, loserAuthor = y.issued, y.admin
+	}
+	if _, err := (&roster.Writer{R: y.r, Me: y.owner}).SetRole(loserAuthor.Public(), roster.Member); err != nil {
+		t.Fatal(err)
+	}
+	r, _, _, jerr, serr := y.run(t, joiner, false, func(ac *AdminConfig, jc *JoinConfig) {
+		ac.Invite, jc.Invite, ac.Me = loser.Invite, loser.Invite, y.owner
+		ac.Now = func() time.Time { return now.Add(2 * time.Hour) }
+	})
+	if jerr != nil || serr != nil || r == nil {
+		t.Fatalf("a demoted author's approval stopped being evidence: %v / %v", jerr, serr)
+	}
+	_ = a
+}
+
+// TestIssueRoundsUp: a short ttl rounds the expiry up to the whole second,
+// so the invite is usable at once.
+func TestIssueRoundsUp(t *testing.T) {
+	x := group(t, 1)
+	at := time.Unix(1_800_000_000, 100_000_000)
+	is, _, err := Issue(&roster.Writer{R: x.r, Me: x.admin, Now: func() time.Time { return at }}, 1, 100*time.Millisecond, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if is.Invite.Expires != 1_800_000_001 {
+		t.Fatalf("expires %d", is.Invite.Expires)
+	}
+	if f, _ := x.r.Fold(); !f.Invites[is.Invite.Key].Usable(at) {
+		t.Fatal("a fresh invite isn't usable")
+	}
+}
+
+// TestAdminWithoutKeys: an admin missing the current group secret refuses,
+// writing nothing, rather than answer with keys the joiner can't use.
+func TestAdminWithoutKeys(t *testing.T) {
+	x := group(t, 1)
+	// The owner rekeys in a copy holding only the genesis: neither the
+	// admin nor the member gets the new keys.
+	stale, err := roster.New(x.r.Op(x.r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk, err := (&roster.Writer{R: stale, Me: x.owner}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := x.r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	before := len(x.r.IDs())
+	for _, c := range []struct {
+		id     *keys.Identity
+		rejoin bool
+	}{{me(9), false}, {x.member, true}} {
+		_, _, op, jerr, serr := x.run(t, c.id, c.rejoin, nil)
+		if !errors.Is(jerr, ErrNoKeys) || !errors.Is(serr, ErrNoKeys) || op != nil {
+			t.Fatalf("rejoin=%v: got %v / %v, want ErrNoKeys", c.rejoin, jerr, serr)
+		}
+	}
+	if len(x.r.IDs()) != before {
+		t.Fatal("a refused request wrote to the roster")
+	}
+}
+
+// TestRosterTooLarge: a roster too large for the joiner's limits is refused
+// before anything is written.
+func TestRosterTooLarge(t *testing.T) {
+	x := group(t, 1)
+	defer func(b int) { maxOpsBytes = b }(maxOpsBytes)
+	maxOpsBytes = roster.MaxOpBytes // no room left for the roster
+	before := len(x.r.IDs())
+	_, _, op, jerr, serr := x.run(t, me(9), false, nil)
+	if !errors.Is(jerr, ErrTooLarge) || !errors.Is(serr, ErrTooLarge) || op != nil || len(x.r.IDs()) != before {
+		t.Fatalf("got %v / %v, want ErrTooLarge with nothing written", jerr, serr)
+	}
+}

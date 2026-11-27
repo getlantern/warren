@@ -33,6 +33,12 @@ var (
 	// ErrNotAdmin means the side serving the invite can't approve: it isn't
 	// an owner or admin.
 	ErrNotAdmin = errors.New("join: not an admin")
+	// ErrNoKeys means the admin doesn't hold the current group secret, so
+	// it can't give a joiner one.
+	ErrNoKeys = errors.New("join: admin lacks the current keys")
+	// ErrTooLarge means the roster wouldn't fit in an answer the joiner
+	// takes.
+	ErrTooLarge = errors.New("join: roster too large to answer")
 	// ErrFrame means a malformed or oversized frame.
 	ErrFrame = errors.New("join: malformed frame")
 	// ErrBadAnswer means the admin's answer doesn't hold this joiner's
@@ -60,7 +66,7 @@ const (
 )
 
 // Refusal codes in an answer, each an error a joiner gets back.
-var codes = []error{nil, ErrBadProof, ErrInviteUnusable, ErrNotApproved, ErrNotMember, ErrAlreadyMember, ErrNotAdmin}
+var codes = []error{nil, ErrBadProof, ErrInviteUnusable, ErrNotApproved, ErrNotMember, ErrAlreadyMember, ErrNotAdmin, ErrNoKeys, ErrTooLarge}
 
 func codeOf(err error) int64 {
 	for i, e := range codes {
@@ -216,6 +222,21 @@ func admit(cfg AdminConfig, req Request, t time.Time) (replay bool, err error) {
 	if a := f.Roles[cfg.Me.Public()]; a != roster.Owner && a != roster.Admin {
 		return false, ErrNotAdmin
 	}
+	// It must hold the current G to give one: otherwise Deliver could send
+	// only older keys, or nothing, and an empty delivery wouldn't mean the
+	// rejoiner holds every key.
+	if _, ok := cfg.Roster.Keyring(cfg.Me).Secrets[f.Current]; !ok {
+		return false, ErrNoKeys
+	}
+	// The answer, with the one operation this may write, must fit what the
+	// joiner takes, or an approval would be committed that can't be sent.
+	size := roster.MaxOpBytes
+	for _, o := range f.Order {
+		size += len(o.Encode()) + 16
+	}
+	if size > maxOpsBytes || len(f.Order)+1 > maxOps {
+		return false, ErrTooLarge
+	}
 	member := f.Roles[req.Member] != roster.None
 	if member && answered(f, cfg.Invite.Key, req.Member) {
 		return true, nil
@@ -232,22 +253,17 @@ func admit(cfg AdminConfig, req Request, t time.Time) (replay bool, err error) {
 	return false, nil
 }
 
-// answered reports whether an approver answered invite for member: an add
-// or deliver naming it, to member, by an owner or admin. That is the
-// author's role as the op counted, or, for an add that doesn't count (it
-// lost to a concurrent add of the same key, and still spent its invite),
-// the author's role now. A member's own deliver naming an invite spends
-// nothing (see roster.InviteState) and is no approval.
+// answered reports whether an approver answered invite for member: one of
+// the operations that spent it, as the fold counts them (an owner's or
+// admin's add, counting or not, or rejoin's deliver), was to member. A
+// member's own deliver naming an invite spends nothing and is no approval.
 func answered(f *roster.Result, invite, member keys.PublicKey) bool {
-	approver := func(r roster.Role) bool { return r == roster.Owner || r == roster.Admin }
-	for _, o := range f.Order {
-		if o.Invite != invite || o.Target != member || (o.Kind != roster.Add && o.Kind != roster.Deliver) {
-			continue
-		}
-		if f.Counts[o.ID()] && approver(f.As[o.ID()]) {
-			return true
-		}
-		if !f.Counts[o.ID()] && o.Kind == roster.Add && approver(f.Roles[o.Author]) {
+	s := f.Invites[invite]
+	if s == nil {
+		return false
+	}
+	for _, a := range s.Approvals {
+		if a.Target == member {
 			return true
 		}
 	}

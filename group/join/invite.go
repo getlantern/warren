@@ -29,6 +29,9 @@ const MaxHints = 16
 
 const linkPrefix = "warren-invite:1:"
 
+// maxLinkBytes bounds a link's decoded payload.
+const maxLinkBytes = 4096
+
 // ErrBadLink means a link that doesn't parse as an invite.
 var ErrBadLink = errors.New("join: bad invite link")
 
@@ -70,11 +73,11 @@ func (iv Invite) Link() string {
 func ParseLink(s string) (Invite, error) {
 	var iv Invite
 	rest, ok := strings.CutPrefix(s, linkPrefix)
-	if !ok {
+	if !ok || len(rest) > base64.RawURLEncoding.EncodedLen(maxLinkBytes) { // before decoding it
 		return iv, ErrBadLink
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(rest)
-	if err != nil || len(raw) > 4096 {
+	if err != nil || len(raw) > maxLinkBytes {
 		return iv, ErrBadLink
 	}
 	v, err := bencode.DecodeLimit(raw, 64)
@@ -130,7 +133,8 @@ func (is *Issued) Listener(p uint64) keys.Signer {
 	return is.Key.Blind(keys.InviteBlind(is.Invite.Secret, p))
 }
 
-// Issue makes an invite admitting up to uses joiners and rejoiners for ttl,
+// Issue makes an invite admitting up to uses joiners and rejoiners for ttl
+// (its expiry rounded up to the whole second),
 // and records it in w's roster with an invite operation, which it returns
 // for the caller to share with members. w.Me must be an owner or admin.
 // random defaults to crypto/rand.
@@ -158,7 +162,16 @@ func Issue(w *roster.Writer, uses uint32, ttl time.Duration, hints []netip.AddrP
 	if w.Now != nil {
 		now = w.Now()
 	}
-	expires := now.Add(ttl).Unix()
+	// Rounded up to the whole second, so a short ttl doesn't record an
+	// invite already expired at the current second.
+	end := now.Add(ttl)
+	expires := end.Unix()
+	if end.Nanosecond() > 0 {
+		expires++
+	}
+	if expires <= now.Unix() {
+		return nil, nil, roster.ErrNotAllowed
+	}
 	op, err := w.Invite(key.Public(), uses, expires)
 	if err != nil {
 		return nil, nil, err

@@ -328,6 +328,16 @@ type InviteState struct {
 	// Dead is set once a counting remove comes after the invite in the
 	// total order: invites issued before a removal are refused after it.
 	Dead bool
+	// Approvals is the operations that spent it, in total order: what an
+	// approver answered under it, and to whom.
+	Approvals []Approval
+}
+
+// Approval is an operation that spent an invite: an add or a rejoin's
+// deliver, by an owner or admin, to Target.
+type Approval struct {
+	Op     ID
+	Target keys.PublicKey
 }
 
 // Usable reports whether the invite may admit another joiner at now.
@@ -376,6 +386,7 @@ func countInvite(res *Result, live []*InviteState, o *Op, author Role) []*Invite
 	case Deliver:
 		if s := res.Invites[o.Invite]; s != nil && (author == Owner || author == Admin) {
 			s.Used++
+			s.Approvals = append(s.Approvals, Approval{Op: o.id, Target: o.Target})
 		}
 	case Remove:
 		for _, s := range live {
@@ -583,6 +594,7 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 			// it counts (see InviteState).
 			if s := res.Invites[o.Invite]; s != nil {
 				s.Used++
+				s.Approvals = append(s.Approvals, Approval{Op: o.id, Target: o.Target})
 			}
 			cur := res.Roles[o.Target]
 			switch {

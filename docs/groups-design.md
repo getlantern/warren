@@ -522,8 +522,9 @@ carries neither `G` nor any member key.
   rejoin's `deliver` (below). Each such operation spends one of the
   invite's uses, so a single-use invite is spent by the first of either;
   since both are roster operations, every admin counts the uses alike. All
-  invites are refused after expiry (but for a retry, below), and invites issued before a removal
-  are refused after it (*Removal*): every member folds the same total
+  invites are refused after expiry, and invites issued before a removal
+  are refused after it (*Removal*), but for a retry by a key the invite
+  already admitted (below): every member folds the same total
   order, so they agree which invites a removal came after.
 - The fold counts uses and doesn't drop: two admins approving one invite at
   once both admit their joiner, and the invite reads as overspent. Dropping
