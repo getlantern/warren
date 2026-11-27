@@ -332,3 +332,51 @@ func TestDemotedAdminCantBackdateSpend(t *testing.T) {
 		t.Fatalf("a demoted admin's backdated deliver spent the invite: %+v", s)
 	}
 }
+
+// TestConcurrentApprovalsOfOneJoiner: two admins admitting the same joiner
+// at once under different invites both spend their invite, though only one
+// add counts.
+func TestConcurrentApprovalsOfOneJoiner(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	a := invite(t, r, admin, 50, 1)
+	b := invite(t, r, owner, 51, 1)
+	c := r.Clone()
+	joiner := me(60).Public()
+	x, err := (&Writer{R: r, Me: admin, Now: clock}).Add(joiner, "j", Member, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := (&Writer{R: c, Me: owner, Now: clock}).Add(joiner, "j", Member, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(y); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Add(x); err != nil {
+		t.Fatal(err)
+	}
+	for _, ro := range []*Roster{r, c} {
+		f, err := ro.Fold()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Roles[joiner] != Member {
+			t.Fatal("the joiner wasn't admitted")
+		}
+		if f.Invites[a].Used != 1 || f.Invites[b].Used != 1 {
+			t.Fatalf("uses: %d and %d, want 1 each", f.Invites[a].Used, f.Invites[b].Used)
+		}
+	}
+	// A causal duplicate (the admin had seen the admission) spends nothing.
+	d := invite(t, r, admin, 52, 1)
+	o := (&Writer{R: r, Me: admin}).base(Add)
+	o.Target, o.Role, o.Name, o.Invite = joiner, Member, "j", d
+	o.Sign(admin)
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, d); s.Used != 0 {
+		t.Fatalf("a causal duplicate add spent its invite: %+v", s)
+	}
+}
