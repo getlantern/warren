@@ -492,3 +492,27 @@ func TestStoppedCountingDropped(t *testing.T) {
 		t.Fatal("a secret whose rekey stopped counting is still listened under")
 	}
 }
+
+// TestSecretsOrderedByWindow: superseded secrets come latest window end
+// first, whatever order they were kept in, so a full table gives up the
+// one whose window ends soonest.
+func TestSecretsOrderedByWindow(t *testing.T) {
+	now := time.Now()
+	n := &Node{current: keys.Secret{9}}
+	n.superseded = []supersededSecret{
+		{g: keys.Secret{2}, until: now.Add(2 * time.Hour)},
+		{g: keys.Secret{1}, until: now.Add(time.Hour), ranOn: true},
+		{g: keys.Secret{3}, until: now.Add(3 * time.Hour)},
+		{g: keys.Secret{4}, until: now.Add(-time.Minute)}, // past its window
+	}
+	got := n.secrets(now)
+	want := []keys.Secret{{9}, {3}, {2}, {1}}
+	if len(got) != len(want) {
+		t.Fatalf("got %d secrets, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("secret %d is %v, want %v", i, got[i][0], want[i][0])
+		}
+	}
+}

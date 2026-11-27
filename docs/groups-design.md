@@ -472,8 +472,8 @@ Removing a member:
    rendezvous keys from each `G` superseded in that window. A member that
    missed the change reaches them there, and gets it by roster gossip. (A
    device whose listener table is full gives the current `G` priority, so
-   it may stop listening under the oldest superseded one early; it still
-   admits and calls under it for the window.) A
+   it may stop listening early under the superseded one whose window ends
+   soonest; it still admits and calls under it for the window.) A
    member offline longer can't reach anyone (it holds only secrets the
    removed member also holds), so it **rejoins** through an invite
    (*Invites*): it proves its existing member key, which the removed member

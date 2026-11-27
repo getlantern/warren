@@ -38,8 +38,9 @@ const streamName = "warren-group:1"
 // there and gets the change by gossip (docs/groups-design.md, *Removal*,
 // step 4). Operations carry no time, so it runs from this node's own
 // observation. With the listener table full, the current secret takes
-// the oldest superseded one's listeners: that secret is still admitted and
-// called under for Grace, but no longer listened under.
+// the listeners of the superseded secret whose window ends soonest: that
+// secret is still admitted and called under for its window, but no longer
+// listened under.
 const Grace = 24 * time.Hour
 
 // busyTries and busyWait bound a call's tries of a busy group.
@@ -305,15 +306,21 @@ func (n *Node) Group() keys.Secret {
 }
 
 // secrets is the current group secret, then those superseded within Grace
-// at now, newest first.
+// at now, by when their window ends, latest first: the last is the one a
+// full listener table gives up first.
 func (n *Node) secrets(now time.Time) []keys.Secret {
 	n.gmu.Lock()
-	defer n.gmu.Unlock()
-	out := []keys.Secret{n.current}
-	for i := len(n.superseded) - 1; i >= 0; i-- {
-		if s := n.superseded[i]; now.Before(s.until) {
-			out = append(out, s.g)
+	live := make([]supersededSecret, 0, len(n.superseded))
+	for _, s := range n.superseded {
+		if now.Before(s.until) {
+			live = append(live, s)
 		}
+	}
+	out := []keys.Secret{n.current}
+	n.gmu.Unlock()
+	slices.SortStableFunc(live, func(a, b supersededSecret) int { return b.until.Compare(a.until) })
+	for _, s := range live {
+		out = append(out, s.g)
 	}
 	return out
 }
@@ -476,8 +483,9 @@ func (n *Node) rotate(ctx context.Context) error {
 			err := n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
 			// The current secret is the one every up-to-date member calls:
 			// with the table full (and only then: not on a cancelled
-			// context, say), it takes the oldest superseded secret's
-			// listeners (the secret stays in Grace for admission and calls).
+			// context, say), it takes the listeners of the superseded
+			// secret whose window ends soonest, gs being ordered so (the
+			// secret stays in Grace for admission and calls).
 			for j := len(gs) - 1; errors.Is(err, dht.ErrTooManyListeners) && i == 0 && j > 0; j-- {
 				if n.dropListeners(ctx, gs[j]) {
 					err = n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
