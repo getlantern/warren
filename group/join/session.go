@@ -209,8 +209,11 @@ func Answer(ctx context.Context, conn io.ReadWriteCloser, cfg AdminConfig, req R
 // NeedsApproval reports whether Answer would put req to Approve: it passes
 // the roster's checks now and isn't a retry. A caller deciding approval
 // itself, outside whatever holds the roster, asks this first (holding it
-// briefly), decides, then calls Answer with no Approve, which checks
-// everything again.
+// briefly), decides, then calls Answer with an Approve that returns its
+// decision: false if it never decided because this said no. Answer checks
+// everything again, and asks Approve for any request that isn't a retry,
+// so a check that failed here but passes there is refused rather than
+// admitted unasked. Answer with no Approve approves all.
 func NeedsApproval(cfg AdminConfig, req Request) bool {
 	now := time.Now
 	if cfg.Now != nil {
