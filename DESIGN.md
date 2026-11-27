@@ -969,7 +969,13 @@ line, B runs alongside it, C waits on device time, D is maintenance.
          and rejoins' delivers that name it, and whether a removal after it
          killed it; writers refuse an invite that isn't usable. Concurrent
          approvals are counted, not dropped;
-      2. `group/join`: the invite token and the join session protocol;
+      2. `group/join` (built): the invite link (`Issue`, `Link`,
+         `ParseLink`, the per-period blinded listener key) and the join
+         session (`Serve`, `Join`): a request with a MAC over the
+         connection secret with `I` and a member-key signature, checked
+         against the roster and an `Approve` callback, answered with an
+         `add` or a rejoin's `deliver` and the roster's operations, which
+         the joiner checks admit it with the current `G`;
       3. `group/node`: listening under blinded invite keys, joining and
          rejoining by invite.
 6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3

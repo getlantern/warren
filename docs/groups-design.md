@@ -511,8 +511,9 @@ carries neither `G` nor any member key.
   key. Only the admin holds the invite's private key, so only the admin can
   listen there, and one listener means no clash at holders.
 - That **join session** carries the invitee's new member key, display name,
-  and a proof that it knows `I` (a MAC over the session's secret), and
-  nothing else. The admin approves with an `add`, which delivers `G` and the
+  a proof that it knows `I` (a MAC over the session's secret), and a
+  signature over the session's secret with the member key, so no one can
+  get another's key added; nothing else. The admin approves with an `add`, which delivers `G` and the
   epoch keys sealed to the new member. The join answer also carries the
   genesis and the roster's operations (small for v1 groups), so the invitee
   can check its own `add` and compute the members' rendezvous keys. The
