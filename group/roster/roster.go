@@ -355,21 +355,27 @@ func (h *ready) Pop() any {
 // deliver's, or kills those before a remove. Only an owner or admin, who
 // approves invites, spends one: any member may deliver, and a member's
 // deliver naming an invite would otherwise use it up with no one joining.
-func (r *Roster) countInvite(res *Result, o *Op, author Role) {
+// live holds the invites recorded since the last counting remove, the only
+// ones a remove has left to kill, and is returned updated.
+func countInvite(res *Result, live []*InviteState, o *Op, author Role) []*InviteState {
 	switch o.Kind {
 	case Invite:
 		if _, ok := res.Invites[o.Invite]; !ok { // the first record stands
-			res.Invites[o.Invite] = &InviteState{Op: o.id, Expires: o.Expires, Uses: o.Uses}
+			s := &InviteState{Op: o.id, Expires: o.Expires, Uses: o.Uses}
+			res.Invites[o.Invite] = s
+			live = append(live, s)
 		}
 	case Add, Deliver:
 		if s := res.Invites[o.Invite]; s != nil && (author == Owner || author == Admin) {
 			s.Used++
 		}
 	case Remove:
-		for _, s := range res.Invites {
+		for _, s := range live {
 			s.Dead = true
 		}
+		live = live[:0]
 	}
+	return live
 }
 
 // order is the total order: a topological order of the causal graph that,
@@ -530,6 +536,7 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 		Invites: map[keys.PublicKey]*InviteState{},
 	}
 	ever := map[keys.PublicKey]bool{}
+	var live []*InviteState // invites recorded since the last counting remove
 	// granted is the operation that made each admin one: its counting add
 	// as admin, or its latest promotion.
 	granted := map[keys.PublicKey]ID{}
@@ -610,7 +617,7 @@ func (r *Roster) apply(order []*Op, dropped map[ID]bool) *Result {
 		}
 		res.Counts[o.id] = ok
 		if ok {
-			r.countInvite(res, o, author)
+			live = countInvite(res, live, o, author)
 			res.As[o.id] = author
 			if o.Kind == Genesis {
 				res.As[o.id] = Owner
