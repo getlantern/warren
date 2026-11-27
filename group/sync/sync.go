@@ -49,6 +49,7 @@ type Sync struct {
 	walking  map[keys.PublicKey]bool // walking down a peer's branch of a fork
 	stopped  map[keys.PublicKey]bool // nothing more from this peer
 	added    bool                    // operations went into r this exchange
+	fold     *roster.Result          // r's fold once the peer's operations are in
 	sentBye  bool
 	gotBye   bool
 	err      error
@@ -210,8 +211,13 @@ func (s *Sync) refold() error {
 	if err != nil {
 		return err
 	}
+	s.fold = f
 	return s.logs.Update(f)
 }
+
+// Fold is the roster's fold once the peer's operations are all in (the
+// one the logs were brought up to), or nil before then, or if none came.
+func (s *Sync) Fold() *roster.Result { return s.fold }
 
 // missingOps returns every operation this side holds that the peer
 // doesn't, parents first, split to fit messages.

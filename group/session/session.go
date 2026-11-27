@@ -530,10 +530,6 @@ func (s *session) transportMatches(member keys.PublicKey) bool {
 	return !s.cfg.Caller && s.viaSync()
 }
 
-// sync runs the group/sync exchange to its end. On failure the logs are
-// brought up to the roster as it now stands: operations taken before the
-// session failed (a removal in a batch the peer never finished) stay in
-// the roster, so the logs must follow them.
 // batchDone reports whether m leaves the peer's roster operations whole:
 // it isn't an Ops message with more to follow.
 func batchDone(m gsync.Message) bool {
@@ -544,7 +540,10 @@ func batchDone(m gsync.Message) bool {
 // sync runs group/sync with peer to the end. A message that adds roster
 // operations is checked for peer's removal, which ends the session before
 // anything more is sent: a removed member is served nothing after this
-// side learns of it, whoever it learned it from.
+// side learns of it, whoever it learned it from. On failure the logs are
+// brought up to the roster as it now stands: operations taken before the
+// session failed (a removal in a batch the peer never finished) stay in
+// the roster, so the logs must follow them.
 func (s *session) sync(peer keys.PublicKey) (err error) {
 	defer func() {
 		if err != nil {
@@ -584,9 +583,11 @@ func (s *session) sync(peer keys.PublicKey) (err error) {
 		// meanwhile.
 		if pending && batchDone(m) {
 			pending = false
-			f, err := s.cfg.Roster.Fold()
-			if err != nil {
-				return err
+			f := x.Fold() // the sync's own, for the batch just finished
+			if f == nil {
+				if f, err = s.cfg.Roster.Fold(); err != nil {
+					return err
+				}
 			}
 			if f.Roles[peer] == roster.None {
 				return ErrRemoved
