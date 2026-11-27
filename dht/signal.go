@@ -1413,6 +1413,20 @@ func (n *Node) Holders() []netip.AddrPort {
 	return out
 }
 
+// HoldersFor reports the record holders kept alive for one listener key,
+// or none if the node doesn't listen under it.
+func (n *Node) HoldersFor(key [32]byte) []netip.AddrPort {
+	var out []netip.AddrPort
+	for _, l := range n.lsts {
+		if l.pub == key {
+			for _, h := range l.holders {
+				out = append(out, h.addr)
+			}
+		}
+	}
+	return out
+}
+
 // Listener is one key a node listens under.
 type Listener struct {
 	Key       [32]byte

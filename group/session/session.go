@@ -94,6 +94,10 @@ type Config struct {
 	Local, Peer keys.PublicKey
 	// Now places the session in a period, for the rendezvous and sync keys.
 	Now time.Time
+	// Admitted, if set, is called once the peer is admitted, before the
+	// sync: until then the peer has proved only that it holds an admitted
+	// transport key, so a caller can bound that phase more tightly.
+	Admitted func()
 }
 
 // Run admits the peer and syncs with it, returning its member key once
@@ -102,9 +106,15 @@ type Config struct {
 // caller's to close.
 func Run(ctx context.Context, conn io.ReadWriteCloser, cfg Config) (keys.PublicKey, error) {
 	s := newSession(cfg, conn)
-	stop := make(chan struct{})
-	defer close(stop)
+	// The watcher is joined before Run returns, so a ctx the caller
+	// cancels afterwards can't close conn under it.
+	stop, watched := make(chan struct{}), make(chan struct{})
+	defer func() {
+		close(stop)
+		<-watched
+	}()
 	go func() {
+		defer close(watched)
 		select {
 		case <-ctx.Done():
 			conn.Close()
@@ -486,6 +496,9 @@ func (s *session) admit(ops []*roster.Op) (keys.PublicKey, error) {
 	}
 	if !s.transportMatches(h.key) {
 		return h.key, ErrTransportKey
+	}
+	if s.cfg.Admitted != nil {
+		s.cfg.Admitted()
 	}
 	// Admitted: keep the chain, and bring the logs up to the roster.
 	for _, o := range ops {

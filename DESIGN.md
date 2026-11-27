@@ -952,8 +952,17 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       keys and last-seen times; a reader merges every distinct value
       across replicas and keeps only members' keys, a writer reads back
       and merges again if a concurrent writer displaced it;
-   3. `group/node`: the runtime on an endpoint (listening under rendezvous
-      keys, calling members, liveness), tested over loopback networks;
+   3. `group/node` (built): the runtime on an endpoint. A host routes each
+      call by the key called to the group listening under it; a group
+      listens under this and the next period's rendezvous keys, admits
+      members' keys for the previous, current and next period and the
+      sync keys for calling it, calls under its rendezvous key and falls
+      back to the sync key only when the callee stays silent, runs one
+      session at a time (a busy group answers busy rather than making a
+      caller wait, so two members calling each other can't deadlock; the
+      caller tries again on the same connection after a random wait),
+      bounds a caller's admission by the call timeout, and records whom it
+      reached. Tested over loopback networks;
    4. join and rejoin sessions, with invites.
 6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
    tree over ciphertext, announcements. Pure library, so it can be built
