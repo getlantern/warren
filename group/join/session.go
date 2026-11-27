@@ -40,16 +40,19 @@ var (
 	ErrBadAnswer = errors.New("join: answer doesn't admit this member")
 )
 
-const (
+// Limits on an answer; tests lower them.
+var (
 	// maxOpsBytes and maxOps bound the roster an answer carries, as
 	// group/session bounds an add chain.
 	maxOpsBytes = 16 << 20
 	maxOps      = 1 << 16
 	// maxFrame bounds a frame.
-	maxFrame = roster.MaxOpBytes + 64
+	maxFrame = uint32(roster.MaxOpBytes + 64)
 	// opsChunk is the bytes of operations a sender puts in one frame.
 	opsChunk = 256 << 10
+)
 
+const (
 	frameRequest = 'q'
 	frameAnswer  = 'a'
 	frameOps     = 'o'
@@ -187,14 +190,21 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 	if cfg.Approve != nil && !cfg.Approve(req) {
 		return nil, ErrNotApproved
 	}
-	w := &roster.Writer{R: cfg.Roster, Me: cfg.Me, Now: now}
+	// Approve may have taken a while: check the invite again, at the one
+	// instant the writer then uses too.
+	t := now()
+	if s := f.Invites[cfg.Invite.Key]; !s.Usable(t) {
+		return nil, ErrInviteUnusable
+	}
+	w := &roster.Writer{R: cfg.Roster, Me: cfg.Me, Now: func() time.Time { return t }}
 	if !req.Rejoin {
 		return w.Add(req.Member, req.Name, roster.Member, cfg.Invite.Key)
 	}
 	op, err := w.Deliver(req.Member, cfg.Invite.Key)
 	if errors.Is(err, roster.ErrNotAllowed) {
-		// Everything else Deliver checks was checked above: the rejoiner
-		// holds every key already, so it needs only the roster.
+		// Everything else Deliver checks was checked above, against the
+		// same roster and instant: the rejoiner holds every key already,
+		// so it needs only the roster, and the invite isn't spent.
 		return nil, nil
 	}
 	return op, err

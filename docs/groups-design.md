@@ -543,7 +543,8 @@ with it as well as proving it knows `I`. The admin checks that key is on its
 roster and not removed, and answers with a `deliver` of the current `G` and
 every epoch key it lacks (mirrors get `G` only), naming the invite and so
 spending one of its uses, plus the genesis and the roster's operations, as
-for a new member. Nothing else changes: no `add`, no
+for a new member. A rejoiner already holding every key gets the roster
+alone, with no `deliver`, and the invite isn't spent. Nothing else changes: no `add`, no
 removal, no rekey, and its log carries on. A removed member can't do this:
 its key is off the roster. A stolen device can, as it could use any member
 key; the admin sees which member is rejoining, and the answer to a stolen

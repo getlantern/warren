@@ -134,6 +134,11 @@ func Issue(w *roster.Writer, uses uint32, ttl time.Duration, hints []netip.AddrP
 	if len(hints) > MaxHints || ttl <= 0 {
 		return nil, nil, roster.ErrNotAllowed
 	}
+	for _, h := range hints {
+		if !h.IsValid() { // ParseLink would refuse the link
+			return nil, nil, roster.ErrNotAllowed
+		}
+	}
 	key, err := keys.NewIdentity(random)
 	if err != nil {
 		return nil, nil, err

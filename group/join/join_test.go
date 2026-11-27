@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
@@ -414,5 +415,146 @@ func TestLinkRejectsBadKey(t *testing.T) {
 	iv.Key = keys.PublicKey{} // not a usable key
 	if _, err := ParseLink(iv.Link()); !errors.Is(err, ErrBadLink) {
 		t.Fatalf("a link with an unusable key parsed: %v", err)
+	}
+}
+
+// TestExpiresDuringApproval: an invite that expires while Approve decides is
+// refused, a rejoin with nothing to deliver included.
+func TestExpiresDuringApproval(t *testing.T) {
+	for _, rejoin := range []bool{false, true} {
+		x := group(t, 1)
+		clockNow := now
+		id := me(9)
+		if rejoin {
+			id = x.member
+		}
+		_, _, op, jerr, serr := x.run(t, id, rejoin, func(a *AdminConfig, _ *JoinConfig) {
+			a.Now = func() time.Time { return clockNow }
+			a.Approve = func(Request) bool { clockNow = now.Add(time.Hour); return true }
+		})
+		if !errors.Is(jerr, ErrInviteUnusable) || !errors.Is(serr, ErrInviteUnusable) || op != nil {
+			t.Fatalf("rejoin=%v: got %v / %v, want ErrInviteUnusable", rejoin, jerr, serr)
+		}
+	}
+}
+
+func TestIssueRefusesBadHints(t *testing.T) {
+	x := group(t, 1)
+	before := len(x.r.IDs())
+	if _, _, err := Issue(&roster.Writer{R: x.r, Me: x.admin}, 1, time.Hour, []netip.AddrPort{{}}, nil); !errors.Is(err, roster.ErrNotAllowed) {
+		t.Fatalf("an invalid hint was issued: %v", err)
+	}
+	if len(x.r.IDs()) != before {
+		t.Fatal("a refused invite was recorded")
+	}
+}
+
+// TestCancelUnblocks: cancelling either side's context ends a session
+// blocked on a silent peer, and cancelling after it returns doesn't close
+// the connection.
+func TestCancelUnblocks(t *testing.T) {
+	x := group(t, 1)
+	for name, run := range map[string]func(ctx context.Context, c net.Conn) error{
+		"Join": func(ctx context.Context, c net.Conn) error {
+			_, err := Join(ctx, c, JoinConfig{Invite: x.issued.Invite, Me: me(9), Secret: secret})
+			return err
+		},
+		"Serve": func(ctx context.Context, c net.Conn) error {
+			_, _, err := Serve(ctx, c, AdminConfig{Roster: x.r, Me: x.admin, Invite: x.issued.Invite, Secret: secret})
+			return err
+		},
+	} {
+		a, b := net.Pipe()
+		go func() { _, _ = io.Copy(io.Discard, b) }() // reads, never answers
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- run(ctx, a) }()
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: cancelling didn't unblock it", name)
+		}
+		a.Close()
+		b.Close()
+	}
+	// A completed session, then a cancel: the connection stays open.
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() {
+		_, _, err := Serve(ctx, b, AdminConfig{Roster: x.r, Me: x.admin, Invite: x.issued.Invite, Secret: secret, Now: clock})
+		served <- err
+	}()
+	if _, err := Join(ctx, a, JoinConfig{Invite: x.issued.Invite, Me: me(9), Secret: secret}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	go func() { _, _ = b.Write([]byte{1}) }()
+	if _, err := io.ReadFull(a, make([]byte, 1)); err != nil {
+		t.Fatalf("a cancel after the session closed the connection: %v", err)
+	}
+}
+
+// TestAnswerLimits: a roster spanning several frames round-trips, and an
+// answer past each receive limit is refused.
+func TestAnswerLimits(t *testing.T) {
+	x := group(t, 1)
+	f, _ := x.r.Fold()
+	restore := func(c, o, b int, fr uint32) func() {
+		return func() { opsChunk, maxOps, maxOpsBytes, maxFrame = c, o, b, fr }
+	}
+	defer restore(opsChunk, maxOps, maxOpsBytes, maxFrame)()
+	answer := func() []byte {
+		var buf bytes.Buffer
+		if err := writeAnswer(&buf, 0, f.Order); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	opsChunk = 1 // a frame per operation
+	b := answer()
+	frames := 0
+	for rd := bytes.NewReader(b); ; {
+		kind, _, err := readFrame(rd)
+		if err != nil {
+			break
+		}
+		if kind == frameOps {
+			frames++
+		}
+	}
+	if frames != len(f.Order) {
+		t.Fatalf("%d op frames for %d operations, one each", frames, len(f.Order))
+	}
+	got, err := readAnswer(bytes.NewReader(b))
+	if err != nil || len(got) != len(f.Order) {
+		t.Fatalf("a multi-frame answer: %d ops, %v", len(got), err)
+	}
+	for i, o := range got {
+		if o.ID() != f.Order[i].ID() {
+			t.Fatal("the operations came back out of order")
+		}
+	}
+	maxOps = len(f.Order) - 1
+	if _, err := readAnswer(bytes.NewReader(b)); !errors.Is(err, ErrFrame) {
+		t.Fatalf("too many operations: %v", err)
+	}
+	maxOps = 1 << 16
+	maxOpsBytes = 100
+	if _, err := readAnswer(bytes.NewReader(b)); !errors.Is(err, ErrFrame) {
+		t.Fatalf("too many bytes of operations: %v", err)
+	}
+	maxOpsBytes = 16 << 20
+	maxFrame = 64
+	if _, err := readAnswer(bytes.NewReader(b)); !errors.Is(err, ErrFrame) {
+		t.Fatalf("an oversized frame: %v", err)
 	}
 }
