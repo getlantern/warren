@@ -304,7 +304,7 @@ func TestPostRefusals(t *testing.T) {
 	seed := network(t, 6)
 	n := x.join(t, host(t, seed), x.m1, x.r)
 	n.mu.Lock()
-	n.queue = append(n.queue, []byte("held"))
+	n.queue = append(n.queue, &heldPost{body: []byte("held")})
 	n.mu.Unlock()
 	// Queued behind it, then Do's refresh flushes both, the held one first,
 	// so it's no longer held when Post returns.
@@ -319,6 +319,9 @@ func TestPostRefusals(t *testing.T) {
 	}
 
 	mn := x.join(t, host(t, seed), mirror, x.r)
+	mn.mu.Lock()
+	mn.flushErr = errors.New("an old failure") // not what a mirror should hear
+	mn.mu.Unlock()
 	if _, err := mn.Post(context.Background(), []byte("x")); !errors.Is(err, roster.ErrNotAllowed) {
 		t.Fatalf("a mirror's post: %v", err)
 	}
@@ -357,8 +360,9 @@ func TestPausedMemberTickDoesntWait(t *testing.T) {
 
 // TestPostAfterEpochStopsCounting: posts flushed under an admin's
 // corrective rekey that then stops counting (the owner demoted the admin
-// concurrently) are still this member's; later posts chain after them
-// rather than forking the member's own log.
+// concurrently) are still this member's. Later posts chain after them
+// rather than forking the member's own log, and since memberlog hides them
+// too, Post says so (ErrHidden) rather than reporting success.
 func TestPostAfterEpochStopsCounting(t *testing.T) {
 	x := newGroup(t)
 	a := x.admins(t)
@@ -411,11 +415,24 @@ func TestPostAfterEpochStopsCounting(t *testing.T) {
 	n.mu.Lock()
 	ferr, fork := n.flushErr, n.cfg.Logs.Log(x.m1.Public()).Fork()
 	n.mu.Unlock()
-	if ferr != nil || fork != nil {
+	if !errors.Is(ferr, ErrHidden) || fork != nil {
 		t.Fatalf("the flush after the owner's rekey: %v, fork %v", ferr, fork != nil)
 	}
-	if queued, err := n.Post(ctx, []byte("three")); err != nil || queued {
-		t.Fatalf("a later post: queued %v, %v", queued, err)
+	if _, err := n.Post(ctx, []byte("three")); !errors.Is(err, ErrHeldFailed) || !errors.Is(err, ErrHidden) {
+		t.Fatalf("a post after a hidden flush: %v", err)
+	}
+	if h := n.TakeHeld(); len(h) != 0 {
+		t.Fatalf("a hidden post is still held: %q", h)
+	}
+	if queued, err := n.Post(ctx, []byte("three")); !errors.Is(err, ErrHidden) || queued {
+		t.Fatalf("a direct post behind hidden entries: queued %v, %v", queued, err)
+	}
+	n.mu.Lock()
+	l := n.cfg.Logs.Log(x.m1.Public())
+	last, fork := l.Last(), l.Fork()
+	n.mu.Unlock()
+	if last == nil || last.Seq != 3 || fork != nil {
+		t.Fatalf("the member's own chain: last %v, fork %v", last, fork != nil)
 	}
 }
 
@@ -427,7 +444,7 @@ func TestHeldFailureSurfaces(t *testing.T) {
 	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
 	ctx := context.Background()
 	n.mu.Lock()
-	n.queue = append(n.queue, make([]byte, memberlog.MaxBody+1)) // can't be written
+	n.queue = append(n.queue, &heldPost{body: make([]byte, memberlog.MaxBody+1)}) // can't be written
 	n.mu.Unlock()
 	if _, err := n.Post(ctx, []byte("a")); err != nil {
 		t.Fatal(err) // queued behind it; its flush fails
@@ -449,7 +466,7 @@ func TestLeaveDoesntFlush(t *testing.T) {
 	x := newGroup(t)
 	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
 	n.mu.Lock()
-	n.queue = append(n.queue, []byte("held")) // unpaused, holding the key
+	n.queue = append(n.queue, &heldPost{body: []byte("held")}) // unpaused, holding the key
 	n.mu.Unlock()
 	if err := n.Leave(context.Background()); err != nil {
 		t.Fatal(err)

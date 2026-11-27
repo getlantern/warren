@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/getlantern/warren/group/keys"
@@ -24,21 +25,22 @@ func (n *Node) Paused() bool { return n.paused.Load() }
 // member can't post (roster.ErrNotAllowed), nor can a body over
 // memberlog.MaxBody be. If held posts failed to append, a post is refused
 // with that failure (ErrHeldFailed) until they do or TakeHeld clears them.
+// ErrHidden, alone or wrapped so, means a post was appended but doesn't
+// show (see ErrHidden).
 func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 	if len(body) > memberlog.MaxBody {
 		return false, fmt.Errorf("node: post of %d bytes is over memberlog.MaxBody", len(body))
 	}
-	var at uint64 // its place in the queue's history, if held
-	held := false
+	var held *heldPost
 	err = n.Do(ctx, func(r *roster.Roster, logs *memberlog.Set) error {
-		if n.flushErr != nil {
-			return fmt.Errorf("%w: %w", ErrHeldFailed, n.flushErr)
-		}
 		f, err := r.Fold()
 		if err == nil {
 			if role := f.Roles[n.cfg.Me.Public()]; role == roster.None || role == roster.Mirror {
 				return roster.ErrNotAllowed
 			}
+		}
+		if n.flushErr != nil {
+			return fmt.Errorf("%w: %w", ErrHeldFailed, n.flushErr)
 		}
 		var key keys.EpochKey
 		ok := false
@@ -50,8 +52,8 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 			if len(n.queue) >= MaxQueued {
 				return ErrQueueFull
 			}
-			at, held = n.flushed+uint64(len(n.queue)), true
-			n.queue = append(n.queue, append([]byte(nil), body...))
+			held = &heldPost{body: append([]byte(nil), body...)}
+			n.queue = append(n.queue, held)
 			return nil
 		}
 		if err := logs.Update(f); err != nil {
@@ -59,13 +61,21 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 		}
 		return n.write(r, logs, f, key, body)
 	})
-	if err != nil || !held {
+	if err != nil || held == nil {
 		return false, err
 	}
-	// Do's refresh may have appended it already.
+	// Do's refresh may have appended it already (or TakeHeld handed it
+	// over since, which isn't appending it).
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return at >= n.flushed, nil
+	return !held.written, nil
+}
+
+// heldPost is a post held for publishing; written once a flush appends
+// it. mu held.
+type heldPost struct {
+	body    []byte
+	written bool
 }
 
 // TakeHeld hands over the posts held for publishing, oldest first (what
@@ -76,8 +86,10 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 func (n *Node) TakeHeld() [][]byte {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	h := n.queue
-	n.flushed += uint64(len(h))
+	h := make([][]byte, len(n.queue))
+	for i, p := range n.queue {
+		h[i] = p.body
+	}
 	n.queue, n.flushErr = nil, nil
 	return h
 }
@@ -96,8 +108,13 @@ func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, ke
 	if err != nil {
 		return err
 	}
-	_, err = logs.Add(e)
-	return err
+	if _, err := logs.Add(e); err != nil {
+		return err
+	}
+	if h := logs.Log(n.cfg.Me.Public()).Head(); h == nil || h.ID() != e.ID() {
+		return ErrHidden // appended, so not to be written again
+	}
+	return nil
 }
 
 // flush appends the held posts, in order, once publishing may resume,
@@ -123,12 +140,17 @@ func (n *Node) flush() {
 		return
 	}
 	for len(n.queue) > 0 {
-		if err := n.write(r, logs, f, key, n.queue[0]); err != nil {
+		err := n.write(r, logs, f, key, n.queue[0].body)
+		if err != nil && !errors.Is(err, ErrHidden) {
 			n.flushErr = err
 			return
 		}
+		n.queue[0].written = true
 		n.queue = n.queue[1:]
-		n.flushed++
+		if err != nil {
+			n.flushErr = err // the rest would be hidden too
+			return
+		}
 	}
 	n.flushErr = nil
 }

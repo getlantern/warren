@@ -85,6 +85,11 @@ var (
 	// ErrHeldFailed means held posts failed to append (Node.Post); the
 	// error wraps why.
 	ErrHeldFailed = errors.New("node: held posts failed to append")
+	// ErrHidden means a post was appended but doesn't show: it chains
+	// after this member's own entries under an epoch that stopped
+	// counting (an admin's rekey racing its demotion), which memberlog
+	// hides along with everything after them.
+	ErrHidden = errors.New("node: post appended but hidden behind entries under an epoch that stopped counting")
 )
 
 // Host owns a warren endpoint and routes its listeners and connections to
@@ -287,11 +292,9 @@ type Node struct {
 	// (roster.NeedsRekey): the current keys have reached a key that isn't
 	// a member, so the node publishes nothing until the rekey lands.
 	paused atomic.Bool
-	// queue is the posts held while paused, in order; flushed counts those
-	// ever taken off it, so a post can tell whether it still is. flushErr
-	// is the last flush's failure, nil once one succeeds. mu held.
-	queue    [][]byte
-	flushed  uint64
+	// queue is the posts held while paused, in order. flushErr is the last
+	// flush's failure, nil once one succeeds. mu held.
+	queue    []*heldPost
 	flushErr error
 }
 
@@ -401,8 +404,8 @@ func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	}
 	h.groups = append(h.groups, n)
 	h.mu.Unlock()
-	// A failed corrective rekey doesn't fail the join: the next Tick tries
-	// again.
+	// A failed corrective rekey doesn't fail the join: the node stays
+	// Paused, and the next Tick tries again.
 	if _, err := n.tick(ctx); err != nil {
 		n.leave()
 		return nil, err
