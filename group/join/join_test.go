@@ -558,3 +558,93 @@ func TestAnswerLimits(t *testing.T) {
 		t.Fatalf("an oversized frame: %v", err)
 	}
 }
+
+// TestApproveRemovesRejoiner: a roster change made during Approve (here,
+// the rejoiner's removal) is checked before anything is sent.
+func TestApproveRemovesRejoiner(t *testing.T) {
+	x := group(t, 2)
+	r, _, op, jerr, serr := x.run(t, x.member, true, func(a *AdminConfig, _ *JoinConfig) {
+		a.Approve = func(Request) bool {
+			if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Remove(x.member.Public(), 0, [32]byte{}); err != nil {
+				t.Error(err)
+			}
+			return true
+		}
+	})
+	if r != nil || op != nil || jerr == nil || serr == nil {
+		t.Fatalf("a member removed during approval got %v (%v / %v)", r, jerr, serr)
+	}
+}
+
+// TestRetryAfterLostAnswer: a joiner whose answer was lost asks again with
+// the same key and gets the roster, though the invite is spent and expired,
+// with nothing more written.
+func TestRetryAfterLostAnswer(t *testing.T) {
+	x := group(t, 1)
+	id := me(9)
+	if _, _, _, jerr, serr := x.run(t, id, false, nil); jerr != nil || serr != nil {
+		t.Fatalf("first join: %v / %v", jerr, serr)
+	}
+	before := len(x.r.IDs())
+	r, _, op, jerr, serr := x.run(t, id, false, func(a *AdminConfig, _ *JoinConfig) {
+		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
+		a.Approve = func(Request) bool { t.Error("a retry was put to Approve again"); return false }
+	})
+	if jerr != nil || serr != nil {
+		t.Fatalf("retry: %v / %v", jerr, serr)
+	}
+	if op != nil || len(x.r.IDs()) != before {
+		t.Fatal("a retry wrote to the roster")
+	}
+	if f, _ := r.Fold(); f.Roles[id.Public()] != roster.Member {
+		t.Fatal("the retry's roster doesn't admit the joiner")
+	}
+	// Another key can't ride on that answer.
+	if _, _, _, jerr, _ := x.run(t, me(10), false, nil); !errors.Is(jerr, ErrInviteUnusable) {
+		t.Fatalf("another key used the spent invite: %v", jerr)
+	}
+	// Nor can the joiner once it is removed.
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Remove(id.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if r, _, _, jerr, serr := x.run(t, id, false, nil); r != nil || serr == nil || jerr == nil {
+		t.Fatalf("a removed joiner's retry was served: %v / %v", jerr, serr)
+	}
+}
+
+// TestRejoinRoles: the owner and an admin rejoin keeping their roles, and a
+// mirror that missed a rekey gets the group secret but no epoch keys.
+func TestRejoinRoles(t *testing.T) {
+	x := group(t, 5)
+	admin2, mirror := me(30), me(31)
+	ow := &roster.Writer{R: x.r, Me: x.owner}
+	if _, err := ow.Add(admin2.Public(), "admin2", roster.Admin, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ow.Add(mirror.Public(), "mirror", roster.Mirror, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	rk := x.missRekey(t) // the mirror, like the member, misses it
+	for _, c := range []struct {
+		id   *keys.Identity
+		role roster.Role
+	}{{x.owner, roster.Owner}, {admin2, roster.Admin}, {mirror, roster.Mirror}} {
+		r, _, _, jerr, serr := x.run(t, c.id, true, nil)
+		if jerr != nil || serr != nil {
+			t.Fatalf("%v rejoining: %v / %v", c.role, jerr, serr)
+		}
+		f, _ := r.Fold()
+		if f.Roles[c.id.Public()] != c.role {
+			t.Fatalf("a rejoining %v came back as %v", c.role, f.Roles[c.id.Public()])
+		}
+		if c.role == roster.Mirror {
+			k := r.Keyring(c.id)
+			if _, ok := k.Secrets[rk.ID()]; !ok {
+				t.Fatal("the mirror didn't get the group secret it missed")
+			}
+			if len(k.Epochs) != 0 {
+				t.Fatal("a mirror got epoch keys")
+			}
+		}
+	}
+}

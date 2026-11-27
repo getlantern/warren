@@ -170,31 +170,18 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 	if !hmac.Equal(mac, macOf(cfg.Invite, cfg.Secret, req)) || !req.Member.Verify(proofOf(cfg.Invite, cfg.Secret, req), sig) {
 		return nil, ErrBadProof
 	}
-	f, err := cfg.Roster.Fold()
-	if err != nil {
+	replay, err := admit(cfg, req, now())
+	if err != nil || replay {
 		return nil, err
-	}
-	if a := f.Roles[cfg.Me.Public()]; a != roster.Owner && a != roster.Admin {
-		return nil, ErrNotAdmin
-	}
-	if s := f.Invites[cfg.Invite.Key]; s == nil || !s.Usable(now()) {
-		return nil, ErrInviteUnusable
-	}
-	member := f.Roles[req.Member] != roster.None
-	switch {
-	case req.Rejoin && (!member || req.Member == cfg.Me.Public()):
-		return nil, ErrNotMember
-	case !req.Rejoin && (member || f.Removed[req.Member] != roster.ID{}):
-		return nil, ErrAlreadyMember
 	}
 	if cfg.Approve != nil && !cfg.Approve(req) {
 		return nil, ErrNotApproved
 	}
-	// Approve may have taken a while: check the invite again, at the one
-	// instant the writer then uses too.
+	// Approve may have taken a while, or changed the roster: check again,
+	// on a fresh fold and at the one instant the writer then uses too.
 	t := now()
-	if s := f.Invites[cfg.Invite.Key]; !s.Usable(t) {
-		return nil, ErrInviteUnusable
+	if replay, err = admit(cfg, req, t); err != nil || replay {
+		return nil, err
 	}
 	w := &roster.Writer{R: cfg.Roster, Me: cfg.Me, Now: func() time.Time { return t }}
 	if !req.Rejoin {
@@ -202,12 +189,52 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 	}
 	op, err := w.Deliver(req.Member, cfg.Invite.Key)
 	if errors.Is(err, roster.ErrNotAllowed) {
-		// Everything else Deliver checks was checked above, against the
+		// Everything else Deliver checks was just checked, against the
 		// same roster and instant: the rejoiner holds every key already,
 		// so it needs only the roster, and the invite isn't spent.
 		return nil, nil
 	}
 	return op, err
+}
+
+// admit checks a request against the roster at t. replay reports a request
+// this invite already answered for this key (an add or a rejoin's deliver
+// naming it, to it): its answer was lost, and the joiner gets the roster
+// again with nothing written, so a spent or expired invite can't strand
+// it. The request's proofs bind it to that key and invite.
+func admit(cfg AdminConfig, req Request, t time.Time) (replay bool, err error) {
+	f, err := cfg.Roster.Fold()
+	if err != nil {
+		return false, err
+	}
+	if a := f.Roles[cfg.Me.Public()]; a != roster.Owner && a != roster.Admin {
+		return false, ErrNotAdmin
+	}
+	member := f.Roles[req.Member] != roster.None
+	if member && answered(f, cfg.Invite.Key, req.Member) {
+		return true, nil
+	}
+	if s := f.Invites[cfg.Invite.Key]; s == nil || !s.Usable(t) {
+		return false, ErrInviteUnusable
+	}
+	switch {
+	case req.Rejoin && (!member || req.Member == cfg.Me.Public()):
+		return false, ErrNotMember
+	case !req.Rejoin && (member || f.Removed[req.Member] != roster.ID{}):
+		return false, ErrAlreadyMember
+	}
+	return false, nil
+}
+
+// answered reports whether a counting add or deliver naming invite was
+// written to member.
+func answered(f *roster.Result, invite, member keys.PublicKey) bool {
+	for _, o := range f.Order {
+		if (o.Kind == roster.Add || o.Kind == roster.Deliver) && o.Invite == invite && o.Target == member && f.Counts[o.ID()] {
+			return true
+		}
+	}
+	return false
 }
 
 // JoinConfig is the joining side.
