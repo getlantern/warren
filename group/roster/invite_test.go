@@ -386,8 +386,8 @@ func TestConcurrentApprovalsOfOneJoiner(t *testing.T) {
 }
 
 // TestFoldScalesWithDuplicateAdds: a long chain of same-role duplicate adds,
-// some naming an invite, folds without refolding each one's history.
-// Each approval naming the invite spends it.
+// half naming an invite, folds in linear time, and each approval naming the
+// invite spends it.
 func TestFoldScalesWithDuplicateAdds(t *testing.T) {
 	r, _, admin, member := group(t)
 	inv := invite(t, r, admin, 50, 1)
@@ -396,7 +396,7 @@ func TestFoldScalesWithDuplicateAdds(t *testing.T) {
 	for i := range n {
 		o := w.base(Add)
 		o.Target, o.Role, o.Name = member.Public(), Member, "m"
-		if i%2 == 0 { // half name an invite, which asks about their history
+		if i%2 == 0 { // half name an invite, half don't
 			o.Invite = inv
 		}
 		o.Sign(admin)
