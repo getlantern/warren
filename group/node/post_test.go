@@ -360,9 +360,9 @@ func TestPausedMemberTickDoesntWait(t *testing.T) {
 
 // TestPostAfterEpochStopsCounting: posts flushed under an admin's
 // corrective rekey that then stops counting (the owner demoted the admin
-// concurrently) are still this member's. Later posts chain after them
-// rather than forking the member's own log, and since memberlog hides them
-// too, Post says so (ErrHidden) rather than reporting success.
+// concurrently) are still this member's, and memberlog hides them and
+// everything after. So later posts are refused (ErrHidden), not appended
+// hidden or at a number that would fork the log, and held ones stay held.
 func TestPostAfterEpochStopsCounting(t *testing.T) {
 	x := newGroup(t)
 	a := x.admins(t)
@@ -403,36 +403,33 @@ func TestPostAfterEpochStopsCounting(t *testing.T) {
 	if !n.Paused() {
 		t.Fatal("the admin's rekey still counts")
 	}
-	if _, err := n.Post(ctx, []byte("two")); err != nil {
-		t.Fatal(err)
+	if queued, err := n.Post(ctx, []byte("two")); !errors.Is(err, ErrHidden) || queued {
+		t.Fatalf("a post behind hidden entries: queued %v, %v", queued, err)
 	}
+	n.mu.Lock()
+	n.queue = append(n.queue, &heldPost{body: []byte("held")})
+	n.mu.Unlock()
 	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
 		_, err := (&roster.Writer{R: r, Me: x.owner}).Rekey()
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	n.mu.Lock()
-	ferr, fork := n.flushErr, n.cfg.Logs.Log(x.m1.Public()).Fork()
-	n.mu.Unlock()
-	if !errors.Is(ferr, ErrHidden) || fork != nil {
-		t.Fatalf("the flush after the owner's rekey: %v, fork %v", ferr, fork != nil)
-	}
-	if _, err := n.Post(ctx, []byte("three")); !errors.Is(err, ErrHeldFailed) || !errors.Is(err, ErrHidden) {
-		t.Fatalf("a post after a hidden flush: %v", err)
-	}
-	if h := n.TakeHeld(); len(h) != 0 {
-		t.Fatalf("a hidden post is still held: %q", h)
+	if n.Paused() {
+		t.Fatal("still paused after the owner's rekey")
 	}
 	if queued, err := n.Post(ctx, []byte("three")); !errors.Is(err, ErrHidden) || queued {
-		t.Fatalf("a direct post behind hidden entries: queued %v, %v", queued, err)
+		t.Fatalf("a post after the owner's rekey: queued %v, %v", queued, err)
 	}
 	n.mu.Lock()
 	l := n.cfg.Logs.Log(x.m1.Public())
-	last, fork := l.Last(), l.Fork()
+	last, fork, ferr := l.Last(), l.Fork(), n.flushErr
 	n.mu.Unlock()
-	if last == nil || last.Seq != 3 || fork != nil {
-		t.Fatalf("the member's own chain: last %v, fork %v", last, fork != nil)
+	if last == nil || last.Seq != 1 || fork != nil || ferr != nil {
+		t.Fatalf("the member's own chain: last %v, fork %v, flush %v", last, fork != nil, ferr)
+	}
+	if h := n.TakeHeld(); len(h) != 1 || string(h[0]) != "held" {
+		t.Fatalf("held %q", h)
 	}
 }
 

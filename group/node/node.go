@@ -85,11 +85,11 @@ var (
 	// ErrHeldFailed means held posts failed to append (Node.Post); the
 	// error wraps why.
 	ErrHeldFailed = errors.New("node: held posts failed to append")
-	// ErrHidden means a post was appended but doesn't show: it chains
-	// after this member's own entries under an epoch that stopped
-	// counting (an admin's rekey racing its demotion), which memberlog
-	// hides along with everything after them.
-	ErrHidden = errors.New("node: post appended but hidden behind entries under an epoch that stopped counting")
+	// ErrHidden means a post wasn't appended because this member's own log
+	// holds entries that don't show (under an epoch that stopped counting,
+	// say: an admin's rekey racing its demotion), and memberlog hides
+	// everything after them too.
+	ErrHidden = errors.New("node: own log stalled behind entries that don't show")
 )
 
 // Host owns a warren endpoint and routes its listeners and connections to

@@ -110,9 +110,10 @@ func (l *Log) Head() *Entry {
 
 // Last returns a copy of the last entry on the visible chain's line: the
 // head, or past it the entries held ahead that chain from it (ones the
-// roster no longer lets show, say), or nil. An author writing its own log
-// chains from this rather than Head: an entry at Head's next sequence
-// number would fork the log against one it already wrote.
+// roster no longer lets show, say), or nil. An author whose Last isn't
+// its Head can't append anything that shows: an entry after Last is
+// hidden behind it, and one after Head forks the log against one it
+// already wrote.
 func (l *Log) Last() *Entry {
 	seq := l.top
 	for {

@@ -1019,11 +1019,12 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       `node.ErrQueueFull`), as it does for a member that holds no current
       epoch key yet, and a post goes in behind anything held; a refresh
       that finds the condition gone appends them in order under the new
-      epoch, chaining after any of the member's own entries an epoch that
-      stopped counting hides (an admin's rekey racing its demotion), so
-      the log doesn't fork. memberlog hides everything after such an
-      entry too, so `Post` reports that (`node.ErrHidden`); letting the
-      chain show past them is a memberlog change still to make. A failed
+      epoch. If the member's own log holds entries that don't show (under
+      an epoch that stopped counting: an admin's rekey racing its
+      demotion), memberlog hides everything after them too, and an entry
+      after the visible head would fork the log, so `Post` refuses
+      (`node.ErrHidden`) and held posts stay held; letting the chain show
+      past such entries is a memberlog change still to make. A failed
       append is reported to later posts
       (`node.ErrHeldFailed`), and `Node.TakeHeld` hands over what's held,
       which `Leave` also leaves to the caller. A mirror's or removed
