@@ -1012,11 +1012,15 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       `roster.NeedsRekey` is the model's *Removal* step 3 (any seal of the
       current keys reached a key the fold leaves with no role, or the
       current epoch key reached a mirror), checked against the model in
-      the conformance walks. While it holds, `Node.Post` queues app
-      entries in memory (`node.MaxQueued`, then `node.ErrQueueFull`), as
-      it does for a member that holds no current epoch key yet; a refresh
+      the conformance walks. It skips seals by keys the fold gives no
+      role, since `Holds` are unchecked and such a key could keep the
+      group paused with no one to remove. While it holds, `Node.Post`
+      queues app entries in memory (`node.MaxQueued`, then
+      `node.ErrQueueFull`), as it does for a member that holds no current
+      epoch key yet, and a post goes in behind anything held; a refresh
       that finds the condition gone appends them in order under the new
-      epoch. An owner's or admin's node writes the corrective `rekey`
+      epoch. `Node.Held` hands back what's held, which `Leave` leaves to
+      the caller. A mirror's or removed member's post is refused. An owner's or admin's node writes the corrective `rekey`
       itself on its next `Tick` (`Join` ticks, so straight away for one
       joining an exposed roster). Content blobs join the queue in step 6;
    4. mirrors, once content and swarming exist.

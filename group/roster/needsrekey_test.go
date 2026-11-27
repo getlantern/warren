@@ -95,3 +95,25 @@ func TestNeedsRekeyMirrorEpoch(t *testing.T) {
 		t.Fatal("a mirror holding the current epoch key doesn't call for a rekey")
 	}
 }
+
+// TestNeedsRekeyIgnoresStrangers: a key with no role can sign an operation
+// Add stores, claiming to seal the current keys to another; that's no
+// exposure (it holds nothing to seal) and calls for nothing.
+func TestNeedsRekeyIgnoresStrangers(t *testing.T) {
+	r, _, _, _ := group(t)
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger := me(23)
+	o := (&Writer{R: r, Me: stranger}).base(Deliver)
+	o.Target = me(24).Public()
+	o.Seals = []Seal{{To: me(24).Public(), Holds: []KeyRef{{Made: f.Current}}, Box: make([]byte, 64)}}
+	o.Sign(stranger)
+	if _, err := r.Add(o); err != nil {
+		t.Fatalf("Add refused the stranger's op (the attack needs it stored): %v", err)
+	}
+	if needs(t, r) {
+		t.Fatal("a stranger's claimed seal calls for a rekey")
+	}
+}

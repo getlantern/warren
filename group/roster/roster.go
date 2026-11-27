@@ -374,9 +374,16 @@ func (h *ready) Pop() any {
 // f keeps, and until it lands members publish nothing. It reads every
 // operation's seals, counting or not: a member delivering the current keys
 // to a key of its own calls for one too (the answer to that is removing
-// it). f must be r's fold.
+// it). Seals by keys f gives no role are skipped: Add stores any signed
+// operation, so a throwaway key could otherwise claim a seal (Holds are
+// unchecked) and keep the group paused with no one to remove, and such a
+// key can only seal current keys it holds, which a seal to it already
+// shows. f must be r's fold.
 func (r *Roster) NeedsRekey(f *Result) bool {
 	for _, o := range r.ops {
+		if f.Roles[o.Author] == None {
+			continue
+		}
 		for _, s := range o.Seals {
 			role := f.Roles[s.To]
 			if role != None && role != Mirror {

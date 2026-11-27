@@ -129,6 +129,10 @@ func TestPausedPostsFlushAfterRekey(t *testing.T) {
 	if !n.Paused() {
 		t.Fatal("not paused on an exposed roster")
 	}
+	// Refused, not held where it would block the queue's flush.
+	if queued, err := n.Post(context.Background(), make([]byte, memberlog.MaxBody+1)); err == nil || queued {
+		t.Fatalf("an oversized post while paused: queued %v, %v", queued, err)
+	}
 	defer func(m int) { MaxQueued = m }(MaxQueued)
 	MaxQueued = 2
 	for _, b := range []string{"one", "two"} {
@@ -194,6 +198,16 @@ func TestAdminCorrectsOnTick(t *testing.T) {
 	}
 	if ops(t, m) != before || !m.Paused() {
 		t.Fatal("a member's node wrote a rekey")
+	}
+	// Held posts are the caller's after Leave.
+	if _, err := m.Post(ctx, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h := m.Held(); len(h) != 1 || string(h[0]) != "one" {
+		t.Fatalf("held after Leave %q", h)
 	}
 
 	for _, id := range []*keys.Identity{x.owner, a} {
@@ -276,5 +290,66 @@ func TestPostWithoutEpochKeyQueues(t *testing.T) {
 	}
 	if got := bodies(t, n, k); len(got) != 1 || got[0] != "one" {
 		t.Fatalf("log after the deliver %q", got)
+	}
+}
+
+// TestPostRefusals: a mirror's post is refused, and a post goes in behind
+// anything held.
+func TestPostRefusals(t *testing.T) {
+	x := newGroup(t)
+	mirror := me(7)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(mirror.Public(), "mirror", roster.Mirror, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	seed := network(t, 6)
+	n := x.join(t, host(t, seed), x.m1, x.r)
+	n.mu.Lock()
+	n.queue = append(n.queue, []byte("held"))
+	n.mu.Unlock()
+	if queued, err := n.Post(context.Background(), []byte("next")); err != nil || !queued {
+		t.Fatalf("a post behind a held one: queued %v, %v", queued, err)
+	}
+	// Its Do's refresh flushes both, the held one first.
+	if got := bodies(t, n, x.m1); len(got) != 2 || got[0] != "held" || got[1] != "next" {
+		t.Fatalf("log %q", got)
+	}
+	if h := n.Held(); len(h) != 0 {
+		t.Fatalf("held after the flush %q", h)
+	}
+
+	mn := x.join(t, host(t, seed), mirror, x.r)
+	if _, err := mn.Post(context.Background(), []byte("x")); !errors.Is(err, roster.ErrNotAllowed) {
+		t.Fatalf("a mirror's post: %v", err)
+	}
+}
+
+// TestPausedMemberTickDoesntWait: a paused member's node has no rekey to
+// write, so its Tick doesn't wait for the group.
+func TestPausedMemberTickDoesntWait(t *testing.T) {
+	x := newGroup(t)
+	x.admins(t)
+	if err := x.expose(x.r); err != nil {
+		t.Fatal(err)
+	}
+	f, err := x.r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.g = x.r.Keyring(x.owner).Secrets[f.Current]
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	held, release := make(chan struct{}), make(chan struct{})
+	go func() {
+		_ = n.Do(context.Background(), func(*roster.Roster, *memberlog.Set) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	defer close(release)
+	<-held
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := n.Tick(ctx); err != nil {
+		t.Fatalf("a paused member's Tick waited on the group: %v", err)
 	}
 }

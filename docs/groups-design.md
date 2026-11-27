@@ -458,7 +458,11 @@ Removing a member:
    after it has sealed the current keys. A compromised member can trigger
    it on purpose, by delivering the current keys to a key of its own, and
    so pause publishing until the rekey lands; the answer is to remove it,
-   which the rekey that follows does. The rekey protects only what comes
+   which the rekey that follows does. Seals by a key the fold gives no role
+   don't count toward this: the keys a seal claims to hold aren't checked,
+   so such a key could otherwise keep the group paused with no one to
+   remove, and it can only seal current keys it holds, which a seal to it
+   already shows. The rekey protects only what comes
    next: past epoch keys that reached such a key (a removed one, or one
    whose `add` the fold dropped) stay readable to it. (The first wording only covered
    keys reaching a *removed* member; the roster model found the demotion
