@@ -980,3 +980,30 @@ func TestApproveAfterCancel(t *testing.T) {
 		t.Fatalf("an approval after cancellation: op=%v err=%v", op, err)
 	}
 }
+
+// TestCancelledRetryCommitsNothing: a retry that would redeliver missed
+// keys commits nothing once the session's context has ended.
+func TestCancelledRetryCommitsNothing(t *testing.T) {
+	x := group(t, 1)
+	joiner := me(9)
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin, Now: clock}).Add(joiner.Public(), "j", roster.Member, x.issued.Invite.Key); err != nil {
+		t.Fatal(err) // as if the answer to this add was lost
+	}
+	x.missRekey(t) // so a retry would deliver
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	iv := x.issued.Invite
+	go func() { _, _ = Join(context.Background(), a, JoinConfig{Invite: iv, Me: joiner, Secret: secret}) }()
+	req, err := Verify(context.Background(), b, iv, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := len(x.r.IDs())
+	op, err := Answer(ctx, b, AdminConfig{Roster: x.r, Me: x.admin, Invite: iv, Secret: secret, Now: clock}, req)
+	if op != nil || len(x.r.IDs()) != before || !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled retry: op=%v err=%v, roster grew %d", op, err, len(x.r.IDs())-before)
+	}
+}

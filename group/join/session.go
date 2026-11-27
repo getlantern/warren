@@ -239,7 +239,7 @@ func decide(ctx context.Context, cfg AdminConfig, now func() time.Time, req Requ
 		return nil, err
 	}
 	if replay {
-		return redeliver(cfg, req, now())
+		return redeliver(ctx, cfg, req, now())
 	}
 	if f, err := cfg.Roster.Fold(); err != nil || !fits(f.Order) {
 		// Even without the op it would write, the answer couldn't be
@@ -259,14 +259,14 @@ func decide(ctx context.Context, cfg AdminConfig, now func() time.Time, req Requ
 		return nil, err
 	}
 	if replay {
-		return redeliver(cfg, req, t)
+		return redeliver(ctx, cfg, req, t)
 	}
 	if !req.Rejoin {
-		return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+		return stage(ctx, cfg, t, func(w *roster.Writer) (*roster.Op, error) {
 			return w.Add(req.Member, req.Name, roster.Member, cfg.Invite.Key)
 		})
 	}
-	op, err := stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+	op, err := stage(ctx, cfg, t, func(w *roster.Writer) (*roster.Op, error) {
 		op, err := w.Deliver(req.Member, cfg.Invite.Key)
 		if errors.Is(err, roster.ErrNotAllowed) {
 			// Everything else Deliver checks was just checked, against the
@@ -316,9 +316,9 @@ func (a *Answered) has(k keys.PublicKey) bool {
 
 // stage writes an answer's operation, if any, on a copy of the roster at
 // t, and commits it only if the answer it makes fits what the joiner
-// takes: an approval committed that can't be sent would spend the invite
-// for nothing.
-func stage(cfg AdminConfig, t time.Time, write func(*roster.Writer) (*roster.Op, error)) (*roster.Op, error) {
+// takes (an approval committed that can't be sent would spend the invite
+// for nothing) and the session's context hasn't ended.
+func stage(ctx context.Context, cfg AdminConfig, t time.Time, write func(*roster.Writer) (*roster.Op, error)) (*roster.Op, error) {
 	c := cfg.Roster.Clone()
 	op, err := write(&roster.Writer{R: c, Me: cfg.Me, Now: func() time.Time { return t }})
 	if err != nil {
@@ -330,6 +330,9 @@ func stage(cfg AdminConfig, t time.Time, write func(*roster.Writer) (*roster.Op,
 	}
 	if !fits(f.Order) {
 		return nil, ErrTooLarge
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err // the session ended: commit nothing
 	}
 	if op != nil {
 		if _, err := cfg.Roster.Add(op); err != nil {
@@ -405,8 +408,8 @@ func answered(f *roster.Result, invite, member keys.PublicKey) bool {
 // keys the member has since come to lack (a rekey made without it, say).
 // That deliver names no invite, so it spends nothing and needs no usable
 // invite; any member may be delivered to.
-func redeliver(cfg AdminConfig, req Request, t time.Time) (*roster.Op, error) {
-	return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+func redeliver(ctx context.Context, cfg AdminConfig, req Request, t time.Time) (*roster.Op, error) {
+	return stage(ctx, cfg, t, func(w *roster.Writer) (*roster.Op, error) {
 		op, err := w.Deliver(req.Member, keys.PublicKey{})
 		if errors.Is(err, roster.ErrNotAllowed) {
 			return nil, nil // it holds every key
