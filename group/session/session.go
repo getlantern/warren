@@ -106,9 +106,15 @@ type Config struct {
 // caller's to close.
 func Run(ctx context.Context, conn io.ReadWriteCloser, cfg Config) (keys.PublicKey, error) {
 	s := newSession(cfg, conn)
-	stop := make(chan struct{})
-	defer close(stop)
+	// The watcher is joined before Run returns, so a ctx the caller
+	// cancels afterwards can't close conn under it.
+	stop, watched := make(chan struct{}), make(chan struct{})
+	defer func() {
+		close(stop)
+		<-watched
+	}()
 	go func() {
+		defer close(watched)
 		select {
 		case <-ctx.Done():
 			conn.Close()

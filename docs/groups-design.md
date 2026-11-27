@@ -30,7 +30,9 @@ Non-goals for v1: groups of thousands (see *Scale*), anonymity against a
 member (members see each other's addresses when they connect),
 deniability, and hiding from a DHT node that the same IP address is behind
 two groups, or behind one rendezvous key after another across periods (see
-*Identity*): rotating identifiers don't hide a stable address.
+*Identity*): rotating identifiers don't hide a stable address. Groups joined
+on one `group/node` host share its socket too, so the same address and port
+link them to one device even behind a shared NAT.
 
 ## What Rust warren did, and what changes
 

@@ -81,6 +81,16 @@ type group struct {
 	r                *roster.Roster
 	g                keys.Secret
 	owner, m1, m2, x *keys.Identity
+	// clock, if set, is every joined node's clock, so tests that must agree
+	// on the period don't straddle an hour.
+	clock func() time.Time
+}
+
+func (x *group) now() time.Time {
+	if x.clock != nil {
+		return x.clock()
+	}
+	return time.Now()
 }
 
 func newGroup(t *testing.T) *group {
@@ -115,8 +125,8 @@ func copyRoster(t *testing.T, r *roster.Roster) *roster.Roster {
 	return c
 }
 
-// join puts id, with its own copy of r, on h, and waits until its
-// listeners are published.
+// join puts id, with its own copy of r, on h, and waits until its listener
+// for the current period is published (not just any on the host).
 func (x *group) join(t *testing.T, h *Host, id *keys.Identity, r *roster.Roster) *Node {
 	t.Helper()
 	c := copyRoster(t, r)
@@ -130,13 +140,14 @@ func (x *group) join(t *testing.T, h *Host, id *keys.Identity, r *roster.Roster)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	n, err := h.Join(ctx, Config{Me: id, Group: x.g, Roster: c, Logs: logs, CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second})
+	n, err := h.Join(ctx, Config{Me: id, Group: x.g, Roster: c, Logs: logs, Now: x.clock, CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
+	key := id.Rendezvous(x.g, keys.PeriodOf(x.now())).Public()
 	for {
 		var holders int
-		h.Endpoint().DHT().Inspect(ctx, func(d *dht.Node) { holders = len(d.Holders()) })
+		h.Endpoint().DHT().Inspect(ctx, func(d *dht.Node) { holders = len(d.HoldersFor(key)) })
 		if holders > 0 {
 			return n
 		}
@@ -334,6 +345,8 @@ func TestStrangerRefused(t *testing.T) {
 func TestPublishAndReadDirectory(t *testing.T) {
 	seed := network(t, 10)
 	x := newGroup(t)
+	fixed := time.Now()
+	x.clock = func() time.Time { return fixed }
 	a := x.join(t, host(t, seed), x.m1, x.r)
 	b := x.join(t, host(t, seed), x.m2, x.r)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -430,6 +443,11 @@ func TestAdmits(t *testing.T) {
 	if h.authorize(rv(x.m2, p), rv(x.m2, p)) {
 		t.Fatal("a listener the host doesn't hold admitted a caller")
 	}
+	n.ready.Store(false) // as while Join is still listening
+	if h.authorize(ours, rv(x.m2, p)) {
+		t.Fatal("the host routed a call to a group whose join hadn't finished")
+	}
+	n.ready.Store(true)
 	// A member added through Do is admitted at once.
 	newcomer := me(7)
 	if err := n.Do(func(r *roster.Roster, _ *memberlog.Set) error {
@@ -495,6 +513,12 @@ func TestStalledCallerReleasesGroup(t *testing.T) {
 // nothing on it.
 func rawStream(t *testing.T, a *Node, from, to *keys.Identity, g keys.Secret) net.Conn {
 	t.Helper()
+	return rawStreamTo(t, a, from, to, g, streamName)
+}
+
+// rawStreamTo is rawStream asking for dest.
+func rawStreamTo(t *testing.T, a *Node, from, to *keys.Identity, g keys.Secret, dest string) net.Conn {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	p := keys.PeriodOf(time.Now())
@@ -508,7 +532,7 @@ func rawStream(t *testing.T, a *Node, from, to *keys.Identity, g keys.Secret) ne
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cl.Close() })
-	stream, err := cl.DialConn(ctx, streamName)
+	stream, err := cl.DialConn(ctx, dest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,6 +657,8 @@ func TestSyncAllCarriesOn(t *testing.T) {
 func TestPublishSightings(t *testing.T) {
 	seed := network(t, 10)
 	x := newGroup(t)
+	fixed := time.Now()
+	x.clock = func() time.Time { return fixed }
 	a := x.join(t, host(t, seed), x.m1, x.r)
 	b := x.join(t, host(t, seed), x.m2, x.r)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -773,5 +799,92 @@ func TestLingerBounded(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		bounded("a cancelled linger", 2*time.Second, func() { slow.linger(ctx, a) })
 		cancel()
+	}
+}
+
+// TestWrongStreamEndsServe: a stream asking for another destination ends
+// the connection at once, rather than keeping it until it goes idle.
+func TestWrongStreamEndsServe(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r)
+	b := x.join(t, host(t, seed), x.m2, x.r)
+	stream := rawStreamTo(t, a, x.m1, x.m2, x.g, "elsewhere:1")
+	if _, err := stream.Write([]byte{preamble}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	eventually(t, "the callee kept serving a stream for another destination", func() bool { return b.h.serving.Load() == 0 })
+	if d := time.Since(start); d > b.cfg.CallTimeout {
+		t.Fatalf("the connection lasted %v, as if left to go idle", d)
+	}
+}
+
+// TestJoinTwiceRefused: a host can't join one group as one member twice.
+func TestJoinTwiceRefused(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	h := host(t, seed)
+	x.join(t, h, x.m1, x.r)
+	c := copyRoster(t, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := h.Join(ctx, Config{Me: x.m1, Group: x.g, Roster: c, Logs: memberlog.NewSet(c.Group())}); !errors.Is(err, ErrJoined) {
+		t.Fatalf("got %v, want ErrJoined", err)
+	}
+	h.mu.Lock()
+	groups := len(h.groups)
+	h.mu.Unlock()
+	if groups != 1 {
+		t.Fatalf("%d groups on the host, want 1", groups)
+	}
+}
+
+// TestDoMakesBusy: while Do holds the roster, a session can't begin, and
+// trying leaves the group not busy.
+func TestDoMakesBusy(t *testing.T) {
+	x := newGroup(t)
+	n := &Node{cfg: Config{Me: me(2), Group: x.g, Roster: copyRoster(t, x.r)}}
+	inDo, release, out := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(out)
+		_ = n.Do(func(*roster.Roster, *memberlog.Set) error {
+			close(inDo)
+			<-release
+			return nil
+		})
+	}()
+	<-inDo
+	got := make(chan bool, 1)
+	go func() { got <- n.begin() }()
+	select {
+	case ok := <-got:
+		if ok {
+			t.Fatal("a session began while Do held the roster")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("begin waited on Do")
+	}
+	if n.active.Load() {
+		t.Fatal("a refused begin left the group busy")
+	}
+	close(release)
+	<-out
+}
+
+// TestNoFallbackForAbsentMember: a member that isn't listening at all isn't
+// called again under the sync key, which dials the same listener.
+func TestNoFallbackForAbsentMember(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	a := x.join(t, host(t, seed), x.m1, x.r) // m2 never joins
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := a.Call(ctx, x.m2.Public())
+	if !errors.Is(err, dht.ErrNoRecord) {
+		t.Fatalf("got %v, want ErrNoRecord", err)
+	}
+	if u, ok := err.(interface{ Unwrap() []error }); ok && len(u.Unwrap()) != 1 {
+		t.Fatalf("an absent member was called again under the sync key: %v", err)
 	}
 }

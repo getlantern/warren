@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/getlantern/warren/dht"
 	"github.com/getlantern/warren/endpoint"
 	"github.com/getlantern/warren/group/directory"
 	"github.com/getlantern/warren/group/keys"
@@ -57,6 +58,9 @@ var (
 	ErrBusy = errors.New("node: in another session")
 	// ErrClosed means the host was closed.
 	ErrClosed = errors.New("node: host closed")
+	// ErrJoined means the host has already joined the group as that
+	// member: the two would listen under the same keys.
+	ErrJoined = errors.New("node: already joined")
 )
 
 // Host owns a warren endpoint and routes its listeners and connections to
@@ -129,7 +133,7 @@ func (h *Host) groupFor(key keys.PublicKey) *Node {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, n := range h.groups {
-		if n.listensUnder(key) {
+		if n.ready.Load() && n.listensUnder(key) {
 			return n
 		}
 	}
@@ -206,6 +210,10 @@ type Node struct {
 
 	shards uint32 // the genesis op's, fixed for the group's life
 
+	// ready is set once Join succeeds: until then the host routes nothing
+	// to the group, so a failed join is never reached.
+	ready atomic.Bool
+
 	smu  sync.Mutex
 	seen map[keys.PublicKey]time.Time // member → last session with it
 }
@@ -225,12 +233,19 @@ func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	n.refresh()
 	n.mu.Unlock()
 	h.mu.Lock()
+	for _, g := range h.groups {
+		if g.cfg.Group == cfg.Group && g.cfg.Me.Public() == cfg.Me.Public() {
+			h.mu.Unlock()
+			return nil, ErrJoined
+		}
+	}
 	h.groups = append(h.groups, n)
 	h.mu.Unlock()
 	if err := n.Tick(ctx); err != nil {
 		n.leave()
 		return nil, err
 	}
+	n.ready.Store(true)
 	return n, nil
 }
 
@@ -282,9 +297,9 @@ func (n *Node) Tick(ctx context.Context) error {
 // drops the rest, keeping the previous period's for a call across the
 // boundary.
 func (n *Node) rotate(ctx context.Context) error {
-	p := keys.PeriodOf(n.now())
 	n.lmu.Lock()
 	defer n.lmu.Unlock()
+	p := keys.PeriodOf(n.now()) // under lmu, so an older Tick can't undo a newer
 	// Drop first, so a full listener table doesn't keep the old keys.
 	for q, s := range n.listening {
 		if q+1 < p || q > p+1 { // q > p+1: the clock went back
@@ -421,6 +436,7 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 		idle.Reset(idleFor)
 		try := streams.Add(1)
 		if dest != streamName || try > busyTries {
+			giveUp() // keeps a connection whose session has started
 			return
 		}
 		var b [1]byte
@@ -481,7 +497,12 @@ func (n *Node) begin() bool {
 	if !n.active.CompareAndSwap(false, true) {
 		return false
 	}
-	n.mu.Lock()
+	// A Do holding mu makes the group busy too: waiting on it couldn't be
+	// cancelled, not even by Close.
+	if !n.mu.TryLock() {
+		n.active.Store(false)
+		return false
+	}
 	return true
 }
 
@@ -550,8 +571,8 @@ func (n *Node) linger(ctx context.Context, stream net.Conn) {
 // Call reaches member and syncs with it: under this period's rendezvous
 // key first, and if the member doesn't answer (it may not know us yet, and
 // a listener stays silent to a caller it doesn't admit), under the sync
-// key for calling it. A member that answers and then fails the session
-// isn't called again.
+// key for calling it. A member that answers, or that isn't listening at
+// all, isn't called again.
 func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
 	roles, err := n.view()
 	if err != nil {
@@ -584,13 +605,20 @@ func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
 	return errors.Join(errs...)
 }
 
-// callAs calls callee under as, reporting whether it answered.
+// silent reports whether a failed Connect means the callee didn't answer
+// (the one case a sync-key call can help): no holder delivered an answer,
+// or the call ran out of time while ctx, the caller's, didn't.
+func (n *Node) silent(ctx context.Context, err error) bool {
+	return errors.Is(err, dht.ErrNoAnswer) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil)
+}
+
+// callAs calls callee under as, reporting whether it answered (see silent).
 func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey) (bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, n.cfg.CallTimeout)
 	defer cancel()
 	c, err := n.h.ep.Connect(cctx, keys.CryptoSigner(as), callee)
 	if err != nil {
-		return false, err
+		return !n.silent(ctx, err), err
 	}
 	defer func() { _ = c.Close() }()
 	sctx, scancel := context.WithTimeout(ctx, n.cfg.SessionTimeout)
@@ -631,7 +659,9 @@ func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey
 // it if the callee answers go. It reports the answer's round trip, zero if
 // none was asked.
 func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) (time.Duration, error) {
-	stream, err := cl.DialConn(ctx, streamName)
+	dctx, cancel := context.WithTimeout(ctx, n.cfg.CallTimeout) // the first does the handshake
+	stream, err := cl.DialConn(dctx, streamName)
+	cancel()
 	if err != nil {
 		return 0, err
 	}
