@@ -43,6 +43,9 @@ const streamName = "warren-group:1"
 // listened under.
 const Grace = 24 * time.Hour
 
+// MaxQueued bounds the posts held while publishing is paused (Node.Post).
+var MaxQueued = 1000
+
 // busyTries and busyWait bound a call's tries of a busy group.
 const (
 	busyTries = 3
@@ -76,6 +79,9 @@ var (
 	ErrJoined = errors.New("node: already joined")
 	// ErrLeft means the node has left its host (Node.Leave).
 	ErrLeft = errors.New("node: left")
+	// ErrQueueFull means a post found the publish queue full (MaxQueued)
+	// while publishing is paused.
+	ErrQueueFull = errors.New("node: publish queue full")
 )
 
 // Host owns a warren endpoint and routes its listeners and connections to
@@ -273,6 +279,13 @@ type Node struct {
 	// rekeyed is set when refresh moves to a new secret, so whoever ends
 	// the session or Do rotates the listeners onto it.
 	rekeyed atomic.Bool
+
+	// paused is set while the roster calls for a corrective rekey
+	// (roster.NeedsRekey): the current keys have reached a key that isn't
+	// a member, so the node publishes nothing until the rekey lands.
+	paused atomic.Bool
+	// queue is the posts held while paused, in order. mu held.
+	queue [][]byte
 }
 
 // sighting is a session with a member: when, and under which group secret.
@@ -433,7 +446,10 @@ func (n *Node) Tick(ctx context.Context) error {
 	if n.left.Load() {
 		return ErrLeft // the roster is the caller's again
 	}
-	err := n.rotate(ctx)
+	// Before rotating, so the listeners follow a corrective rekey's secret
+	// in this same Tick.
+	cerr := n.correct(ctx)
+	err := errors.Join(cerr, n.rotate(ctx))
 	// After lmu is released, as the host's admission and routing take it.
 	// A session holding mu refreshes when it ends, with the clock then.
 	// Leave may have run meanwhile: checked again under mu, which Leave's
@@ -597,6 +613,11 @@ func (n *Node) refresh() {
 		if n.follow(g, cands, now) {
 			n.rekeyed.Store(true)
 		}
+	}
+	// A roster that won't fold pauses publishing too: fail closed.
+	n.paused.Store(err != nil || n.cfg.Roster.NeedsRekey(f))
+	if !n.paused.Load() {
+		n.flush()
 	}
 	admit := map[keys.PublicKey]bool{}
 	p := keys.PeriodOf(now)

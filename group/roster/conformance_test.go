@@ -210,6 +210,20 @@ func (tr *translation) compare(s m.Store) error {
 			return fmt.Errorf("key %d's group secrets: %w", k, err)
 		}
 	}
+	// The model's Removal step 3 (its checker's docPredicate): the current
+	// keys reached a key off the roster, or the current epoch key a mirror.
+	needs := false
+	for k := range epochs {
+		switch role := mf.Roles[k]; {
+		case role == m.None && (epochs[k][mf.Current] || gs[k][mf.Current]):
+			needs = true
+		case role == m.Mirror && epochs[k][mf.Current]:
+			needs = true
+		}
+	}
+	if got := rr.NeedsRekey(rf); got != needs {
+		return fmt.Errorf("model calls for a corrective rekey=%v, real %v", needs, got)
+	}
 	return nil
 }
 

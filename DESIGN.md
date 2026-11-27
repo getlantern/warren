@@ -1008,7 +1008,17 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       runs one session at a time, so this is every session the removed
       key has; once content and swarming bring longer-lived ones, applying
       a removal must also close any others with that key;
-   3. the publish pause until a corrective rekey;
+   3. the publish pause until a corrective rekey (built):
+      `roster.NeedsRekey` is the model's *Removal* step 3 (any seal of the
+      current keys reached a key the fold leaves with no role, or the
+      current epoch key reached a mirror), checked against the model in
+      the conformance walks. While it holds, `Node.Post` queues app
+      entries in memory (`node.MaxQueued`, then `node.ErrQueueFull`), as
+      it does for a member that holds no current epoch key yet; a refresh
+      that finds the condition gone appends them in order under the new
+      epoch. An owner's or admin's node writes the corrective `rekey`
+      itself on its next `Tick` (`Join` ticks, so straight away for one
+      joining an exposed roster). Content blobs join the queue in step 6;
    4. mirrors, once content and swarming exist.
 
 **B. DHT speed** (*Performance against libtorrent*): the hit median is
