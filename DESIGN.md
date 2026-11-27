@@ -963,7 +963,15 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       caller tries again on the same connection after a random wait),
       bounds a caller's admission by the call timeout, and records whom it
       reached. Tested over loopback networks;
-   4. join and rejoin sessions, with invites.
+   4. join and rejoin with invites, in three parts:
+      1. `roster` invite accounting (built): an `invite` carries its uses;
+         the fold reports each invite's expiry, uses, uses spent by adds
+         and rejoins' delivers that name it, and whether a removal after it
+         killed it; writers refuse an invite that isn't usable. Concurrent
+         approvals are counted, not dropped;
+      2. `group/join`: the invite token and the join session protocol;
+      3. `group/node`: listening under blinded invite keys, joining and
+         rejoining by invite.
 6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
    tree over ciphertext, announcements. Pure library, so it can be built
    alongside steps 4 and 5.

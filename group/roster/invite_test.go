@@ -1,0 +1,220 @@
+package roster
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/getlantern/warren/group/keys"
+)
+
+var inviteNow = time.Unix(1_800_000_000, 0)
+
+func clock() time.Time { return inviteNow }
+
+// invite records a fresh invite with uses and an hour to run.
+func invite(t *testing.T, r *Roster, by *keys.Identity, b byte, uses uint32) keys.PublicKey {
+	t.Helper()
+	inv := me(b).Public()
+	if _, err := (&Writer{R: r, Me: by, Now: clock}).Invite(inv, uses, inviteNow.Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	return inv
+}
+
+func inviteState(t *testing.T, r *Roster, inv keys.PublicKey) *InviteState {
+	t.Helper()
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := f.Invites[inv]
+	if s == nil {
+		t.Fatal("the invite isn't recorded")
+	}
+	return s
+}
+
+func TestInviteRecorded(t *testing.T) {
+	r, owner, admin, member := group(t)
+	inv := invite(t, r, admin, 50, 2)
+	s := inviteState(t, r, inv)
+	if s.Uses != 2 || s.Used != 0 || s.Dead || s.Expires != inviteNow.Add(time.Hour).Unix() || !s.Usable(inviteNow) {
+		t.Fatalf("recorded as %+v", s)
+	}
+	exp := inviteNow.Add(time.Hour).Unix()
+	for name, try := range map[string]func() error{
+		"the same key again": func() error { _, err := (&Writer{R: r, Me: owner}).Invite(inv, 1, exp); return err },
+		"by a member":        func() error { _, err := (&Writer{R: r, Me: member}).Invite(me(51).Public(), 1, exp); return err },
+		"with no uses":       func() error { _, err := (&Writer{R: r, Me: owner}).Invite(me(52).Public(), 0, exp); return err },
+		"with too many uses": func() error {
+			_, err := (&Writer{R: r, Me: owner}).Invite(me(53).Public(), MaxUses+1, exp)
+			return err
+		},
+	} {
+		if err := try(); !errors.Is(err, ErrNotAllowed) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// TestInviteSpent: each add or rejoin's deliver naming an invite spends a
+// use, and a spent invite can't be named again.
+func TestInviteSpent(t *testing.T) {
+	r, _, admin, member := group(t)
+	inv := invite(t, r, admin, 50, 2)
+	w := &Writer{R: r, Me: admin, Now: clock}
+	if _, err := w.Add(me(60).Public(), "new", Member, inv); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); s.Used != 1 || !s.Usable(inviteNow) {
+		t.Fatalf("after an add: %+v", s)
+	}
+	// A rejoin spends one too. The member must lack keys to deliver: the
+	// owner rekeys in a copy that hasn't seen the member's add.
+	missKeys(t, r, member)
+	if _, err := w.Deliver(member.Public(), inv); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); s.Used != 2 || s.Usable(inviteNow) {
+		t.Fatalf("after a rejoin: %+v", s)
+	}
+	if _, err := w.Add(me(61).Public(), "another", Member, inv); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("a spent invite admitted another: %v", err)
+	}
+}
+
+func TestInviteRefusedWhenUnusable(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	inv := invite(t, r, admin, 50, 1)
+	late := &Writer{R: r, Me: admin, Now: func() time.Time { return inviteNow.Add(time.Hour) }}
+	if _, err := late.Add(me(60).Public(), "late", Member, inv); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("an expired invite admitted: %v", err)
+	}
+	w := &Writer{R: r, Me: admin, Now: clock}
+	if _, err := w.Add(me(60).Public(), "stranger", Member, me(59).Public()); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("an unrecorded invite admitted: %v", err)
+	}
+	// A removal kills the invites issued before it, not those after.
+	victim := me(70)
+	if _, err := w.Add(victim.Public(), "victim", Member, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Writer{R: r, Me: owner}).Remove(victim.Public(), 0, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); !s.Dead || s.Usable(inviteNow) {
+		t.Fatalf("an invite issued before a removal survived it: %+v", s)
+	}
+	if _, err := w.Add(me(60).Public(), "after", Member, inv); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("a dead invite admitted: %v", err)
+	}
+	fresh := invite(t, r, admin, 51, 1)
+	if s := inviteState(t, r, fresh); s.Dead {
+		t.Fatal("an invite issued after the removal is dead")
+	}
+	if _, err := w.Add(me(60).Public(), "after", Member, fresh); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestInviteOverspentConcurrently: two admins approving one single-use
+// invite at once both admit their joiner; the fold counts both uses rather
+// than dropping an admission.
+func TestInviteOverspentConcurrently(t *testing.T) {
+	r, owner, admin, _ := group(t)
+	inv := invite(t, r, admin, 50, 1)
+	c := r.Clone()
+	a, err := (&Writer{R: r, Me: admin, Now: clock}).Add(me(60).Public(), "a", Member, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := (&Writer{R: c, Me: owner, Now: clock}).Add(me(61).Public(), "b", Member, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Add(a); err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []*Roster{r, c} {
+		f, err := x.Fold()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Roles[me(60).Public()] != Member || f.Roles[me(61).Public()] != Member {
+			t.Fatal("an admission was dropped")
+		}
+		if s := f.Invites[inv]; s.Used != 2 || s.Usable(inviteNow) {
+			t.Fatalf("an overspent invite reads %+v", s)
+		}
+	}
+}
+
+// TestInviteFirstRecordStands: a second invite op for one key (only a
+// hand-made one; the writer refuses) doesn't reset its uses.
+func TestInviteFirstRecordStands(t *testing.T) {
+	r, _, admin, _ := group(t)
+	inv := invite(t, r, admin, 50, 1)
+	w := &Writer{R: r, Me: admin, Now: clock}
+	if _, err := w.Add(me(60).Public(), "a", Member, inv); err != nil {
+		t.Fatal(err)
+	}
+	o := w.base(Invite)
+	o.Invite, o.Expires, o.Uses = inv, inviteNow.Add(2*time.Hour).Unix(), 5
+	o.Sign(admin)
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	if s := inviteState(t, r, inv); s.Uses != 1 || s.Used != 1 {
+		t.Fatalf("a later record reset the invite: %+v", s)
+	}
+}
+
+// missKeys has the owner rekey in a copy of r holding only the genesis and
+// the admin's add, so m lacks the new keys once r takes the rekey.
+func missKeys(t *testing.T, r *Roster, m *keys.Identity) {
+	t.Helper()
+	stale, err := New(r.Op(r.Group()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.ops {
+		if o.Kind == Add && o.Target == me(2).Public() {
+			if _, err := stale.Add(o); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rk, err := (&Writer{R: stale, Me: me(1)}).Rekey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Add(rk); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Keyring(m).Epochs[rk.ID()]; ok {
+		t.Fatal("the member got the rekey")
+	}
+}
+
+// TestInviteOnlyCounting: an invite op that doesn't count (a member can't
+// invite) records nothing.
+func TestInviteOnlyCounting(t *testing.T) {
+	r, _, _, member := group(t)
+	o := (&Writer{R: r, Me: member}).base(Invite)
+	o.Invite, o.Expires, o.Uses = me(50).Public(), inviteNow.Add(time.Hour).Unix(), 1
+	o.Sign(member)
+	if _, err := r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Invites[me(50).Public()] != nil {
+		t.Fatal("a member's invite was recorded")
+	}
+}

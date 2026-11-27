@@ -447,8 +447,12 @@ func TestDecodeRejectsFieldsOutsideKind(t *testing.T) {
 		"a name on a rekey":     func(o *Op) { o.Name = "x" },
 		"a log head on a rekey": func(o *Op) { o.LogSeq = 3 },
 		"an expiry on a rekey":  func(o *Op) { o.Expires = 5 },
+		"uses on a rekey":       func(o *Op) { o.Uses = 1 },
 		"an invite with no expiry": func(o *Op) {
-			o.Kind, o.Invite, o.CommitSecret, o.CommitEpoch = Invite, admin.Public(), [32]byte{}, [32]byte{}
+			o.Kind, o.Invite, o.Uses, o.CommitSecret, o.CommitEpoch = Invite, admin.Public(), 1, [32]byte{}, [32]byte{}
+		},
+		"an invite with no uses": func(o *Op) {
+			o.Kind, o.Invite, o.Expires, o.CommitSecret, o.CommitEpoch = Invite, admin.Public(), 5, [32]byte{}, [32]byte{}
 		},
 	} {
 		o := w.base(Rekey)
@@ -469,7 +473,7 @@ func TestFoldScales(t *testing.T) {
 	const n = 3000
 	for i := range n {
 		o := w.base(Invite)
-		o.Invite, o.Expires = inv, int64(i+1)
+		o.Invite, o.Expires, o.Uses = inv, int64(i+1), 1
 		o.Sign(admin)
 		if _, err := r.Add(o); err != nil {
 			t.Fatal(err)
@@ -498,7 +502,7 @@ func TestFoldScalesAfterRemoval(t *testing.T) {
 		const n = 3000
 		for i := range n {
 			o := w.base(Invite)
-			o.Invite, o.Expires = inv, int64(i+1)
+			o.Invite, o.Expires, o.Uses = inv, int64(i+1), 1
 			o.Sign(admin)
 			if _, err := r.Add(o); err != nil {
 				t.Fatal(err)
