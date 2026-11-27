@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -476,5 +477,35 @@ func TestLeaveDoesntFlush(t *testing.T) {
 	n.mu.Unlock()
 	if l != nil && len(l.Entries()) != 0 {
 		t.Fatal("Leave appended the held post")
+	}
+}
+
+// TestPostOnForkedOwnLog: a forked own log refuses posts as forked, not as
+// stalled.
+func TestPostOnForkedOwnLog(t *testing.T) {
+	x := newGroup(t)
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	ctx := context.Background()
+	if _, err := n.Post(ctx, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Do(ctx, func(r *roster.Roster, logs *memberlog.Set) error {
+		f, err := r.Fold()
+		if err != nil {
+			return err
+		}
+		e, err := memberlog.Write(x.m1, r.Group(), nil, f.Current, r.Keyring(x.m1).Epochs[f.Current], memberlog.App, []byte("other one"))
+		if err != nil {
+			return err
+		}
+		if _, err := logs.Add(e); !errors.Is(err, memberlog.ErrForked) {
+			return fmt.Errorf("a second entry at seq 1: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Post(ctx, []byte("two")); !errors.Is(err, memberlog.ErrForked) {
+		t.Fatalf("a post on a forked own log: %v", err)
 	}
 }

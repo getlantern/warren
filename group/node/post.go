@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/getlantern/warren/group/keys"
@@ -20,13 +21,14 @@ func (n *Node) Paused() bool { return n.paused.Load() }
 // current epoch key. While publishing is paused, or the member doesn't hold
 // that key yet (pending a deliver), it is held instead and appended, in
 // order, once it can be: queued reports that it wasn't appended by the
-// time Post returns (it's held, or TakeHeld has handed it over), and ErrQueueFull a hold past MaxQueued. A mirror or a removed
-// member can't post (roster.ErrNotAllowed), nor can a body over
-// memberlog.MaxBody be. If held posts failed to append, a post is refused
-// with that failure (ErrHeldFailed) until they do or TakeHeld clears them.
+// time Post returns (it's held, or TakeHeld has handed it over), and
+// ErrQueueFull a hold past MaxQueued. A mirror or a removed member can't
+// post (roster.ErrNotAllowed), nor can a body over memberlog.MaxBody be.
 // While this member's own log holds entries past what shows, a post is
-// refused (ErrHidden) and held posts stay held: anything appended would be
-// hidden too.
+// refused (ErrHidden), held or not, and held posts stay held: anything
+// appended would be hidden too. A forked own log refuses posts too
+// (memberlog.ErrForked). If held posts failed to append, a post is refused
+// with that failure (ErrHeldFailed) until they do or TakeHeld clears them.
 func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 	if len(body) > memberlog.MaxBody {
 		return false, fmt.Errorf("node: post of %d bytes is over memberlog.MaxBody", len(body))
@@ -48,8 +50,8 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 			if err := logs.Update(f); err != nil {
 				return err
 			}
-			if n.stalled(logs) {
-				return ErrHidden
+			if err := n.ownLog(logs); err != nil {
+				return err
 			}
 			key, ok = r.Keyring(n.cfg.Me).Epochs[f.Current]
 		}
@@ -98,8 +100,8 @@ func (n *Node) TakeHeld() [][]byte {
 }
 
 // write appends body to this member's log under key, f's current epoch
-// key; logs must have been given f, and the log mustn't be stalled. mu
-// held.
+// key; logs must have been given f, and ownLog must have found nothing in
+// the way. mu held.
 func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, key keys.EpochKey, body []byte) error {
 	var prev *memberlog.Entry
 	if l := logs.Log(n.cfg.Me.Public()); l != nil {
@@ -113,17 +115,22 @@ func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, ke
 	return err
 }
 
-// stalled reports whether this member's own log holds entries past what
-// shows (under an epoch that stopped counting, say), so anything appended
-// now would be hidden too; logs must have been given the current fold. mu
-// held.
-func (n *Node) stalled(logs *memberlog.Set) bool {
+// ownLog reports why nothing appended to this member's own log now would
+// show: memberlog.ErrForked if it's forked, ErrHidden if it holds entries
+// past what shows (under an epoch that stopped counting, say); nil if
+// something would. logs must have been given the current fold. mu held.
+func (n *Node) ownLog(logs *memberlog.Set) error {
 	l := logs.Log(n.cfg.Me.Public())
 	if l == nil {
-		return false
+		return nil
 	}
-	h, last := l.Head(), l.Last()
-	return last != nil && (h == nil || h.ID() != last.ID())
+	if l.Fork() != nil {
+		return memberlog.ErrForked
+	}
+	if h, last := l.Head(), l.Last(); last != nil && (h == nil || h.ID() != last.ID()) {
+		return ErrHidden
+	}
+	return nil
 }
 
 // flush appends the held posts, in order, once publishing may resume,
@@ -148,10 +155,15 @@ func (n *Node) flush() {
 		n.flushErr = err
 		return
 	}
-	if n.stalled(logs) {
-		return // held until the log shows again, or TakeHeld
-	}
 	for len(n.queue) > 0 {
+		// Each time: a write that didn't show would make the next fork.
+		if err := n.ownLog(logs); errors.Is(err, ErrHidden) {
+			n.flushErr = nil // held until the log shows again; Post says so
+			return
+		} else if err != nil {
+			n.flushErr = err
+			return
+		}
 		if err := n.write(r, logs, f, key, n.queue[0].body); err != nil {
 			n.flushErr = err
 			return
