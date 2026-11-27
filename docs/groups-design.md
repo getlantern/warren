@@ -522,7 +522,7 @@ carries neither `G` nor any member key.
   rejoin's `deliver` (below). Each such operation spends one of the
   invite's uses, so a single-use invite is spent by the first of either;
   since both are roster operations, every admin counts the uses alike. All
-  invites are refused after expiry, and invites issued before a removal
+  invites are refused after expiry (but for a retry, below), and invites issued before a removal
   are refused after it (*Removal*): every member folds the same total
   order, so they agree which invites a removal came after.
 - The fold counts uses and doesn't drop: two admins approving one invite at
@@ -545,9 +545,12 @@ every epoch key it lacks (mirrors get `G` only), naming the invite and so
 spending one of its uses, plus the genesis and the roster's operations, as
 for a new member. A rejoiner already holding every key gets the roster
 alone, with no `deliver`, and the invite isn't spent. A join or rejoin
-whose answer was lost can be asked again with the same key: an admin
-holding an `add` or `deliver` naming the invite to that key answers with the
-roster and writes nothing, so a spent or expired invite can't strand it. Nothing else changes: no `add`, no
+whose answer was lost can be asked again with the same key: an admin that
+finds an approver's `add` or `deliver` naming the invite to that key, still
+a member, answers with the roster again, plus a plain `deliver` (naming no
+invite, spending nothing) of any keys it has since come to lack, so a spent
+or expired invite can't strand it. The admin keeps the invite key, and
+keeps listening, until the invite expires, even once it is spent. Nothing else changes: no `add`, no
 removal, no rekey, and its log carries on. A removed member can't do this:
 its key is off the roster. A stolen device can, as it could use any member
 key; the admin sees which member is rejoining, and the answer to a stolen

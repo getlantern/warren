@@ -171,8 +171,11 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 		return nil, ErrBadProof
 	}
 	replay, err := admit(cfg, req, now())
-	if err != nil || replay {
+	if err != nil {
 		return nil, err
+	}
+	if replay {
+		return redeliver(cfg, req, now())
 	}
 	if cfg.Approve != nil && !cfg.Approve(req) {
 		return nil, ErrNotApproved
@@ -180,8 +183,11 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 	// Approve may have taken a while, or changed the roster: check again,
 	// on a fresh fold and at the one instant the writer then uses too.
 	t := now()
-	if replay, err = admit(cfg, req, t); err != nil || replay {
+	if replay, err = admit(cfg, req, t); err != nil {
 		return nil, err
+	}
+	if replay {
+		return redeliver(cfg, req, t)
 	}
 	w := &roster.Writer{R: cfg.Roster, Me: cfg.Me, Now: func() time.Time { return t }}
 	if !req.Rejoin {
@@ -198,10 +204,10 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 }
 
 // admit checks a request against the roster at t. replay reports a request
-// this invite already answered for this key (an add or a rejoin's deliver
-// naming it, to it): its answer was lost, and the joiner gets the roster
-// again with nothing written, so a spent or expired invite can't strand
-// it. The request's proofs bind it to that key and invite.
+// an approver already answered under this invite for this key, still a
+// member: its answer was lost, and it is answered again (redeliver)
+// whether or not the invite is still usable, so a spent or expired invite
+// can't strand it. The request's proofs bind it to that key and invite.
 func admit(cfg AdminConfig, req Request, t time.Time) (replay bool, err error) {
 	f, err := cfg.Roster.Fold()
 	if err != nil {
@@ -226,15 +232,39 @@ func admit(cfg AdminConfig, req Request, t time.Time) (replay bool, err error) {
 	return false, nil
 }
 
-// answered reports whether a counting add or deliver naming invite was
-// written to member.
+// answered reports whether an approver answered invite for member: an add
+// or deliver naming it, to member, by an owner or admin. That is the
+// author's role as the op counted, or, for an add that doesn't count (it
+// lost to a concurrent add of the same key, and still spent its invite),
+// the author's role now. A member's own deliver naming an invite spends
+// nothing (see roster.InviteState) and is no approval.
 func answered(f *roster.Result, invite, member keys.PublicKey) bool {
+	approver := func(r roster.Role) bool { return r == roster.Owner || r == roster.Admin }
 	for _, o := range f.Order {
-		if (o.Kind == roster.Add || o.Kind == roster.Deliver) && o.Invite == invite && o.Target == member && f.Counts[o.ID()] {
+		if o.Invite != invite || o.Target != member || (o.Kind != roster.Add && o.Kind != roster.Deliver) {
+			continue
+		}
+		if f.Counts[o.ID()] && approver(f.As[o.ID()]) {
+			return true
+		}
+		if !f.Counts[o.ID()] && o.Kind == roster.Add && approver(f.Roles[o.Author]) {
 			return true
 		}
 	}
 	return false
+}
+
+// redeliver answers a replayed request: the roster, with a deliver of any
+// keys the member has since come to lack (a rekey made without it, say).
+// That deliver names no invite, so it spends nothing and needs no usable
+// invite; any member may be delivered to.
+func redeliver(cfg AdminConfig, req Request, t time.Time) (*roster.Op, error) {
+	w := &roster.Writer{R: cfg.Roster, Me: cfg.Me, Now: func() time.Time { return t }}
+	op, err := w.Deliver(req.Member, keys.PublicKey{})
+	if errors.Is(err, roster.ErrNotAllowed) {
+		return nil, nil // it holds every key
+	}
+	return op, err
 }
 
 // JoinConfig is the joining side.

@@ -111,7 +111,9 @@ func ParseLink(s string) (Invite, error) {
 }
 
 // Issued is an invite with the admin's private half: the invite key it
-// listens under. The admin keeps it until the invite is spent or expires.
+// listens under. The admin keeps it, and keeps listening, until the invite
+// expires, even once it is spent, so a joiner whose answer was lost can ask
+// again (Serve answers it whatever the invite's state).
 type Issued struct {
 	Invite Invite
 	Key    *keys.Identity

@@ -648,3 +648,108 @@ func TestRejoinRoles(t *testing.T) {
 		}
 	}
 }
+
+// TestMemberDeliverIsNoApproval: a member's own deliver naming an invite
+// doesn't let it retry past the invite's expiry.
+func TestMemberDeliverIsNoApproval(t *testing.T) {
+	x := group(t, 1)
+	o := &roster.Op{Group: x.r.Group(), Kind: roster.Deliver, Parents: x.r.Heads(), Target: x.member.Public(), Invite: x.issued.Invite.Key}
+	for _, p := range o.Parents {
+		o.Lamport = max(o.Lamport, x.r.Op(p).Lamport)
+	}
+	o.Lamport++
+	o.Sign(x.member)
+	if _, err := x.r.Add(o); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, jerr, serr := x.run(t, x.member, true, func(a *AdminConfig, _ *JoinConfig) {
+		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
+	})
+	if !errors.Is(jerr, ErrInviteUnusable) || !errors.Is(serr, ErrInviteUnusable) {
+		t.Fatalf("a member's own deliver let it retry: %v / %v", jerr, serr)
+	}
+}
+
+// TestRetryLosingConcurrentAdd: two admins admit one joiner at once under
+// different invites; a retry under the invite whose add lost still gets
+// the roster.
+func TestRetryLosingConcurrentAdd(t *testing.T) {
+	x := group(t, 1)
+	other, _, err := Issue(&roster.Writer{R: x.r, Me: x.owner, Now: clock}, 1, time.Hour, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiner := me(9)
+	c := x.r.Clone()
+	a, err := (&roster.Writer{R: x.r, Me: x.admin, Now: clock}).Add(joiner.Public(), "j", roster.Member, x.issued.Invite.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := (&roster.Writer{R: c, Me: x.owner, Now: clock}).Add(joiner.Public(), "j", roster.Member, other.Invite.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := x.r.Add(b); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := x.r.Fold()
+	loser, approver := x.issued, x.admin
+	if f.Counts[a.ID()] {
+		loser, approver = other, x.owner
+	}
+	r, _, _, jerr, serr := x.run(t, joiner, false, func(ac *AdminConfig, jc *JoinConfig) {
+		ac.Invite, jc.Invite, ac.Me = loser.Invite, loser.Invite, approver
+	})
+	if jerr != nil || serr != nil || r == nil {
+		t.Fatalf("a retry under the losing add's invite: %v / %v", jerr, serr)
+	}
+}
+
+// TestRetryAfterMissedRekey: a joiner whose answer was lost, and who then
+// missed a rekey, gets the new keys on retry.
+func TestRetryAfterMissedRekey(t *testing.T) {
+	x := group(t, 1)
+	joiner := me(9)
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin, Now: clock}).Add(joiner.Public(), "j", roster.Member, x.issued.Invite.Key); err != nil {
+		t.Fatal(err) // as if the answer to this add was lost
+	}
+	rk := x.missRekey(t) // the stale copy hasn't seen the joiner's add either
+	if _, ok := x.r.Keyring(joiner).Epochs[rk.ID()]; ok {
+		t.Fatal("the joiner got the rekey")
+	}
+	r, _, op, jerr, serr := x.run(t, joiner, false, nil)
+	if jerr != nil || serr != nil {
+		t.Fatalf("retry: %v / %v", jerr, serr)
+	}
+	if op == nil || op.Kind != roster.Deliver || op.Invite != (keys.PublicKey{}) {
+		t.Fatal("the retry didn't deliver the missed keys, naming no invite")
+	}
+	if _, ok := r.Keyring(joiner).Epochs[rk.ID()]; !ok {
+		t.Fatal("the joiner didn't get the keys it missed")
+	}
+	if f, _ := x.r.Fold(); f.Invites[x.issued.Invite.Key].Used != 1 {
+		t.Fatal("the redelivery spent the invite again")
+	}
+}
+
+// TestRetryRejoin: a rejoin whose deliver spent the invite, then lost its
+// answer, gets the roster on retry past expiry, without Approve or another
+// op.
+func TestRetryRejoin(t *testing.T) {
+	x := group(t, 1)
+	x.missRekey(t)
+	if _, _, op, jerr, serr := x.run(t, x.member, true, nil); jerr != nil || serr != nil || op == nil {
+		t.Fatalf("rejoin: %v / %v", jerr, serr)
+	}
+	before := len(x.r.IDs())
+	r, _, op, jerr, serr := x.run(t, x.member, true, func(a *AdminConfig, _ *JoinConfig) {
+		a.Now = func() time.Time { return now.Add(2 * time.Hour) }
+		a.Approve = func(Request) bool { t.Error("a retry was put to Approve"); return false }
+	})
+	if jerr != nil || serr != nil || r == nil {
+		t.Fatalf("retry: %v / %v", jerr, serr)
+	}
+	if op != nil || len(x.r.IDs()) != before {
+		t.Fatal("a retry with nothing to deliver wrote to the roster")
+	}
+}
