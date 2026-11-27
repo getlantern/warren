@@ -584,10 +584,8 @@ func (s *session) sync(peer keys.PublicKey) (err error) {
 		if pending && batchDone(m) {
 			pending = false
 			f := x.Fold() // the sync's own, for the batch just finished
-			if f == nil {
-				if f, err = s.cfg.Roster.Fold(); err != nil {
-					return err
-				}
+			if f == nil { // the sync refolds every finished batch
+				return errors.New("session: sync finished a batch without folding")
 			}
 			if f.Roles[peer] == roster.None {
 				return ErrRemoved
