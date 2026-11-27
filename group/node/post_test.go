@@ -558,6 +558,16 @@ func postPastGap(t *testing.T, skip int) {
 // the removal. Peers keep the dropped entries, so posting at the shortened
 // head would fork the log: Post refuses until they're back.
 func TestPostAfterCutStopsCounting(t *testing.T) {
+	for _, gap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("gap=%v", gap), func(t *testing.T) { postAfterCut(t, gap) })
+	}
+}
+
+// postAfterCut posts entries 1-3 (with gap, 2 is held by peers only, as
+// for a member restored from older state), then applies the cut and its
+// voiding.
+func postAfterCut(t *testing.T, gap bool) {
+	t.Helper()
 	x := newGroup(t)
 	a := x.admins(t)
 	f, err := x.r.Fold()
@@ -567,10 +577,34 @@ func TestPostAfterCutStopsCounting(t *testing.T) {
 	x.g = x.r.Keyring(x.owner).Secrets[f.Current]
 	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
 	ctx := context.Background()
-	for _, b := range []string{"one", "two", "three"} {
-		if _, err := n.Post(ctx, []byte(b)); err != nil {
-			t.Fatal(err)
+	if !gap {
+		for _, b := range []string{"one", "two", "three"} {
+			if _, err := n.Post(ctx, []byte(b)); err != nil {
+				t.Fatal(err)
+			}
 		}
+	} else if err := n.Do(ctx, func(r *roster.Roster, logs *memberlog.Set) error {
+		f, err := r.Fold()
+		if err != nil {
+			return err
+		}
+		key := r.Keyring(x.m1).Epochs[f.Current]
+		var prev *memberlog.Entry
+		for i := range 3 {
+			e, err := memberlog.Write(x.m1, r.Group(), prev, f.Current, key, memberlog.App, []byte{byte(i)})
+			if err != nil {
+				return err
+			}
+			if i != 1 {
+				if _, err := logs.Add(e); err != nil {
+					return err
+				}
+			}
+			prev = e
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	// As a session applies roster ops: add, then give the logs the fold.
 	apply := func(op func(r *roster.Roster) (*roster.Op, error)) {
@@ -599,10 +633,11 @@ func TestPostAfterCutStopsCounting(t *testing.T) {
 		return (&roster.Writer{R: r.Clone(), Me: a}).Remove(x.m1.Public(), 1, first.ID())
 	})
 	n.mu.Lock()
-	held := n.cfg.Logs.Log(x.m1.Public()).Len()
+	l := n.cfg.Logs.Log(x.m1.Public())
+	last, entries := l.Last(), len(l.Entries())
 	n.mu.Unlock()
-	if held != 1 {
-		t.Fatalf("the cut left %d own entries, want 1", held)
+	if last == nil || last.Seq != 1 || entries != 1 {
+		t.Fatalf("after the cut: %d shown, last at %d", entries, last.Seq)
 	}
 	apply(func(*roster.Roster) (*roster.Op, error) {
 		return (&roster.Writer{R: stale, Me: x.owner}).SetRole(a.Public(), roster.Member)

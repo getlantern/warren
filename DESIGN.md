@@ -1022,7 +1022,9 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       epoch. If the member's own log holds entries that don't show (under
       an epoch that stopped counting: an admin's rekey racing its
       demotion), memberlog hides everything after them too, and an entry
-      after the visible head would fork the log, so `Post` refuses
+      after the visible head would fork the log; the same goes for own
+      entries held past a gap, or held once and dropped by a removal's cut
+      that stopped counting (`memberlog.Log.Peak`). So `Post` refuses
       (`node.ErrHidden`) and held posts stay held; letting the chain show
       past such entries is a memberlog change still to make. A failed
       append is reported to later posts
