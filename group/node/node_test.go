@@ -162,7 +162,7 @@ func (x *group) join(t *testing.T, h *Host, id *keys.Identity, r *roster.Roster)
 // post appends an app entry to id's log on n, through Do.
 func post(t *testing.T, n *Node, id *keys.Identity, msg string) {
 	t.Helper()
-	err := n.Do(func(r *roster.Roster, logs *memberlog.Set) error {
+	err := n.Do(context.Background(), func(r *roster.Roster, logs *memberlog.Set) error {
 		f, err := r.Fold()
 		if err != nil {
 			return err
@@ -458,7 +458,7 @@ func TestAdmits(t *testing.T) {
 	n.ready.Store(true)
 	// A member added through Do is admitted at once.
 	newcomer := me(7)
-	if err := n.Do(func(r *roster.Roster, _ *memberlog.Set) error {
+	if err := n.Do(context.Background(), func(r *roster.Roster, _ *memberlog.Set) error {
 		_, err := (&roster.Writer{R: r, Me: x.owner}).Add(newcomer.Public(), "n", roster.Member, keys.PublicKey{})
 		return err
 	}); err != nil {
@@ -709,7 +709,7 @@ func TestTwoGroupsOnOneHost(t *testing.T) {
 		t.Fatalf("calling the second group on a host: %v", err)
 	}
 	var got int
-	_ = b.Do(func(_ *roster.Roster, logs *memberlog.Set) error {
+	_ = b.Do(context.Background(), func(_ *roster.Roster, logs *memberlog.Set) error {
 		if l := logs.Log(y.m1.Public()); l != nil {
 			got = len(l.Entries())
 		}
@@ -759,7 +759,7 @@ func TestDoWaitsForSession(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	go func() {
-		_ = n.Do(func(*roster.Roster, *memberlog.Set) error {
+		_ = n.Do(context.Background(), func(*roster.Roster, *memberlog.Set) error {
 			close(entered)
 			<-release
 			return nil
@@ -774,7 +774,7 @@ func TestDoWaitsForSession(t *testing.T) {
 	<-entered
 	second := make(chan struct{})
 	go func() {
-		_ = n.Do(func(*roster.Roster, *memberlog.Set) error { close(second); return nil })
+		_ = n.Do(context.Background(), func(*roster.Roster, *memberlog.Set) error { close(second); return nil })
 	}()
 	select {
 	case <-second:
@@ -863,7 +863,7 @@ func TestDoMakesBusy(t *testing.T) {
 	inDo, release, out := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(out)
-		_ = n.Do(func(*roster.Roster, *memberlog.Set) error {
+		_ = n.Do(context.Background(), func(*roster.Roster, *memberlog.Set) error {
 			close(inDo)
 			<-release
 			return nil
@@ -906,4 +906,38 @@ func TestNoFallbackForAbsentMember(t *testing.T) {
 	if u, ok := err.(interface{ Unwrap() []error }); ok && len(u.Unwrap()) != 1 {
 		t.Fatalf("an absent member was called again under the sync key: %v", err)
 	}
+}
+
+// TestDoNotStarved: while a Do waits, no new session begins, so callers
+// keeping the group busy can't hold off the app.
+func TestDoNotStarved(t *testing.T) {
+	x := newGroup(t)
+	n := &Node{cfg: Config{Me: me(2), Group: x.g, Roster: copyRoster(t, x.r)}}
+	if !n.begin() {
+		t.Fatal("begin")
+	}
+	ran := make(chan struct{})
+	go func() {
+		_ = n.Do(context.Background(), func(*roster.Roster, *memberlog.Set) error { close(ran); return nil })
+	}()
+	eventually(t, "Do never started waiting", func() bool { return n.doWaiting.Load() > 0 })
+	n.end()
+	if n.begin() { // a caller racing in as the session ends
+		t.Fatal("a session began ahead of a waiting Do")
+	}
+	<-ran
+	eventually(t, "Do kept the group", func() bool { return !n.active.Load() })
+	// A Do whose context ends while it waits gives up.
+	if !n.begin() {
+		t.Fatal("begin after Do")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := n.Do(ctx, func(*roster.Roster, *memberlog.Set) error { return nil }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want DeadlineExceeded", err)
+	}
+	if n.doWaiting.Load() != 0 {
+		t.Fatal("a Do that gave up still counts as waiting")
+	}
+	n.end()
 }

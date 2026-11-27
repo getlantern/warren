@@ -200,6 +200,8 @@ type Node struct {
 	// waited could hold up its peer's, and two members calling each other
 	// could each end up waiting on the other until the session timed out.
 	active atomic.Bool
+	// doWaiting counts Do calls waiting for the group; see Do.
+	doWaiting atomic.Int32
 
 	lmu       sync.Mutex
 	listening map[uint64]keys.Signer // period → the rendezvous key listened under
@@ -506,8 +508,8 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 
 // begin starts a session unless one is running; see active.
 func (n *Node) begin() bool {
-	if !n.active.CompareAndSwap(false, true) {
-		return false // a session, or a Do
+	if n.doWaiting.Load() > 0 || !n.active.CompareAndSwap(false, true) {
+		return false // a session, or a Do running or waiting
 	}
 	n.mu.Lock() // held otherwise only by a refresh, briefly
 	return true
@@ -542,14 +544,23 @@ func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, c
 
 // Do runs fn on the group's roster and logs, which a joined group shares
 // with its sessions: change or read them only through Do. It waits for a
-// running session to end, and refreshes what the group admits afterwards.
-func (n *Node) Do(fn func(*roster.Roster, *memberlog.Set) error) error {
+// running session to end (or ctx), and refreshes what the group admits
+// afterwards.
+func (n *Node) Do(ctx context.Context, fn func(*roster.Roster, *memberlog.Set) error) error {
 	// Do claims the group as a session does, so a session finds it busy
-	// rather than waiting on a callback nothing can cancel; Do itself waits
-	// its turn.
+	// rather than waiting on a callback nothing can cancel. While Do waits,
+	// no new session begins, so callers can't starve it (it may be applying
+	// a removal).
+	n.doWaiting.Add(1)
 	for !n.active.CompareAndSwap(false, true) {
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			n.doWaiting.Add(-1)
+			return ctx.Err()
+		}
 	}
+	n.doWaiting.Add(-1)
 	n.mu.Lock()
 	defer n.end()
 	err := fn(n.cfg.Roster, n.cfg.Logs)
