@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"net"
 	"slices"
@@ -30,6 +31,17 @@ import (
 
 // streamName is the hysteria2 destination a session stream asks for.
 const streamName = "warren-group:1"
+
+// Grace is how long after a node first sees the group secret replaced (a
+// remove or rekey) it keeps listening under, and admitting members' keys
+// from, the superseded secret: a member that missed the change reaches it
+// there and gets the change by gossip (docs/groups-design.md, *Removal*,
+// step 4). Operations carry no time, so it runs from this node's own
+// observation. With the listener table full, the current secret takes
+// the listeners of the superseded secret whose window ends soonest: that
+// secret is still admitted and called under for its window, but no longer
+// listened under.
+const Grace = 24 * time.Hour
 
 // busyTries and busyWait bound a call's tries of a busy group.
 const (
@@ -173,7 +185,10 @@ func (h *Host) accept(ctx context.Context) {
 // Config is one group a host joins. Once joined, its Roster and Logs are
 // shared with the group's sessions: use Node.Do to reach them.
 type Config struct {
-	Me     *keys.Identity
+	Me *keys.Identity
+	// Group is the group secret the node starts on. It follows the
+	// roster's current secret from then on (Node.Group), keeping
+	// superseded ones for Grace.
 	Group  keys.Secret
 	Roster *roster.Roster
 	Logs   *memberlog.Set
@@ -227,7 +242,7 @@ type Node struct {
 	left atomic.Bool
 
 	lmu       sync.Mutex
-	listening map[uint64]keys.Signer     // period → the rendezvous key listened under
+	listening map[listenKey]keys.Signer  // the rendezvous keys listened under
 	invites   map[keys.PublicKey]*invite // by invite key
 	admit     atomic.Pointer[map[keys.PublicKey]bool]
 	// roles is the roster's members as of the last refresh, read without
@@ -241,21 +256,125 @@ type Node struct {
 	ready atomic.Bool
 
 	smu  sync.Mutex
-	seen map[keys.PublicKey]time.Time // member → last session with it
+	seen map[keys.PublicKey]sighting // member → last session with it
+
+	// gmu holds the group secrets: the current one and those superseded
+	// within Grace. It is taken last, under mu or lmu.
+	gmu        sync.Mutex
+	current    keys.Secret
+	superseded []supersededSecret
+	// seenKeys is, per counting key-making operation the node has seen,
+	// until when its secret is kept once superseded: Grace from when the
+	// node first saw the operation, whether or not it held the secret then.
+	// The roster's history at the first refresh is past its window, so a
+	// secret delivered late (even a hand-made deliver of an old one) never
+	// starts one. nil until the first refresh. mu held.
+	seenKeys map[roster.ID]time.Time
+	// rekeyed is set when refresh moves to a new secret, so whoever ends
+	// the session or Do rotates the listeners onto it.
+	rekeyed atomic.Bool
+}
+
+// sighting is a session with a member: when, and under which group secret.
+type sighting struct {
+	at time.Time
+	g  keys.Secret
+}
+
+// listenKey is a rendezvous listener's secret and period.
+type listenKey struct {
+	g keys.Secret
+	q uint64
+}
+
+type supersededSecret struct {
+	g     keys.Secret
+	until time.Time
+	// ranOn is set for a secret the node ran on itself, kept for Grace
+	// whatever becomes of its operation (members may still be on it). The
+	// rest come from the roster each refresh, and go when their operation
+	// stops counting.
+	ranOn bool
+}
+
+// Group is the group secret the node runs on now: the roster's current one
+// once its keyring holds it.
+func (n *Node) Group() keys.Secret {
+	n.gmu.Lock()
+	defer n.gmu.Unlock()
+	return n.current
+}
+
+// secrets is the current group secret, then those superseded within Grace
+// at now, by when their window ends, latest first: the last is the one a
+// full listener table gives up first.
+func (n *Node) secrets(now time.Time) []keys.Secret {
+	n.gmu.Lock()
+	live := make([]supersededSecret, 0, len(n.superseded))
+	for _, s := range n.superseded {
+		if now.Before(s.until) {
+			live = append(live, s)
+		}
+	}
+	out := []keys.Secret{n.current}
+	n.gmu.Unlock()
+	slices.SortStableFunc(live, func(a, b supersededSecret) int { return b.until.Compare(a.until) })
+	for _, s := range live {
+		out = append(out, s.g)
+	}
+	return out
+}
+
+// follow moves n to g if it isn't on it already, keeping the secret it
+// leaves for Grace, and replaces the secrets kept from the roster with
+// cands (superseded secrets of counting operations, with their own
+// deadlines). It reports whether the secrets n listens under changed.
+func (n *Node) follow(g keys.Secret, cands []supersededSecret, now time.Time) bool {
+	n.gmu.Lock()
+	defer n.gmu.Unlock()
+	before := map[keys.Secret]bool{n.current: true}
+	for _, s := range n.superseded {
+		if now.Before(s.until) {
+			before[s.g] = true
+		}
+	}
+	var kept []supersededSecret
+	has := func(x keys.Secret) bool {
+		return slices.ContainsFunc(kept, func(s supersededSecret) bool { return s.g == x })
+	}
+	for _, s := range n.superseded {
+		if s.ranOn && now.Before(s.until) && s.g != g {
+			kept = append(kept, s)
+		}
+	}
+	if g != n.current && !has(n.current) {
+		kept = append(kept, supersededSecret{g: n.current, until: now.Add(Grace), ranOn: true})
+	}
+	for _, c := range cands {
+		if c.g != g && now.Before(c.until) && !has(c.g) {
+			kept = append(kept, c)
+		}
+	}
+	n.superseded, n.current = kept, g
+	after := map[keys.Secret]bool{g: true}
+	for _, s := range kept {
+		after[s.g] = true
+	}
+	return !maps.Equal(before, after)
 }
 
 // Join listens for cfg's group on the host under this and the next
 // period's rendezvous keys.
 func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	cfg = withDefaults(cfg)
-	n := &Node{h: h, cfg: cfg, listening: map[uint64]keys.Signer{}, invites: map[keys.PublicKey]*invite{},
-		seen: map[keys.PublicKey]time.Time{}, shards: cfg.Roster.Op(cfg.Roster.Group()).Shards}
+	n := &Node{h: h, cfg: cfg, listening: map[listenKey]keys.Signer{}, invites: map[keys.PublicKey]*invite{},
+		seen: map[keys.PublicKey]sighting{}, shards: cfg.Roster.Op(cfg.Roster.Group()).Shards, current: cfg.Group}
 	n.mu.Lock()
 	n.refresh()
 	n.mu.Unlock()
 	h.mu.Lock()
 	for _, g := range h.groups {
-		if g.cfg.Group == cfg.Group && g.cfg.Me.Public() == cfg.Me.Public() {
+		if g.cfg.Roster.Group() == cfg.Roster.Group() && g.cfg.Me.Public() == cfg.Me.Public() {
 			h.mu.Unlock()
 			return nil, ErrJoined
 		}
@@ -337,29 +456,63 @@ func (n *Node) rotate(ctx context.Context) error {
 	if n.left.Load() { // Leave sets it before taking lmu to drop the listeners
 		return ErrLeft
 	}
-	p := keys.PeriodOf(n.now()) // under lmu, so an older Tick can't undo a newer
-	// Drop first, so a full listener table doesn't keep the old keys.
-	for q, s := range n.listening {
-		if q+1 < p || q > p+1 { // q > p+1: the clock went back
+	now := n.now()
+	p := keys.PeriodOf(now) // under lmu, so an older Tick can't undo a newer
+	live := map[keys.Secret]bool{}
+	gs := n.secrets(now)
+	for _, g := range gs {
+		live[g] = true
+	}
+	// Drop first, so a full listener table doesn't keep the old keys: a
+	// superseded secret past Grace, and periods out of range.
+	for k, s := range n.listening {
+		if !live[k.g] || k.q+1 < p || k.q > p+1 { // q > p+1: the clock went back
 			if n.h.ep.RemoveListener(ctx, s.Public()) == nil { // else the next Tick retries
-				delete(n.listening, q)
+				delete(n.listening, k)
 			}
 		}
 	}
 	var errs []error
-	for _, q := range []uint64{p, p + 1} {
-		if _, ok := n.listening[q]; ok {
-			continue
+	for i, g := range gs {
+		for _, q := range []uint64{p, p + 1} {
+			k := listenKey{g, q}
+			if _, ok := n.listening[k]; ok {
+				continue
+			}
+			s := n.cfg.Me.Rendezvous(g, q)
+			err := n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
+			// The current secret is the one every up-to-date member calls:
+			// with the table full (and only then: not on a cancelled
+			// context, say), it takes the listeners of the superseded
+			// secret whose window ends soonest, gs being ordered so (the
+			// secret stays in Grace for admission and calls).
+			for j := len(gs) - 1; errors.Is(err, dht.ErrTooManyListeners) && i == 0 && j > 0; j-- {
+				if n.dropListeners(ctx, gs[j]) {
+					err = n.h.ep.AddListener(ctx, keys.CryptoSigner(s))
+				}
+			}
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			n.listening[k] = s
 		}
-		s := n.cfg.Me.Rendezvous(n.cfg.Group, q)
-		if err := n.h.ep.AddListener(ctx, keys.CryptoSigner(s)); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		n.listening[q] = s
 	}
 	errs = append(errs, n.rotateInvites(ctx, p)...)
 	return errors.Join(errs...)
+}
+
+// dropListeners removes the rendezvous listeners under g, reporting
+// whether it removed any; lmu held.
+func (n *Node) dropListeners(ctx context.Context, g keys.Secret) bool {
+	dropped := false
+	for k, s := range n.listening {
+		if k.g == g && n.h.ep.RemoveListener(ctx, s.Public()) == nil {
+			delete(n.listening, k)
+			dropped = true
+		}
+	}
+	return dropped
 }
 
 func (n *Node) listensUnder(key keys.PublicKey) bool {
@@ -368,17 +521,19 @@ func (n *Node) listensUnder(key keys.PublicKey) bool {
 	if is, _ := n.inviteFor(key); is != nil {
 		return true
 	}
-	return n.signerFor(key) != nil
+	s, _ := n.signerFor(key)
+	return s != nil
 }
 
-// signerFor is the listener signer whose key is key; lmu held.
-func (n *Node) signerFor(key keys.PublicKey) keys.Signer {
-	for _, s := range n.listening {
+// signerFor is the rendezvous listener whose key is key, and its group
+// secret, or nil; lmu held.
+func (n *Node) signerFor(key keys.PublicKey) (keys.Signer, keys.Secret) {
+	for k, s := range n.listening {
 		if s.Public() == key {
-			return s
+			return s, k.g
 		}
 	}
-	return nil
+	return nil, keys.Secret{}
 }
 
 // refresh rebuilds the set of caller keys the listeners admit: members'
@@ -394,19 +549,70 @@ func (n *Node) refresh() {
 		roles = f.Roles
 	}
 	n.roles.Store(&rolesView{roles: roles, err: err})
-	admit := map[keys.PublicKey]bool{}
-	p := keys.PeriodOf(n.now())
-	for _, q := range []uint64{p - 1, p, p + 1} {
-		for m := range roles {
-			if m == n.cfg.Me.Public() {
+	now := n.now()
+	// Follow the roster's current secret once the keyring holds it (a
+	// member added concurrently with a rekey may not, until a deliver), and
+	// keep for Grace every secret superseded since the last refresh, an
+	// intermediate one in a batch of rekeys included: a member admitted
+	// while it was current may hold no other.
+	if err == nil {
+		k := n.cfg.Roster.Keyring(n.cfg.Me)
+		first := n.seenKeys == nil
+		if first {
+			n.seenKeys = map[roster.ID]time.Time{}
+		}
+		for _, o := range f.Order {
+			// Only a counting key-making operation (the kinds that commit a
+			// secret): a keyring holds rejected ones' secrets too, and a
+			// member could otherwise fill the listener table with secrets
+			// of rekeys it had no authority to write.
+			if o.CommitSecret == ([32]byte{}) || !f.Counts[o.ID()] {
 				continue
 			}
-			if r, err := keys.Rendezvous(n.cfg.Group, q, m); err == nil {
-				admit[r] = true
+			if _, ok := n.seenKeys[o.ID()]; !ok {
+				if first {
+					n.seenKeys[o.ID()] = time.Time{} // history: its window is over
+				} else {
+					n.seenKeys[o.ID()] = now.Add(Grace)
+				}
 			}
 		}
-		ours := n.cfg.Me.Rendezvous(n.cfg.Group, q).Public()
-		admit[n.cfg.Group.SyncKey(q, ours).Public()] = true
+		var cands []supersededSecret
+		for id, until := range n.seenKeys {
+			// Still counting: an operation counted when first seen can stop
+			// (a concurrent demotion of its author, say).
+			if id == f.Current || !now.Before(until) || !f.Counts[id] {
+				continue
+			}
+			if g, ok := k.Secrets[id]; ok {
+				cands = append(cands, supersededSecret{g: g, until: until})
+			}
+		}
+		// Kept even while the current secret isn't held yet (pending a
+		// deliver).
+		g, ok := k.Secrets[f.Current]
+		if !ok {
+			g = n.Group()
+		}
+		if n.follow(g, cands, now) {
+			n.rekeyed.Store(true)
+		}
+	}
+	admit := map[keys.PublicKey]bool{}
+	p := keys.PeriodOf(now)
+	for _, g := range n.secrets(now) {
+		for _, q := range []uint64{p - 1, p, p + 1} {
+			for m := range roles {
+				if m == n.cfg.Me.Public() {
+					continue
+				}
+				if r, err := keys.Rendezvous(g, q, m); err == nil {
+					admit[r] = true
+				}
+			}
+			ours := n.cfg.Me.Rendezvous(g, q).Public()
+			admit[g.SyncKey(q, ours).Public()] = true
+		}
 	}
 	n.admit.Store(&admit)
 }
@@ -420,7 +626,7 @@ func (n *Node) admits(caller keys.PublicKey) bool {
 func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 	defer func() { _ = c.Close() }()
 	n.lmu.Lock()
-	signer := n.signerFor(c.LocalKey)
+	signer, g := n.signerFor(c.LocalKey)
 	issued, inviteSigner := n.inviteFor(c.LocalKey)
 	n.lmu.Unlock()
 	if issued != nil {
@@ -532,7 +738,7 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 			n.end()
 			return
 		}
-		if _, err := n.session(ctx, stream, c, false); err == nil {
+		if _, err := n.session(ctx, stream, c, false, g); err == nil {
 			n.linger(ctx, stream)
 		}
 	})
@@ -571,20 +777,21 @@ func (n *Node) end() {
 
 // session runs one session on stream, begun, which it ends, and records
 // the peer as reached when it ends well.
-func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, caller bool) (keys.PublicKey, error) {
+func (n *Node) session(ctx context.Context, stream net.Conn, c *endpoint.Conn, caller bool, g keys.Secret) (keys.PublicKey, error) {
+	defer n.afterGroup()
 	defer n.end()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	admission := time.AfterFunc(n.cfg.CallTimeout, cancel) // see CallTimeout
 	defer admission.Stop()
 	peer, err := session.Run(ctx, stream, session.Config{
-		Me: n.cfg.Me, Group: n.cfg.Group, Roster: n.cfg.Roster, Logs: n.cfg.Logs,
+		Me: n.cfg.Me, Group: g, Roster: n.cfg.Roster, Logs: n.cfg.Logs,
 		Secret: c.Secret, Caller: caller, Local: c.LocalKey, Peer: c.PeerKey, Now: n.now(),
 		Admitted: func() { admission.Stop() },
 	})
 	if err == nil {
 		n.smu.Lock()
-		n.seen[peer] = n.now()
+		n.seen[peer] = sighting{at: n.now(), g: g}
 		n.smu.Unlock()
 	}
 	n.refresh() // even a failed session may have kept a newcomer's add chain
@@ -614,6 +821,7 @@ func (n *Node) Do(ctx context.Context, fn func(*roster.Roster, *memberlog.Set) e
 		n.active.Store(false)
 		return ErrLeft
 	}
+	defer n.afterGroup() // after end, so outside the group
 	n.mu.Lock()
 	defer n.end()
 	if err := ctx.Err(); err != nil {
@@ -622,6 +830,17 @@ func (n *Node) Do(ctx context.Context, fn func(*roster.Roster, *memberlog.Set) e
 	err := fn(n.cfg.Roster, n.cfg.Logs)
 	n.refresh()
 	return err
+}
+
+// afterGroup, once a session or Do has ended (deferred before end, so it
+// runs after it), moves the listeners onto a group secret refresh just
+// moved to.
+func (n *Node) afterGroup() {
+	if n.rekeyed.Swap(false) && n.ready.Load() && !n.left.Load() { // Join rotates on its own
+		ctx, cancel := context.WithTimeout(context.Background(), n.cfg.CallTimeout)
+		defer cancel()
+		_ = n.rotate(ctx) // the next Tick retries what fails
+	}
 }
 
 // view is the roster's members as of the last refresh.
@@ -669,20 +888,29 @@ func (n *Node) Call(ctx context.Context, member keys.PublicKey) error {
 	if roles[member] == roster.None {
 		return ErrNotMember
 	}
-	p := keys.PeriodOf(n.now())
-	callee, err := keys.Rendezvous(n.cfg.Group, p, member)
-	if err != nil {
-		return err
-	}
+	now := n.now()
+	p := keys.PeriodOf(now)
 	var errs []error
-	for _, as := range []keys.Signer{n.cfg.Me.Rendezvous(n.cfg.Group, p), n.cfg.Group.SyncKey(p, callee)} {
-		answered, err := n.callAs(ctx, as, callee)
-		if err == nil {
-			return nil
+	// The current secret first, then those superseded within Grace, for a
+	// member that hasn't moved yet (it missed the change).
+	for _, g := range n.secrets(now) {
+		callee, err := keys.Rendezvous(g, p, member)
+		if err != nil {
+			return err
 		}
-		errs = append(errs, err)
-		if answered || ctx.Err() != nil {
-			break
+		for _, as := range []keys.Signer{n.cfg.Me.Rendezvous(g, p), g.SyncKey(p, callee)} {
+			connected, err := n.callAs(ctx, as, callee, g)
+			if err == nil {
+				return nil
+			}
+			errs = append(errs, err)
+			if connected || ctx.Err() != nil {
+				return errors.Join(errs...) // it answered, and the session failed
+			}
+			if !n.silent(ctx, err) {
+				break // not listening under this secret: try the next
+			}
+			// Silent: it may not know us yet, so the sync key.
 		}
 	}
 	return errors.Join(errs...)
@@ -695,13 +923,14 @@ func (n *Node) silent(ctx context.Context, err error) bool {
 	return errors.Is(err, dht.ErrNoAnswer) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil)
 }
 
-// callAs calls callee under as, reporting whether it answered (see silent).
-func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey) (bool, error) {
+// callAs calls callee under as, reporting whether it connected: after
+// that, the callee answered, and an error is the session's.
+func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey, g keys.Secret) (bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, n.cfg.CallTimeout)
 	defer cancel()
 	c, err := n.h.ep.Connect(cctx, keys.CryptoSigner(as), callee)
 	if err != nil {
-		return !n.silent(ctx, err), err
+		return false, err
 	}
 	defer func() { _ = c.Close() }()
 	sctx, scancel := context.WithTimeout(ctx, n.cfg.SessionTimeout)
@@ -729,7 +958,7 @@ func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey
 			}
 			window = min(2*window, n.cfg.CallTimeout)
 		}
-		rtt, err := n.try(sctx, cl, c)
+		rtt, err := n.try(sctx, cl, c, g)
 		if !errors.Is(err, ErrBusy) || try == busyTries {
 			return true, err
 		}
@@ -741,7 +970,7 @@ func (n *Node) callAs(ctx context.Context, as keys.Signer, callee keys.PublicKey
 // before our session begins), begin our session, ask the callee, and run
 // it if the callee answers go. It reports the answer's round trip, zero if
 // none was asked.
-func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) (time.Duration, error) {
+func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn, g keys.Secret) (time.Duration, error) {
 	dctx, cancel := context.WithTimeout(ctx, n.cfg.CallTimeout) // the first does the handshake
 	stream, err := cl.DialConn(dctx, streamName)
 	cancel()
@@ -760,7 +989,7 @@ func (n *Node) try(ctx context.Context, cl *hy2.Client, c *endpoint.Conn) (time.
 		n.end()
 		return time.Since(start), err
 	}
-	_, err = n.session(ctx, stream, c, true)
+	_, err = n.session(ctx, stream, c, true, g)
 	rtt := time.Since(start)
 	if err == nil {
 		n.linger(ctx, stream)
@@ -797,7 +1026,7 @@ func (n *Node) Seen() map[keys.PublicKey]time.Time {
 	defer n.smu.Unlock()
 	out := make(map[keys.PublicKey]time.Time, len(n.seen))
 	for k, v := range n.seen {
-		out[k] = v
+		out[k] = v.at
 	}
 	return out
 }
@@ -836,7 +1065,7 @@ func (n *Node) SyncAll(ctx context.Context) error {
 
 // dir is the group's directory, on the host's DHT.
 func (n *Node) dir() *directory.Directory {
-	return &directory.Directory{Group: n.cfg.Group, Shards: n.shards, Store: n.h.ep.DHT(), Now: n.now}
+	return &directory.Directory{Group: n.Group(), Shards: n.shards, Store: n.h.ep.DHT(), Now: n.now}
 }
 
 func (n *Node) members() ([]keys.PublicKey, error) {
@@ -860,16 +1089,24 @@ func (n *Node) Publish(ctx context.Context) error {
 	}
 	now := n.now()
 	p := keys.PeriodOf(now)
-	entries := []directory.Entry{{Key: n.cfg.Me.Rendezvous(n.cfg.Group, p).Public(), Seen: now}}
-	for m, t := range n.Seen() {
-		if keys.PeriodOf(t) != p {
+	d := n.dir() // one snapshot of the secret, for the entries and the write
+	g := d.Group
+	entries := []directory.Entry{{Key: n.cfg.Me.Rendezvous(g, p).Public(), Seen: now}}
+	n.smu.Lock()
+	seen := maps.Clone(n.seen)
+	n.smu.Unlock()
+	for m, sg := range seen {
+		// A member reached this period under this secret: one reached under
+		// another may not be on this one, so it isn't published under it.
+		t := sg.at
+		if keys.PeriodOf(t) != p || sg.g != g {
 			continue
 		}
-		if r, err := keys.Rendezvous(n.cfg.Group, p, m); err == nil {
+		if r, err := keys.Rendezvous(g, p, m); err == nil {
 			entries = append(entries, directory.Entry{Key: r, Seen: t})
 		}
 	}
-	return n.dir().Write(ctx, p, members, entries)
+	return d.Write(ctx, p, members, entries)
 }
 
 // Directory reads when each member was last seen, as the directory says

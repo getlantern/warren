@@ -31,9 +31,9 @@ type invite struct {
 // Invite issues an invite admitting up to uses joiners and rejoiners for
 // ttl, records it in the roster, and listens for it; the returned invite's
 // Link is what the app hands out. n's member must be an owner or admin. It
-// serves joins only while n runs on the group's current secret: after a
-// rekey, until n can move to the new one (step 8), it refuses them
-// (join.ErrAdminBehind). If
+// serves joins only while n runs on the group's current secret, which it
+// follows; until its keyring holds a new one (a concurrent add, say, before
+// a deliver), it refuses them (join.ErrAdminBehind). If
 // a listener fails (a full listener table, say), the invite is still
 // returned, with the error: it is recorded and held, and Tick retries the
 // listener.
@@ -231,17 +231,25 @@ func (n *Node) serveJoin(ctx context.Context, c *endpoint.Conn, issued *join.Iss
 	handlers.Wait()
 }
 
-// onCurrentSecret reports whether n runs on r's current group secret. A
-// node keeps the secret it joined with until it can move to a new one
-// (DESIGN.md, step 8), and a joiner given the new one couldn't reach it.
-// mu held.
+// onCurrentSecret reports whether n runs on r's current group secret, and
+// listens under it this period: it follows the roster's once its keyring
+// holds it, and a joiner given a secret n isn't on (or doesn't listen
+// under) couldn't reach it. mu held.
 func (n *Node) onCurrentSecret(r *roster.Roster) bool {
 	f, err := r.Fold()
 	if err != nil {
 		return false
 	}
 	g, ok := r.Keyring(n.cfg.Me).Secrets[f.Current]
-	return ok && g == n.cfg.Group
+	if !ok || g != n.Group() {
+		return false
+	}
+	// And listening under it, or a joiner given it couldn't reach n (a
+	// full listener table can fail the rotation onto a new secret).
+	n.lmu.Lock()
+	defer n.lmu.Unlock()
+	_, listening := n.listening[listenKey{g, keys.PeriodOf(n.now())}]
+	return listening
 }
 
 // holdAnswer holds stream, after an answer (or refusal) was written to it,
@@ -273,9 +281,9 @@ func (h *Host) JoinByInvite(ctx context.Context, iv join.Invite, me *keys.Identi
 // (the admin may lack operations it holds, such as a rekey on a branch the
 // admin hasn't seen), and the logs brought up to the merge, so the
 // member's own log carries on rather than losing entries or restarting
-// (which members would take as a fork). The node runs on the answer's
-// group secret, and a saved removal of the member refuses the rejoin
-// (ErrNotMember).
+// (which members would take as a fork). The node starts on the answer's
+// group secret (following the merge's from there), and a saved removal of
+// the member refuses the rejoin (ErrNotMember).
 func (h *Host) Rejoin(ctx context.Context, iv join.Invite, me *keys.Identity, cfg Config) (*Node, error) {
 	return h.byInvite(ctx, iv, me, "", true, cfg)
 }
@@ -294,10 +302,10 @@ func (h *Host) byInvite(ctx context.Context, iv join.Invite, me *keys.Identity, 
 	if err != nil {
 		return nil, err
 	}
-	// The node runs on the answer's group secret, the one the admin and
-	// the members it knows of use: a saved rekey merged below may make
-	// another current, which no one here listens under until a running
-	// node can move to a new secret (DESIGN.md, step 8).
+	// The node starts on the answer's group secret, the one the admin and
+	// the members it knows of use. A saved rekey merged below may make
+	// another current: the node then follows it, keeping the answer's for
+	// Grace, so it still reaches them and passes the rekey on.
 	fa, err := r.Fold()
 	if err != nil {
 		return nil, err

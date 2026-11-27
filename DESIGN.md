@@ -986,18 +986,25 @@ line, B runs alongside it, C waits on device time, D is maintenance.
          `Host.JoinByInvite` and `Host.Rejoin` call the blinded key (this,
          the next, then the previous period's), run `join.Join`, and join
          the group with the roster and `G` they get; `Node.Leave` drops a
-         group. A running node keeps the `G` it joined with: moving it to a
-         new one after a rekey is step 8's.
+         group.
 6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
    tree over ciphertext, announcements. Pure library, so it can be built
    alongside steps 4 and 5.
 7. **Swarming**: bitfields, rarest-first, playhead order, work stealing,
    resume, storage budget; inventories for mirrors. The scheduler is pure
    and can also start alongside 4 and 5; wiring it needs 5.
-8. **Removal's runtime parts**: grace-window listening under superseded
-   secrets, the publish pause until a corrective rekey, session teardown
-   on removal, and mirrors. (Removal and rekey themselves are in the
-   roster.)
+8. **Removal's runtime parts** (removal and rekey themselves are in the
+   roster), in parts:
+   1. following `G` (built): a running node moves to the roster's current
+      group secret once its keyring holds it, and for `node.Grace` (24
+      hours) after it first sees one replaced keeps listening under, and
+      admitting members' keys from, the superseded one (with the listener
+      table full, the current secret takes the listeners of the superseded
+      one whose window ends soonest); calls try the current secret, then the superseded ones,
+      for a member that hasn't moved yet;
+   2. session teardown on removal;
+   3. the publish pause until a corrective rekey;
+   4. mirrors, once content and swarming exist.
 
 **B. DHT speed** (*Performance against libtorrent*): the hit median is
 still about twice libtorrent's, which is routing-table work, not tuning:
