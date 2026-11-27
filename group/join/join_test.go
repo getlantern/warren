@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -874,15 +875,54 @@ func TestAdminWithoutKeys(t *testing.T) {
 	}
 }
 
-// TestRosterTooLarge: a roster too large for the joiner's limits is refused
-// before anything is written.
+// TestRosterTooLarge: a join whose answer wouldn't fit the joiner's limits
+// is refused before anything is written, while an answer that fits exactly,
+// with no op to add, goes through; and a retry after a lost answer at
+// exactly the limit isn't refused for room it doesn't need.
 func TestRosterTooLarge(t *testing.T) {
-	x := group(t, 1)
-	defer func(b int) { maxOpsBytes = b }(maxOpsBytes)
-	maxOpsBytes = roster.MaxOpBytes // no room left for the roster
+	x := group(t, 2)
+	defer func(b, o int) { maxOpsBytes, maxOps = b, o }(maxOpsBytes, maxOps)
+	size := func() int {
+		f, _ := x.r.Fold()
+		n := 0
+		for _, b := range opsFrames(f.Order) {
+			n += len(b)
+		}
+		return n
+	}
+	maxOpsBytes = size() // room for the roster, not one op more
 	before := len(x.r.IDs())
 	_, _, op, jerr, serr := x.run(t, me(9), false, nil)
 	if !errors.Is(jerr, ErrTooLarge) || !errors.Is(serr, ErrTooLarge) || op != nil || len(x.r.IDs()) != before {
 		t.Fatalf("got %v / %v, want ErrTooLarge with nothing written", jerr, serr)
+	}
+	if _, _, _, jerr, serr := x.run(t, x.member, true, nil); jerr != nil || serr != nil {
+		t.Fatalf("a roster-only rejoin that fits exactly: %v / %v", jerr, serr)
+	}
+
+	maxOpsBytes = 16 << 20
+	joiner := me(10)
+	if _, err := (&roster.Writer{R: x.r, Me: x.admin, Now: clock}).Add(joiner.Public(), "j", roster.Member, x.issued.Invite.Key); err != nil {
+		t.Fatal(err) // as if its answer was lost
+	}
+	f, _ := x.r.Fold()
+	maxOps = len(f.Order)
+	if _, _, _, jerr, serr := x.run(t, joiner, false, nil); jerr != nil || serr != nil {
+		t.Fatalf("a retry at exactly the op limit: %v / %v", jerr, serr)
+	}
+}
+
+// TestIssueRefusesUnparseableLink: a hint that makes the link too long (a
+// long IPv6 zone) is refused before the invite is recorded.
+func TestIssueRefusesUnparseableLink(t *testing.T) {
+	x := group(t, 1)
+	before := len(x.r.IDs())
+	zone := strings.Repeat("z", maxLinkBytes)
+	hint := netip.AddrPortFrom(netip.MustParseAddr("fe80::1").WithZone(zone), 1)
+	if _, _, err := Issue(&roster.Writer{R: x.r, Me: x.admin}, 1, time.Hour, []netip.AddrPort{hint}, nil); !errors.Is(err, roster.ErrNotAllowed) {
+		t.Fatalf("an unparseable link was issued: %v", err)
+	}
+	if len(x.r.IDs()) != before {
+		t.Fatal("a refused invite was recorded")
 	}
 }

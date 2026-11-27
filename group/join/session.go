@@ -183,6 +183,11 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 	if replay {
 		return redeliver(cfg, req, now())
 	}
+	if f, err := cfg.Roster.Fold(); err != nil || !fits(f.Order) {
+		// Even without the op it would write, the answer couldn't be
+		// sent: don't ask Approve.
+		return nil, ErrTooLarge
+	}
 	if cfg.Approve != nil && !cfg.Approve(req) {
 		return nil, ErrNotApproved
 	}
@@ -195,18 +200,57 @@ func decide(cfg AdminConfig, now func() time.Time, req Request, mac, sig []byte)
 	if replay {
 		return redeliver(cfg, req, t)
 	}
-	w := &roster.Writer{R: cfg.Roster, Me: cfg.Me, Now: func() time.Time { return t }}
 	if !req.Rejoin {
-		return w.Add(req.Member, req.Name, roster.Member, cfg.Invite.Key)
+		return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+			return w.Add(req.Member, req.Name, roster.Member, cfg.Invite.Key)
+		})
 	}
-	op, err := w.Deliver(req.Member, cfg.Invite.Key)
-	if errors.Is(err, roster.ErrNotAllowed) {
-		// Everything else Deliver checks was just checked, against the
-		// same roster and instant: the rejoiner holds every key already,
-		// so it needs only the roster, and the invite isn't spent.
-		return nil, nil
+	return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+		op, err := w.Deliver(req.Member, cfg.Invite.Key)
+		if errors.Is(err, roster.ErrNotAllowed) {
+			// Everything else Deliver checks was just checked, against the
+			// same roster and instant: the rejoiner holds every key
+			// already, so it needs only the roster, and the invite isn't
+			// spent.
+			return nil, nil
+		}
+		return op, err
+	})
+}
+
+// stage writes an answer's operation, if any, on a copy of the roster at
+// t, and commits it only if the answer it makes fits what the joiner
+// takes: an approval committed that can't be sent would spend the invite
+// for nothing.
+func stage(cfg AdminConfig, t time.Time, write func(*roster.Writer) (*roster.Op, error)) (*roster.Op, error) {
+	c := cfg.Roster.Clone()
+	op, err := write(&roster.Writer{R: c, Me: cfg.Me, Now: func() time.Time { return t }})
+	if err != nil {
+		return nil, err
 	}
-	return op, err
+	f, err := c.Fold()
+	if err != nil {
+		return nil, err
+	}
+	if !fits(f.Order) {
+		return nil, ErrTooLarge
+	}
+	if op != nil {
+		if _, err := cfg.Roster.Add(op); err != nil {
+			return nil, err
+		}
+	}
+	return op, nil
+}
+
+// fits reports whether an answer carrying ops is within what readAnswer
+// takes, measured as writeAnswer frames it.
+func fits(ops []*roster.Op) bool {
+	total := 0
+	for _, b := range opsFrames(ops) {
+		total += len(b)
+	}
+	return total <= maxOpsBytes && len(ops) <= maxOps
 }
 
 // admit checks a request against the roster at t. replay reports a request
@@ -227,15 +271,6 @@ func admit(cfg AdminConfig, req Request, t time.Time) (replay bool, err error) {
 	// rejoiner holds every key.
 	if _, ok := cfg.Roster.Keyring(cfg.Me).Secrets[f.Current]; !ok {
 		return false, ErrNoKeys
-	}
-	// The answer, with the one operation this may write, must fit what the
-	// joiner takes, or an approval would be committed that can't be sent.
-	size := roster.MaxOpBytes
-	for _, o := range f.Order {
-		size += len(o.Encode()) + 16
-	}
-	if size > maxOpsBytes || len(f.Order)+1 > maxOps {
-		return false, ErrTooLarge
 	}
 	member := f.Roles[req.Member] != roster.None
 	if member && answered(f, cfg.Invite.Key, req.Member) {
@@ -275,12 +310,13 @@ func answered(f *roster.Result, invite, member keys.PublicKey) bool {
 // That deliver names no invite, so it spends nothing and needs no usable
 // invite; any member may be delivered to.
 func redeliver(cfg AdminConfig, req Request, t time.Time) (*roster.Op, error) {
-	w := &roster.Writer{R: cfg.Roster, Me: cfg.Me, Now: func() time.Time { return t }}
-	op, err := w.Deliver(req.Member, keys.PublicKey{})
-	if errors.Is(err, roster.ErrNotAllowed) {
-		return nil, nil // it holds every key
-	}
-	return op, err
+	return stage(cfg, t, func(w *roster.Writer) (*roster.Op, error) {
+		op, err := w.Deliver(req.Member, keys.PublicKey{})
+		if errors.Is(err, roster.ErrNotAllowed) {
+			return nil, nil // it holds every key
+		}
+		return op, err
+	})
 }
 
 // JoinConfig is the joining side.
@@ -428,30 +464,36 @@ func writeAnswer(w io.Writer, code int64, ops []*roster.Op) error {
 	if err := writeFrame(w, frameAnswer, bencode.AppendInt(nil, code)); err != nil || code != 0 {
 		return err
 	}
+	for _, b := range opsFrames(ops) {
+		if err := writeFrame(w, frameOps, b); err != nil {
+			return err
+		}
+	}
+	return writeFrame(w, frameEnd, bencode.AppendInt(nil, int64(len(ops))))
+}
+
+// opsFrames is the bodies of the frames an answer carries ops in, up to
+// opsChunk bytes of operations each.
+func opsFrames(ops []*roster.Op) [][]byte {
+	var out [][]byte
 	var cur []bencode.Value
 	size := 0
-	flush := func() error {
-		if len(cur) == 0 {
-			return nil
+	flush := func() {
+		if len(cur) > 0 {
+			out = append(out, bencode.Append(nil, bencode.Value{Kind: bencode.List, List: cur}))
+			cur, size = nil, 0
 		}
-		err := writeFrame(w, frameOps, bencode.Append(nil, bencode.Value{Kind: bencode.List, List: cur}))
-		cur, size = nil, 0
-		return err
 	}
 	for _, o := range ops {
 		b := o.Encode()
 		if size+len(b) > opsChunk && len(cur) > 0 {
-			if err := flush(); err != nil {
-				return err
-			}
+			flush()
 		}
 		cur = append(cur, bencode.Value{Kind: bencode.String, Str: b})
 		size += len(b) + 16
 	}
-	if err := flush(); err != nil {
-		return err
-	}
-	return writeFrame(w, frameEnd, bencode.AppendInt(nil, int64(len(ops))))
+	flush()
+	return out
 }
 
 // readAnswer reads an answer: a refusal's error, or the operations.

@@ -172,10 +172,13 @@ func Issue(w *roster.Writer, uses uint32, ttl time.Duration, hints []netip.AddrP
 	if expires <= now.Unix() {
 		return nil, nil, roster.ErrNotAllowed
 	}
+	iv := Invite{Key: key.Public(), Secret: secret, Expires: expires, Name: w.R.Op(w.R.Group()).Name, Hints: hints}
+	if _, err := ParseLink(iv.Link()); err != nil { // a hint's IPv6 zone can make it too long
+		return nil, nil, roster.ErrNotAllowed
+	}
 	op, err := w.Invite(key.Public(), uses, expires)
 	if err != nil {
 		return nil, nil, err
 	}
-	iv := Invite{Key: key.Public(), Secret: secret, Expires: expires, Name: w.R.Op(w.R.Group()).Name, Hints: hints}
 	return &Issued{Invite: iv, Key: key}, op, nil
 }
