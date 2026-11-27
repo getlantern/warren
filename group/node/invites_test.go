@@ -1,0 +1,256 @@
+package node
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/getlantern/warren/dht"
+	"github.com/getlantern/warren/group/join"
+	"github.com/getlantern/warren/group/keys"
+	"github.com/getlantern/warren/group/memberlog"
+	"github.com/getlantern/warren/group/roster"
+)
+
+// memberlogSet is a log set brought up to r's fold.
+func memberlogSet(t *testing.T, r *roster.Roster) *memberlog.Set {
+	t.Helper()
+	logs := memberlog.NewSet(r.Group())
+	f, err := r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logs.Update(f); err != nil {
+		t.Fatal(err)
+	}
+	return logs
+}
+
+var joinCfg = Config{CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second}
+
+// TestJoinByInvite: the owner issues an invite, a newcomer joins through
+// it, and the newcomer then reaches the owner as a member, under its own
+// rendezvous key.
+func TestJoinByInvite(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newcomer := me(40)
+	iv, err := join.ParseLink(issued.Invite.Link())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := host(t, seed).JoinByInvite(ctx, iv, newcomer, "newcomer", joinCfg)
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	roles, _ := n.view()
+	if roles[newcomer.Public()] != roster.Member {
+		t.Fatal("the newcomer's node doesn't hold it as a member")
+	}
+	eventually(t, "the newcomer's listener was never published", func() bool {
+		var ok bool
+		n.h.Endpoint().DHT().Inspect(ctx, func(d *dht.Node) {
+			ok = len(d.HoldersFor(newcomer.Rendezvous(n.cfg.Group, keys.PeriodOf(time.Now())).Public())) > 0
+		})
+		return ok
+	})
+	if err := n.Call(ctx, x.owner.Public()); err != nil {
+		t.Fatalf("the newcomer couldn't reach the owner: %v", err)
+	}
+	if _, ok := owner.Seen()[newcomer.Public()]; !ok {
+		eventually(t, "the owner didn't record the newcomer", func() bool {
+			_, ok := owner.Seen()[newcomer.Public()]
+			return ok
+		})
+	}
+}
+
+// TestRejoinByInvite: a member rejoins on a new host through an invite and
+// gets a working node.
+func TestRejoinByInvite(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := host(t, seed).Rejoin(ctx, issued.Invite, x.m1, joinCfg)
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	roles, _ := n.view()
+	if roles[x.m1.Public()] != roster.Member {
+		t.Fatal("the rejoined node doesn't hold the member")
+	}
+}
+
+// TestJoinRefusals: a wrong invite secret reaches no listener; an expired
+// invite and a declined request are refused, writing nothing.
+func TestJoinRefusals(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	var clock atomic.Int64 // UnixNano, read by the serving goroutine
+	clock.Store(time.Now().UnixNano())
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	var declined atomic.Bool
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	owner := x.join(t, h, x.owner, x.r)
+	_ = owner.Leave(ctx) // rejoin it with a clock and Approve the test controls
+	logs := owner.cfg.Logs
+	o, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: logs, Now: func() time.Time { return time.Unix(0, clock.Load()) },
+		CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second,
+		Approve: func(join.Request) bool { return !declined.Load() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := o.Invite(ctx, 5, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := issued.Invite
+	wrong.Secret[0] ^= 1
+	if _, err := host(t, seed).JoinByInvite(ctx, wrong, me(41), "w", joinCfg); !errors.Is(err, ErrNoListener) {
+		t.Fatalf("a wrong secret: %v, want ErrNoListener", err)
+	}
+	declined.Store(true)
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(42), "d", joinCfg); !errors.Is(err, join.ErrNotApproved) {
+		t.Fatalf("declined: %v, want ErrNotApproved", err)
+	}
+	declined.Store(false)
+	clock.Add(int64(time.Hour + time.Minute)) // expired, within the retry grace: still listening
+	if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(43), "e", joinCfg); !errors.Is(err, join.ErrInviteUnusable) {
+		t.Fatalf("expired: %v, want ErrInviteUnusable", err)
+	}
+	var added int
+	_ = o.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		f, _ := r.Fold()
+		for _, k := range []*keys.Identity{me(41), me(42), me(43)} {
+			if f.Roles[k.Public()] != roster.None {
+				added++
+			}
+		}
+		return nil
+	})
+	if added != 0 {
+		t.Fatal("a refused joiner was added")
+	}
+}
+
+// TestInviteListenerRotates: an invite is listened for under this and the
+// next period's blinded keys, rotates with the clock, and is dropped past
+// its retry grace.
+func TestInviteListenerRotates(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	now := time.Now()
+	h := host(t, seed)
+	c := copyRoster(t, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	n, err := h.Join(ctx, Config{Me: x.owner, Group: x.g, Roster: c, Logs: memberlogSet(t, c), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := n.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := keys.PeriodOf(now)
+	key := func(q uint64) keys.PublicKey { k, _ := issued.Invite.Listener(q); return k }
+	if !n.listensUnder(key(p)) || !n.listensUnder(key(p+1)) || !n.isInviteKey(key(p)) || n.isInviteKey(issued.Invite.Key) {
+		t.Fatal("not listening under the invite's blinded keys")
+	}
+	if !h.authorize(key(p), me(99).Public()) {
+		t.Fatal("an invite listener refused a fresh caller")
+	}
+	now = now.Add(time.Hour)
+	if err := n.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !n.listensUnder(key(p+2)) || !n.listensUnder(key(p)) {
+		t.Fatal("the invite's listener didn't rotate, keeping the previous period's")
+	}
+	now = now.Add(time.Hour)
+	if err := n.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n.listensUnder(key(p)) {
+		t.Fatal("an invite listener two periods back wasn't dropped")
+	}
+	now = time.Unix(issued.Invite.Expires, 0).Add(join.RetryGrace + time.Second)
+	if err := n.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	q := keys.PeriodOf(now)
+	if n.listensUnder(key(q)) || n.listensUnder(key(p+2)) {
+		t.Fatal("an invite past its retry grace is still listened for")
+	}
+	n.lmu.Lock()
+	left := len(n.invites)
+	n.lmu.Unlock()
+	if left != 0 {
+		t.Fatal("an invite past its retry grace is still held")
+	}
+}
+
+// TestLeave: a node that leaves is routed nothing and drops its listeners.
+func TestLeave(t *testing.T) {
+	seed := network(t, 6)
+	x := newGroup(t)
+	h := host(t, seed)
+	n := x.join(t, h, x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	issued, err := n.Invite(ctx, 1, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := keys.PeriodOf(time.Now())
+	ik, _ := issued.Invite.Listener(p)
+	rk := x.owner.Rendezvous(x.g, p).Public()
+	if err := n.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h.groupFor(rk) != nil || h.groupFor(ik) != nil {
+		t.Fatal("a node that left is still routed to")
+	}
+	if n.listensUnder(rk) || n.listensUnder(ik) {
+		t.Fatal("a node that left still listens")
+	}
+}
+
+// TestJoinAcrossPeriodBoundary: a joiner whose clock is a period behind or
+// ahead of the admin's still reaches the invite's listener, by trying the
+// next and the previous period's keys.
+func TestJoinAcrossPeriodBoundary(t *testing.T) {
+	seed := network(t, 10)
+	x := newGroup(t)
+	owner := x.join(t, host(t, seed), x.owner, x.r)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	issued, err := owner.Invite(ctx, 2, 3*time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, skew := range []time.Duration{-time.Hour, 2 * time.Hour} {
+		cfg := joinCfg
+		cfg.Now = func() time.Time { return time.Now().Add(skew) }
+		if _, err := host(t, seed).JoinByInvite(ctx, issued.Invite, me(byte(50+i)), "s", cfg); err != nil {
+			t.Fatalf("a joiner %v off the admin's clock: %v", skew, err)
+		}
+	}
+}

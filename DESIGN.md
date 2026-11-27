@@ -976,8 +976,16 @@ line, B runs alongside it, C waits on device time, D is maintenance.
          against the roster and an `Approve` callback, answered with an
          `add` or a rejoin's `deliver` and the roster's operations, which
          the joiner checks admit it with the current `G`;
-      3. `group/node`: listening under blinded invite keys, joining and
-         rejoining by invite.
+      3. `group/node` (built): `Node.Invite` issues an invite and listens
+         under its key blinded per period, rotating with the clock and
+         dropping it `join.RetryGrace` past expiry; the host admits any
+         caller on an invite key and runs a join session (`join.Serve`
+         under `Do`, with `Config.Approve`) instead of a member session;
+         `Host.JoinByInvite` and `Host.Rejoin` call the blinded key (this,
+         the next, then the previous period's), run `join.Join`, and join
+         the group with the roster and `G` they get; `Node.Leave` drops a
+         group. A running node keeps the `G` it joined with: moving it to a
+         new one after a rekey is step 8's.
 6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
    tree over ciphertext, announcements. Pure library, so it can be built
    alongside steps 4 and 5.

@@ -20,6 +20,7 @@ import (
 	"github.com/getlantern/warren/dht"
 	"github.com/getlantern/warren/endpoint"
 	"github.com/getlantern/warren/group/directory"
+	"github.com/getlantern/warren/group/join"
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/memberlog"
 	"github.com/getlantern/warren/group/roster"
@@ -142,7 +143,7 @@ func (h *Host) groupFor(key keys.PublicKey) *Node {
 
 func (h *Host) authorize(listener, caller [32]byte) bool {
 	n := h.groupFor(listener)
-	return n != nil && n.admits(caller)
+	return n != nil && (n.isInviteKey(listener) || n.admits(caller))
 }
 
 func (h *Host) accept(ctx context.Context) {
@@ -185,6 +186,20 @@ type Config struct {
 	CallTimeout time.Duration
 	// SessionTimeout bounds one session; zero means a minute.
 	SessionTimeout time.Duration
+	// Approve decides a join or rejoin request under one of this node's
+	// invites, its proofs checked; nil approves every request the invite
+	// covers.
+	Approve func(join.Request) bool
+}
+
+func withDefaults(cfg Config) Config {
+	if cfg.CallTimeout == 0 {
+		cfg.CallTimeout = 15 * time.Second
+	}
+	if cfg.SessionTimeout == 0 {
+		cfg.SessionTimeout = time.Minute
+	}
+	return cfg
 }
 
 // Node is one group on a host.
@@ -204,7 +219,8 @@ type Node struct {
 	doWaiting atomic.Int32
 
 	lmu       sync.Mutex
-	listening map[uint64]keys.Signer // period → the rendezvous key listened under
+	listening map[uint64]keys.Signer     // period → the rendezvous key listened under
+	invites   map[keys.PublicKey]*invite // by invite key
 	admit     atomic.Pointer[map[keys.PublicKey]bool]
 	// roles is the roster's members as of the last refresh, read without
 	// mu so a call or a directory write doesn't wait out a session.
@@ -223,14 +239,9 @@ type Node struct {
 // Join listens for cfg's group on the host under this and the next
 // period's rendezvous keys.
 func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
-	if cfg.CallTimeout == 0 {
-		cfg.CallTimeout = 15 * time.Second
-	}
-	if cfg.SessionTimeout == 0 {
-		cfg.SessionTimeout = time.Minute
-	}
-	n := &Node{h: h, cfg: cfg, listening: map[uint64]keys.Signer{}, seen: map[keys.PublicKey]time.Time{},
-		shards: cfg.Roster.Op(cfg.Roster.Group()).Shards}
+	cfg = withDefaults(cfg)
+	n := &Node{h: h, cfg: cfg, listening: map[uint64]keys.Signer{}, invites: map[keys.PublicKey]*invite{},
+		seen: map[keys.PublicKey]time.Time{}, shards: cfg.Roster.Op(cfg.Roster.Group()).Shards}
 	n.mu.Lock()
 	n.refresh()
 	n.mu.Unlock()
@@ -251,7 +262,7 @@ func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// leave takes n off the host and drops its listeners.
+// leave takes n off the host and drops its listeners, invites' included.
 func (n *Node) leave() {
 	n.h.mu.Lock()
 	for i, g := range n.h.groups {
@@ -266,6 +277,12 @@ func (n *Node) leave() {
 	for q, s := range n.listening {
 		_ = n.h.ep.RemoveListener(context.Background(), s.Public())
 		delete(n.listening, q)
+	}
+	for k, iv := range n.invites {
+		for _, s := range iv.listening {
+			_ = n.h.ep.RemoveListener(context.Background(), s.Public())
+		}
+		delete(n.invites, k)
 	}
 }
 
@@ -282,7 +299,8 @@ type rolesView struct {
 }
 
 // Tick brings the listeners up to the clock: this and the next period's
-// rendezvous keys, the older ones dropped, and the admission set rebuilt.
+// rendezvous keys and invite keys, the older ones (and invites past their
+// retry grace) dropped, and the admission set rebuilt.
 // Run it every few minutes.
 func (n *Node) Tick(ctx context.Context) error {
 	err := n.rotate(ctx)
@@ -322,12 +340,16 @@ func (n *Node) rotate(ctx context.Context) error {
 		}
 		n.listening[q] = s
 	}
+	errs = append(errs, n.rotateInvites(ctx, p)...)
 	return errors.Join(errs...)
 }
 
 func (n *Node) listensUnder(key keys.PublicKey) bool {
 	n.lmu.Lock()
 	defer n.lmu.Unlock()
+	if is, _ := n.inviteFor(key); is != nil {
+		return true
+	}
 	return n.signerFor(key) != nil
 }
 
@@ -381,7 +403,12 @@ func (n *Node) serve(ctx context.Context, c *endpoint.Conn) {
 	defer func() { _ = c.Close() }()
 	n.lmu.Lock()
 	signer := n.signerFor(c.LocalKey)
+	issued, inviteSigner := n.inviteFor(c.LocalKey)
 	n.lmu.Unlock()
+	if issued != nil {
+		n.serveJoin(ctx, c, issued, inviteSigner)
+		return
+	}
 	if signer == nil {
 		return
 	}
