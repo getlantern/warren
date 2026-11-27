@@ -1019,10 +1019,14 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       `node.ErrQueueFull`), as it does for a member that holds no current
       epoch key yet, and a post goes in behind anything held; a refresh
       that finds the condition gone appends them in order under the new
-      epoch. `Node.Held` hands back what's held, which `Leave` leaves to
-      the caller. A mirror's or removed member's post is refused. An owner's or admin's node writes the corrective `rekey`
-      itself on its next `Tick` (`Join` ticks, so straight away for one
-      joining an exposed roster). Content blobs join the queue in step 6;
+      epoch, chaining after any of the member's own entries an epoch that
+      stopped counting hides. A failed append is reported to later posts
+      (`node.ErrHeldFailed`), and `Node.TakeHeld` hands over what's held,
+      which `Leave` also leaves to the caller. A mirror's or removed
+      member's post is refused. An owner's or admin's node writes the
+      corrective `rekey` itself on its next `Tick` (`Join` ticks, so
+      straight away for one joining an exposed roster, though a failure
+      there doesn't fail the join). Content blobs join the queue in step 6;
    4. mirrors, once content and swarming exist.
 
 **B. DHT speed** (*Performance against libtorrent*): the hit median is

@@ -82,6 +82,9 @@ var (
 	// ErrQueueFull means a post found the publish queue full (MaxQueued)
 	// while publishing is paused.
 	ErrQueueFull = errors.New("node: publish queue full")
+	// ErrHeldFailed means held posts failed to append (Node.Post); the
+	// error wraps why.
+	ErrHeldFailed = errors.New("node: held posts failed to append")
 )
 
 // Host owns a warren endpoint and routes its listeners and connections to
@@ -284,8 +287,12 @@ type Node struct {
 	// (roster.NeedsRekey): the current keys have reached a key that isn't
 	// a member, so the node publishes nothing until the rekey lands.
 	paused atomic.Bool
-	// queue is the posts held while paused, in order. mu held.
-	queue [][]byte
+	// queue is the posts held while paused, in order; flushed counts those
+	// ever taken off it, so a post can tell whether it still is. flushErr
+	// is the last flush's failure, nil once one succeeds. mu held.
+	queue    [][]byte
+	flushed  uint64
+	flushErr error
 }
 
 // sighting is a session with a member: when, and under which group secret.
@@ -394,7 +401,9 @@ func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	}
 	h.groups = append(h.groups, n)
 	h.mu.Unlock()
-	if err := n.Tick(ctx); err != nil {
+	// A failed corrective rekey doesn't fail the join: the next Tick tries
+	// again.
+	if _, err := n.tick(ctx); err != nil {
 		n.leave()
 		return nil, err
 	}
@@ -443,13 +452,19 @@ type rolesView struct {
 // retry grace) dropped, and the admission set rebuilt.
 // Run it every few minutes.
 func (n *Node) Tick(ctx context.Context) error {
+	cerr, err := n.tick(ctx)
+	return errors.Join(cerr, err)
+}
+
+// tick is Tick, with the corrective rekey's error apart from the rest.
+func (n *Node) tick(ctx context.Context) (cerr, err error) {
 	if n.left.Load() {
-		return ErrLeft // the roster is the caller's again
+		return nil, ErrLeft // the roster is the caller's again
 	}
 	// Before rotating, so the listeners follow a corrective rekey's secret
 	// in this same Tick.
-	cerr := n.correct(ctx)
-	err := errors.Join(cerr, n.rotate(ctx))
+	cerr = n.correct(ctx)
+	err = n.rotate(ctx)
 	// After lmu is released, as the host's admission and routing take it.
 	// A session holding mu refreshes when it ends, with the clock then.
 	// Leave may have run meanwhile: checked again under mu, which Leave's
@@ -460,7 +475,7 @@ func (n *Node) Tick(ctx context.Context) error {
 		}
 		n.mu.Unlock()
 	}
-	return err
+	return cerr, err
 }
 
 // rotate listens under this and the next period's rendezvous keys and
@@ -616,8 +631,8 @@ func (n *Node) refresh() {
 	}
 	// A roster that won't fold pauses publishing too: fail closed.
 	n.paused.Store(err != nil || n.cfg.Roster.NeedsRekey(f))
-	if !n.paused.Load() {
-		n.flush()
+	if !n.paused.Load() && !n.left.Load() {
+		n.flush() // after Leave, held posts are the caller's (TakeHeld)
 	}
 	admit := map[keys.PublicKey]bool{}
 	p := keys.PeriodOf(now)

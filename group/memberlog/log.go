@@ -108,6 +108,33 @@ func (l *Log) Head() *Entry {
 	return l.bySeq[l.top].clone()
 }
 
+// Last returns a copy of the last entry on the visible chain's line: the
+// head, or past it the entries held ahead that chain from it (ones the
+// roster no longer lets show, say), or nil. An author writing its own log
+// chains from this rather than Head: an entry at Head's next sequence
+// number would fork the log against one it already wrote.
+func (l *Log) Last() *Entry {
+	seq := l.top
+	for {
+		next, ok := l.bySeq[seq+1]
+		if !ok {
+			break
+		}
+		var prev ID
+		if seq > 0 {
+			prev = l.bySeq[seq].id
+		}
+		if next.Prev != prev {
+			break
+		}
+		seq++
+	}
+	if seq == 0 {
+		return nil
+	}
+	return l.bySeq[seq].clone()
+}
+
 // limit is the highest sequence number the app may see: below a fork
 // point, except where a removal's head has anchored the chain past it, and
 // never past a removal's cutoff.

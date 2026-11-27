@@ -206,7 +206,7 @@ func TestAdminCorrectsOnTick(t *testing.T) {
 	if err := m.Leave(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if h := m.Held(); len(h) != 1 || string(h[0]) != "one" {
+	if h := m.TakeHeld(); len(h) != 1 || string(h[0]) != "one" {
 		t.Fatalf("held after Leave %q", h)
 	}
 
@@ -306,14 +306,15 @@ func TestPostRefusals(t *testing.T) {
 	n.mu.Lock()
 	n.queue = append(n.queue, []byte("held"))
 	n.mu.Unlock()
-	if queued, err := n.Post(context.Background(), []byte("next")); err != nil || !queued {
+	// Queued behind it, then Do's refresh flushes both, the held one first,
+	// so it's no longer held when Post returns.
+	if queued, err := n.Post(context.Background(), []byte("next")); err != nil || queued {
 		t.Fatalf("a post behind a held one: queued %v, %v", queued, err)
 	}
-	// Its Do's refresh flushes both, the held one first.
 	if got := bodies(t, n, x.m1); len(got) != 2 || got[0] != "held" || got[1] != "next" {
 		t.Fatalf("log %q", got)
 	}
-	if h := n.Held(); len(h) != 0 {
+	if h := n.TakeHeld(); len(h) != 0 {
 		t.Fatalf("held after the flush %q", h)
 	}
 
@@ -351,5 +352,115 @@ func TestPausedMemberTickDoesntWait(t *testing.T) {
 	defer cancel()
 	if err := n.Tick(ctx); err != nil {
 		t.Fatalf("a paused member's Tick waited on the group: %v", err)
+	}
+}
+
+// TestPostAfterEpochStopsCounting: posts flushed under an admin's
+// corrective rekey that then stops counting (the owner demoted the admin
+// concurrently) are still this member's; later posts chain after them
+// rather than forking the member's own log.
+func TestPostAfterEpochStopsCounting(t *testing.T) {
+	x := newGroup(t)
+	a := x.admins(t)
+	if err := x.expose(x.r); err != nil {
+		t.Fatal(err)
+	}
+	f, err := x.r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.g = x.r.Keyring(x.owner).Secrets[f.Current]
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	ctx := context.Background()
+	if _, err := n.Post(ctx, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	var stale *roster.Roster
+	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		stale = r.Clone() // the owner's view, without the admin's rekey
+		_, err := (&roster.Writer{R: r, Me: a}).Rekey()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if h := n.TakeHeld(); len(h) != 0 {
+		t.Fatalf("not flushed under the admin's rekey: %q", h)
+	}
+	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		o, err := (&roster.Writer{R: stale, Me: x.owner}).SetRole(a.Public(), roster.Member)
+		if err != nil {
+			return err
+		}
+		_, err = r.Add(o)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !n.Paused() {
+		t.Fatal("the admin's rekey still counts")
+	}
+	if _, err := n.Post(ctx, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		_, err := (&roster.Writer{R: r, Me: x.owner}).Rekey()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n.mu.Lock()
+	ferr, fork := n.flushErr, n.cfg.Logs.Log(x.m1.Public()).Fork()
+	n.mu.Unlock()
+	if ferr != nil || fork != nil {
+		t.Fatalf("the flush after the owner's rekey: %v, fork %v", ferr, fork != nil)
+	}
+	if queued, err := n.Post(ctx, []byte("three")); err != nil || queued {
+		t.Fatalf("a later post: queued %v, %v", queued, err)
+	}
+}
+
+// TestHeldFailureSurfaces: a held post that fails to append is reported to
+// later posts (ErrHeldFailed) rather than piling them up behind it, until
+// TakeHeld hands it over.
+func TestHeldFailureSurfaces(t *testing.T) {
+	x := newGroup(t)
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	ctx := context.Background()
+	n.mu.Lock()
+	n.queue = append(n.queue, make([]byte, memberlog.MaxBody+1)) // can't be written
+	n.mu.Unlock()
+	if _, err := n.Post(ctx, []byte("a")); err != nil {
+		t.Fatal(err) // queued behind it; its flush fails
+	}
+	if _, err := n.Post(ctx, []byte("b")); !errors.Is(err, ErrHeldFailed) {
+		t.Fatalf("a post behind a failing one: %v", err)
+	}
+	if h := n.TakeHeld(); len(h) != 2 || string(h[1]) != "a" {
+		t.Fatalf("held %d", len(h))
+	}
+	if queued, err := n.Post(ctx, []byte("b")); err != nil || queued {
+		t.Fatalf("a post after TakeHeld: queued %v, %v", queued, err)
+	}
+}
+
+// TestLeaveDoesntFlush: Leave's own refresh leaves held posts to the
+// caller, even once they could be appended.
+func TestLeaveDoesntFlush(t *testing.T) {
+	x := newGroup(t)
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	n.mu.Lock()
+	n.queue = append(n.queue, []byte("held")) // unpaused, holding the key
+	n.mu.Unlock()
+	if err := n.Leave(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h := n.TakeHeld(); len(h) != 1 || string(h[0]) != "held" {
+		t.Fatalf("held after Leave %q", h)
+	}
+	n.mu.Lock()
+	l := n.cfg.Logs.Log(x.m1.Public())
+	n.mu.Unlock()
+	if l != nil && len(l.Entries()) != 0 {
+		t.Fatal("Leave appended the held post")
 	}
 }
