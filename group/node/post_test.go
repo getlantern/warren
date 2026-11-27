@@ -552,3 +552,62 @@ func postPastGap(t *testing.T, skip int) {
 		t.Fatalf("a post past a gap in the own log (entry %d missing): %v", skip+1, err)
 	}
 }
+
+// TestPostAfterCutStopsCounting: a removal's cut drops this member's own
+// entries past its cutoff, then the remover's concurrent demotion voids
+// the removal. Peers keep the dropped entries, so posting at the shortened
+// head would fork the log: Post refuses until they're back.
+func TestPostAfterCutStopsCounting(t *testing.T) {
+	x := newGroup(t)
+	a := x.admins(t)
+	f, err := x.r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.g = x.r.Keyring(x.owner).Secrets[f.Current]
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	ctx := context.Background()
+	for _, b := range []string{"one", "two", "three"} {
+		if _, err := n.Post(ctx, []byte(b)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// As a session applies roster ops: add, then give the logs the fold.
+	apply := func(op func(r *roster.Roster) (*roster.Op, error)) {
+		t.Helper()
+		if err := n.Do(ctx, func(r *roster.Roster, logs *memberlog.Set) error {
+			o, err := op(r)
+			if err != nil {
+				return err
+			}
+			if _, err := r.Add(o); err != nil {
+				return err
+			}
+			f, err := r.Fold()
+			if err != nil {
+				return err
+			}
+			return logs.Update(f)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stale *roster.Roster
+	apply(func(r *roster.Roster) (*roster.Op, error) {
+		stale = r.Clone() // the owner's view, without the removal
+		first := n.cfg.Logs.Log(x.m1.Public()).Entries()[0]
+		return (&roster.Writer{R: r.Clone(), Me: a}).Remove(x.m1.Public(), 1, first.ID())
+	})
+	n.mu.Lock()
+	held := n.cfg.Logs.Log(x.m1.Public()).Len()
+	n.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("the cut left %d own entries, want 1", held)
+	}
+	apply(func(*roster.Roster) (*roster.Op, error) {
+		return (&roster.Writer{R: stale, Me: x.owner}).SetRole(a.Public(), roster.Member)
+	})
+	if queued, err := n.Post(ctx, []byte("other two")); !errors.Is(err, ErrHidden) || queued {
+		t.Fatalf("a post at the head a voided cut left: queued %v, %v", queued, err)
+	}
+}

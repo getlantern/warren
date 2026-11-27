@@ -89,7 +89,8 @@ var (
 	// holds entries that don't show: under an epoch that stopped counting
 	// (an admin's rekey racing its demotion), which memberlog hides with
 	// everything after, or past a gap sync hasn't filled, which a new entry
-	// would fork against.
+	// would fork against, or short of entries this node signed (dropped by
+	// a removal's cut that stopped counting) until sync brings them back.
 	ErrHidden = errors.New("node: own log stalled behind entries that don't show")
 )
 
@@ -301,6 +302,11 @@ type Node struct {
 	// last gave the logs its fold, so an unchanged roster isn't applied
 	// again: Set.Update re-walks every log. mu held.
 	logsAt int
+	// ownSeq is the highest sequence number of this member's own entries
+	// the node has written or seen held: a removal's cut can drop held
+	// ones, and signing past the head while peers keep them would fork the
+	// log. mu held.
+	ownSeq uint64
 }
 
 // sighting is a session with a member: when, and under which group secret.
@@ -635,6 +641,13 @@ func (n *Node) refresh() {
 		}
 		if n.follow(g, cands, now) {
 			n.rekeyed.Store(true)
+		}
+	}
+	// Every refresh, including Join's, so own entries a session brought in
+	// count before a later cut can drop them.
+	if n.cfg.Logs != nil {
+		if l := n.cfg.Logs.Log(n.cfg.Me.Public()); l != nil && l.Last() != nil {
+			n.ownSeq = max(n.ownSeq, l.Last().Seq)
 		}
 	}
 	// A roster that won't fold pauses publishing too: fail closed.

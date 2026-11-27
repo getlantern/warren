@@ -112,8 +112,11 @@ func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, ke
 	if err != nil {
 		return err
 	}
-	_, err = logs.Add(e)
-	return err
+	if _, err := logs.Add(e); err != nil {
+		return err
+	}
+	n.ownSeq = max(n.ownSeq, e.Seq)
+	return nil
 }
 
 // updateLogs gives logs f, r's fold, unless they were given a fold of r
@@ -135,8 +138,10 @@ func (n *Node) updateLogs(r *roster.Roster, logs *memberlog.Set, f *roster.Resul
 // ownLog reports why nothing appended to this member's own log now would
 // show: memberlog.ErrForked if it's forked, ErrHidden if it holds entries
 // past what shows (under an epoch that stopped counting, say, or past a
-// gap: an entry after the head would fork against them); nil if something
-// would. logs must have been given the current fold. mu held.
+// gap: an entry after the head would fork against them), or if it's short
+// of entries this node has written or seen (a removal's cut dropped them,
+// and the removal stopped counting); nil if something would. logs must
+// have been given the current fold. mu held.
 func (n *Node) ownLog(logs *memberlog.Set) error {
 	l := logs.Log(n.cfg.Me.Public())
 	if l == nil {
@@ -155,6 +160,10 @@ func (n *Node) ownLog(logs *memberlog.Set) error {
 	}
 	if uint64(l.Len()) > shown {
 		return ErrHidden // past a gap
+	}
+	n.ownSeq = max(n.ownSeq, shown)
+	if n.ownSeq > shown {
+		return ErrHidden // short of entries already signed, which a cut dropped
 	}
 	return nil
 }
