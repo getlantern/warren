@@ -270,3 +270,47 @@ func TestPublishBlobCancelled(t *testing.T) {
 		t.Fatalf("after cancelling: %d held, %d created, %d pieces put of 4", store.held(), created, puts)
 	}
 }
+
+// TestRepostBlob: a blob announcement TakeHeld hands over goes back as a
+// blob announcement through Repost, not as app data.
+func TestRepostBlob(t *testing.T) {
+	x := newGroup(t)
+	x.admins(t)
+	if err := x.expose(x.r); err != nil {
+		t.Fatal(err)
+	}
+	f, err := x.r.Fold()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.g = x.r.Keyring(x.owner).Secrets[f.Current]
+	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
+	ctx := context.Background()
+	id, _, err := n.PublishBlob(ctx, bytes.NewReader(blobData(t, 100)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := n.TakeHeld()
+	if len(held) != 1 || held[0].Kind != memberlog.Blob {
+		t.Fatalf("held %v", held)
+	}
+	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
+		_, err := (&roster.Writer{R: r, Me: x.owner}).Rekey()
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := n.Repost(ctx, held[0]); err != nil || queued {
+		t.Fatalf("repost: queued %v, %v", queued, err)
+	}
+	kinds, bodies := entries(t, n, x.m1)
+	if len(kinds) != 1 || kinds[0] != memberlog.Blob {
+		t.Fatalf("log kinds %v", kinds)
+	}
+	if a, err := content.DecodeAnnouncement(bodies[0]); err != nil || a.ID != id {
+		t.Fatalf("reposted announcement: %v", err)
+	}
+	if _, err := n.Repost(ctx, Held{Kind: 9}); err == nil {
+		t.Fatal("reposted an unknown kind")
+	}
+}

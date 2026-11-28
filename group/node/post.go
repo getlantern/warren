@@ -100,8 +100,8 @@ type Held struct {
 
 // TakeHeld hands over the posts held for publishing, oldest first (what
 // Post and PublishBlob queued and a flush hasn't appended), and clears them,
-// with any failure appending them: the caller posts them again or drops
-// them. After Leave nothing appends them, so a caller taking the roster
+// with any failure appending them: the caller posts them again (Repost,
+// which keeps their kind) or drops them. After Leave nothing appends them, so a caller taking the roster
 // and logs back takes these too. It waits for a running session or Do.
 func (n *Node) TakeHeld() []Held {
 	n.mu.Lock()
@@ -112,6 +112,17 @@ func (n *Node) TakeHeld() []Held {
 	}
 	n.queue, n.flushErr = nil, nil
 	return h
+}
+
+// Repost appends a post TakeHeld handed over, with its kind, as Post would
+// (a blob's announcement stays one: its pieces are still in the store
+// unless the caller deleted them). Only memberlog.App and memberlog.Blob
+// are kinds it takes.
+func (n *Node) Repost(ctx context.Context, h Held) (queued bool, err error) {
+	if h.Kind != memberlog.App && h.Kind != memberlog.Blob {
+		return false, fmt.Errorf("node: no such post kind %d", h.Kind)
+	}
+	return n.post(ctx, h.Kind, h.Body)
 }
 
 // write appends an entry of kind with body to this member's log under key, f's current epoch
