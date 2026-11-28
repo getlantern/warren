@@ -760,9 +760,10 @@ func TestWithholdingPeer(t *testing.T) {
 	setPeer(t, h, "w", full(n))
 	setPeer(t, h, "honest", set(n, 0, 1))
 	h.SetPlayhead(0)
+	setPeer(t, h, "idle", NewBitfield(n))
 	h.Next("w")
 	c.t = c.t.Add(16 * time.Second)
-	h.Next("honest") // expires w's requests
+	h.Next("idle") // expires w's requests, asking nothing
 	h.RemovePeer("w")
 	setPeer(t, h, "w", full(n))
 	for _, i := range h.Next("w") {
