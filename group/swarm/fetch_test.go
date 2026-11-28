@@ -277,14 +277,33 @@ func TestPipelineDepth(t *testing.T) {
 	if len(first) != 2 {
 		t.Fatalf("an unmeasured peer got %d requests", len(first))
 	}
-	c.t = c.t.Add(100 * time.Millisecond) // 10 pieces a second
-	f.Received("p", first[0], pieceSize, true)
+	// 10 pieces a second, busy throughout, past the least sample span (a
+	// sample closes at the delivery after it).
+	for range 4 {
+		c.t = c.t.Add(100 * time.Millisecond)
+		for i := range f.peers["p"].out {
+			f.Received("p", i, pieceSize, true)
+			break
+		}
+		f.Next("p")
+	}
 	if got := f.Outstanding("p") + len(f.Next("p")); got != 10 {
 		t.Fatalf("at 10 pieces a second, a 1s pipeline of %d", got)
 	}
-	for range 10 { // everything outstanding lands a millisecond on: capped
+	// A slow sample lowers it, smoothed: not straight down to the sample.
+	for range 2 { // a piece a second; the second closes the sample
+		c.t = c.t.Add(time.Second)
+		for i := range f.peers["p"].out {
+			f.Received("p", i, pieceSize, true)
+			break
+		}
+	}
+	if d := f.depth(f.peers["p"]); d <= 2 || d >= 10 {
+		t.Fatalf("after one slow sample, a pipeline of %d", d)
+	}
+	for range 10 { // everything outstanding lands together, 300ms on: capped
 		f.Next("p")
-		c.t = c.t.Add(time.Millisecond)
+		c.t = c.t.Add(300 * time.Millisecond)
 		for i := range f.peers["p"].out {
 			f.Received("p", i, pieceSize, true)
 		}
@@ -448,6 +467,9 @@ func TestThroughputThroughLatency(t *testing.T) {
 	if took := c.t.Sub(time.Unix(0, 0)); took > 10*time.Second {
 		t.Fatalf("300 pieces took %v", took)
 	}
+	if r := f.peers["p"].rate; r < 90000 {
+		t.Fatalf("measured %.0f bytes a second of a 100000 peer", r)
+	}
 }
 
 // TestEndgameIgnoresUnavailable: a piece nobody holds doesn't keep a
@@ -479,8 +501,79 @@ func TestStrikesSurviveRemoval(t *testing.T) {
 	setPeer(t, f, "bad", full(4))
 	f.Received("bad", f.Next("bad")[0], pieceSize, false)
 	f.RemovePeer("bad")
-	setPeer(t, f, "bad", full(4))
-	if got := f.Next("bad"); got != nil || f.Strikes("bad") != 1 {
-		t.Fatalf("back after its strike, asked for %v with %d strikes", got, f.Strikes("bad"))
+	if err := f.SetPeer("bad", full(4)); !errors.Is(err, ErrStruckOut) || f.Strikes("bad") != 1 {
+		t.Fatalf("back after striking out: %v, %d strikes", err, f.Strikes("bad"))
+	}
+	if got := f.Next("bad"); got != nil {
+		t.Fatalf("a struck-out peer asked for %v", got)
+	}
+}
+
+// TestStruckOutRetired: a peer striking out releases its requests and its
+// holdings, so a piece only it advertised doesn't hold off the endgame.
+func TestStruckOutRetired(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 3
+	f := newFetch(t, n, c, Config{MaxStrikes: 1, MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "stuck", set(n, 0))
+	if got := f.Next("stuck"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("stuck asked for %v", got)
+	}
+	setPeer(t, f, "bad", set(n, 2))
+	if got := f.Next("bad"); !slices.Equal(got, []uint32{2}) {
+		t.Fatalf("bad asked for %v", got)
+	}
+	f.Received("bad", 2, pieceSize, false)
+	if f.avail[2] != 0 || f.asked[2] != 0 {
+		t.Fatalf("after bad struck out, piece 2: availability %d, asked %d", f.avail[2], f.asked[2])
+	}
+	setPeer(t, f, "good", set(n, 0, 1))
+	f.Received("good", f.Next("good")[0], pieceSize, true)
+	if got := f.Next("good"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("good stole %v, want the stuck peer's piece 0", got)
+	}
+}
+
+// TestEndgameSameCall: a peer taking the last fresh piece with a slot to
+// spare steals in the same call.
+func TestEndgameSameCall(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 3
+	f := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 2})
+	setPeer(t, f, "a", set(n, 0, 1))
+	if got := f.Next("a"); len(got) != 2 {
+		t.Fatalf("a asked for %v", got)
+	}
+	setPeer(t, f, "b", full(n))
+	got := f.Next("b")
+	if len(got) != 2 || got[0] != 2 {
+		t.Fatalf("b asked for %v, want piece 2 then a stolen one", got)
+	}
+}
+
+// TestBurstThroughput: ten pieces landing together after a second aren't
+// measured as one piece a second each: the ones after the sampling piece
+// count toward the next sample, which then shows the rate.
+func TestBurstThroughput(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 100
+	f := newFetch(t, n, c, Config{MinDepth: 12, MaxDepth: 32}) // one stays outstanding
+	setPeer(t, f, "p", full(n))
+	got := f.Next("p")
+	c.t = c.t.Add(time.Second)
+	for _, i := range got[:10] {
+		f.Received("p", i, pieceSize, true)
+	}
+	c.t = c.t.Add(sampleSpan)
+	f.Received("p", got[10], pieceSize, true)
+	if r := f.peers["p"].rate; r < 9000 {
+		t.Fatalf("a burst of ten pieces then one more measured %.0f bytes a second", r)
+	}
+}
+
+// TestTooLarge: a blob past MaxPieces is refused before any allocation.
+func TestTooLarge(t *testing.T) {
+	if _, err := NewFetch[string](MaxPieces+1, nil, Config{}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("past MaxPieces: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"errors"
 	"math/rand/v2"
 	"slices"
 	"time"
@@ -20,7 +21,8 @@ type Config struct {
 	// when streaming (8).
 	Window uint32
 	// MaxStrikes is how many pieces failing verification a peer may send
-	// before it gets no more requests (3).
+	// before it's out of the fetch (3): its requests and holdings go to
+	// the rest, and SetPeer refuses it.
 	MaxStrikes int
 	// Now is the clock (time.Now); Rand breaks ties (seeded randomly).
 	Now  func() time.Time
@@ -55,13 +57,30 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// rateWeight is the weight of a new throughput sample in a peer's moving
-// average.
-const rateWeight = 0.3
+// rateWeight is the weight of a lower throughput sample in a peer's moving
+// average, and sampleSpan the least time a sample spans.
+const (
+	rateWeight = 0.3
+	sampleSpan = 250 * time.Millisecond
+)
 
-// Fetch is one blob's fetch from a set of peers, identified by P. It isn't
-// safe for concurrent use: one owner drives it, or callers serialize every
-// call, reads included.
+// MaxPieces bounds a fetch's blob: a fetch keeps about 8 bytes a piece of
+// accounting (content.MaxPieces is the same bound).
+const MaxPieces = 1 << 24
+
+var (
+	// ErrTooLarge means a blob has more than MaxPieces pieces.
+	ErrTooLarge = errors.New("swarm: blob too large")
+	// ErrStruckOut means a peer sent MaxStrikes pieces that failed
+	// verification, and is out of this fetch.
+	ErrStruckOut = errors.New("swarm: peer struck out")
+)
+
+// Fetch is one blob's fetch from a set of peers, identified by P: an
+// authenticated identity from a bounded set (a group's members), since a
+// fetch remembers every peer that struck out. It isn't safe for concurrent
+// use: one owner drives it, or callers serialize every call, reads
+// included.
 type Fetch[P comparable] struct {
 	cfg   Config
 	have  *Bitfield
@@ -71,7 +90,7 @@ type Fetch[P comparable] struct {
 	strikes map[P]int
 	// avail counts, per piece, the peers holding it; asked how many peers
 	// have a piece outstanding.
-	avail, asked []int
+	avail, asked []int32
 	// streaming, with the playhead's piece.
 	streaming bool
 	playhead  uint32
@@ -81,13 +100,19 @@ type peer struct {
 	has  *Bitfield
 	out  map[uint32]time.Time // pieces requested, and when
 	rate float64              // bytes per second, a moving average; 0 unmeasured
-	last time.Time            // when its last piece arrived
+	// The current sample: bytes delivered since start, while the peer has
+	// had requests outstanding throughout; lastAt is its last delivery.
+	start, lastAt time.Time
+	bytes         int
 }
 
 // NewFetch starts fetching a blob of n pieces, holding have already (nil
 // for none; a partial download resumes from it). A have for another piece
 // count is refused (ErrBitfield).
 func NewFetch[P comparable](n uint32, have *Bitfield, cfg Config) (*Fetch[P], error) {
+	if n > MaxPieces {
+		return nil, ErrTooLarge
+	}
 	if have == nil {
 		have = NewBitfield(n)
 	}
@@ -95,7 +120,7 @@ func NewFetch[P comparable](n uint32, have *Bitfield, cfg Config) (*Fetch[P], er
 		return nil, ErrBitfield
 	}
 	return &Fetch[P]{cfg: cfg.withDefaults(), have: have.Clone(), peers: map[P]*peer{}, strikes: map[P]int{},
-		avail: make([]int, n), asked: make([]int, n)}, nil
+		avail: make([]int32, n), asked: make([]int32, n)}, nil
 }
 
 // Have is a copy of the pieces held.
@@ -106,10 +131,13 @@ func (f *Fetch[P]) Done() bool { return f.have.Full() }
 
 // SetPeer sets what peer p holds (a bitfield it sent), adding it if new;
 // its outstanding requests stay. A bitfield for another piece count is
-// refused (ErrBitfield).
+// refused (ErrBitfield), as is a peer that struck out (ErrStruckOut).
 func (f *Fetch[P]) SetPeer(p P, has *Bitfield) error {
 	if has.Len() != f.have.Len() {
 		return ErrBitfield
+	}
+	if f.strikes[p] >= f.cfg.MaxStrikes {
+		return ErrStruckOut
 	}
 	pr := f.peers[p]
 	if pr == nil {
@@ -123,7 +151,7 @@ func (f *Fetch[P]) SetPeer(p P, has *Bitfield) error {
 	return nil
 }
 
-func (f *Fetch[P]) count(has *Bitfield, d int) {
+func (f *Fetch[P]) count(has *Bitfield, d int32) {
 	for i := range has.Len() {
 		if has.Has(i) {
 			f.avail[i] += d
@@ -186,7 +214,7 @@ func (f *Fetch[P]) wanted(pr *peer, i uint32) bool {
 // duplicates of the longest outstanding requests to others.
 func (f *Fetch[P]) Next(p P) []uint32 {
 	pr := f.peers[p]
-	if pr == nil || f.strikes[p] >= f.cfg.MaxStrikes {
+	if pr == nil {
 		return nil
 	}
 	slots := f.depth(pr) - len(pr.out)
@@ -208,14 +236,16 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 			}
 		}
 	}
+	// unasked counts the missing pieces some peer holds that no one is
+	// asked for: the endgame is when none are left.
 	var fresh []uint32
-	endgame := true
+	unasked := 0
 	for i := range n {
 		if f.have.Has(i) {
 			continue
 		}
 		if f.asked[i] == 0 && f.avail[i] > 0 {
-			endgame = false
+			unasked++
 			if f.wanted(pr, i) {
 				fresh = append(fresh, i)
 			}
@@ -223,14 +253,15 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 	}
 	// Rarest first; shuffled first so ties fall randomly.
 	f.cfg.Rand.Shuffle(len(fresh), func(a, b int) { fresh[a], fresh[b] = fresh[b], fresh[a] })
-	slices.SortStableFunc(fresh, func(a, b uint32) int { return f.avail[a] - f.avail[b] })
+	slices.SortStableFunc(fresh, func(a, b uint32) int { return int(f.avail[a]) - int(f.avail[b]) })
 	for _, i := range fresh {
 		if slots == 0 {
 			break
 		}
 		ask(i)
+		unasked--
 	}
-	if slots > 0 && endgame {
+	if slots > 0 && unasked == 0 {
 		f.steal(p, pr, ask, slots)
 	}
 	return picks
@@ -279,30 +310,17 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 		return nil
 	}
 	if pr := f.peers[p]; pr != nil {
-		now := f.cfg.Now()
 		if at, ok := pr.out[i]; ok {
 			delete(pr.out, i)
 			f.asked[i]--
-			// From the later of the request and the peer's last delivery:
-			// back to back, pieces measure its rate, not the round trip or
-			// the wait behind the others in its pipeline.
-			start := at
-			if pr.last.After(start) {
-				start = pr.last
-			}
-			if el := now.Sub(start).Seconds(); verified && el > 0 {
-				sample := float64(size) / el
-				if pr.rate == 0 {
-					pr.rate = sample
-				} else {
-					pr.rate += rateWeight * (sample - pr.rate)
-				}
+			if verified {
+				f.measure(pr, at, size)
 			}
 		}
-		if verified {
-			pr.last = now
-		} else {
-			f.strikes[p]++
+		if !verified {
+			if f.strikes[p]++; f.strikes[p] >= f.cfg.MaxStrikes {
+				f.RemovePeer(p) // its pieces and requests go to the rest
+			}
 		}
 	}
 	if !verified || f.have.Has(i) {
@@ -317,6 +335,48 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 		}
 	}
 	return cancel
+}
+
+// measure adds a delivered piece, asked for at at, to peer pr's throughput:
+// bytes delivered over the time it has been busy, so its rate isn't
+// mistaken for each piece's round trip or its wait in the pipeline. A
+// sample spans at least sampleSpan, and closes only after the pieces it
+// counts: at the first delivery after them, or when the peer goes idle,
+// so pieces landing together are counted together.
+func (f *Fetch[P]) measure(pr *peer, at time.Time, size int) {
+	now := f.cfg.Now()
+	if pr.start.IsZero() {
+		pr.start = at
+	}
+	if now.After(pr.lastAt) && pr.lastAt.Sub(pr.start) >= sampleSpan {
+		f.sample(pr, pr.lastAt)
+		pr.start = pr.lastAt
+	}
+	pr.bytes += size
+	pr.lastAt = now
+	if len(pr.out) == 0 { // idle: close what's counted, and start afresh
+		if now.Sub(pr.start) > 0 {
+			f.sample(pr, now)
+		}
+		pr.start, pr.bytes = time.Time{}, 0
+	}
+}
+
+// sample closes peer pr's sample at end, folding it into its rate.
+func (f *Fetch[P]) sample(pr *peer, end time.Time) {
+	el := end.Sub(pr.start).Seconds()
+	if el <= 0 {
+		return
+	}
+	// A rise is taken whole, so a pipeline grows as fast as the peer shows
+	// it can fill one; a fall is smoothed, so one slow sample doesn't
+	// empty it.
+	if s := float64(pr.bytes) / el; s > pr.rate {
+		pr.rate = s
+	} else {
+		pr.rate += rateWeight * (s - pr.rate)
+	}
+	pr.bytes = 0
 }
 
 // Outstanding is how many requests peer p has in flight.

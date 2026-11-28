@@ -1017,13 +1017,19 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       a wrong length or bits past the last piece). A `Fetch` per blob
       tracks pieces held, each peer's bitfield and updates, and requests
       outstanding; `Next(peer)` fills the peer's pipeline (its measured
-      throughput times a target round trip, within bounds) with pieces
+      throughput times a target round trip, within bounds; throughput is
+      bytes delivered while the peer stays busy, sampled over at least
+      250 ms, rises taken whole and falls smoothed) with pieces
       within a window of the playhead in order when streaming, then the
       rarest (availability kept as peers come, go and update; ties fall
       randomly), and in the endgame steals the longest outstanding
-      requests from others. `Received` keeps only verified pieces and
-      names the peers to cancel duplicates at; a failed piece is a strike,
-      and enough strikes stop requests. A fetch resumes from a bitfield;
+      requests from others (pieces no peer holds don't hold the endgame
+      off). `Received` keeps only verified pieces and names the peers to
+      cancel duplicates at; a failed piece is a strike, and a peer that
+      strikes out leaves the fetch for good, its requests and holdings
+      released. A fetch resumes from a bitfield, keeps about 8 bytes a
+      piece (at most `swarm.MaxPieces`), and expects its caller to
+      serialize calls, with peers authenticated members;
    2. the wire protocol: content on its own stream beside the sync
       session (inventories, bitfields, have, request, piece with its
       proof, cancel), the serving side caching each blob's tree;
