@@ -98,9 +98,9 @@ func Pieces(size uint64, pieceSize uint32) (uint32, error) {
 	if err := CheckPieceSize(pieceSize); err != nil {
 		return 0, err
 	}
-	n := (size + uint64(pieceSize) - 1) / uint64(pieceSize)
-	if n == 0 {
-		n = 1
+	n := size / uint64(pieceSize) // rounded up below: no overflow near MaxUint64
+	if size%uint64(pieceSize) != 0 || n == 0 {
+		n++
 	}
 	if n > MaxPieces {
 		return 0, ErrTooLarge

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -208,8 +209,20 @@ func TestPieces(t *testing.T) {
 			t.Fatalf("size %d: %d, %v", c.size, n, err)
 		}
 	}
-	if _, err := Pieces(MaxPieces*MinPieceSize+1, MinPieceSize); !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("past MaxPieces: %v", err)
+	for _, size := range []uint64{MaxPieces*MinPieceSize + 1, math.MaxUint64, math.MaxUint64 - MinPieceSize + 2} {
+		if _, err := Pieces(size, MinPieceSize); !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("size %d: %v", size, err)
+		}
+	}
+	// Near MaxUint64, an overflowing count would make a one-piece blob of
+	// any size verify.
+	piece := random(t, MinPieceSize+16)
+	id := BlobID(LeafHash(piece), math.MaxUint64, MinPieceSize)
+	if err := Verify(id, math.MaxUint64, MinPieceSize, 0, piece, nil); err == nil {
+		t.Fatal("a one-piece blob claiming MaxUint64 bytes verified")
+	}
+	if _, err := (&Announcement{Size: math.MaxUint64, PieceSize: MinPieceSize}).Encode(); !errors.Is(err, ErrAnnouncement) {
+		t.Fatalf("announcing MaxUint64 bytes: %v", err)
 	}
 }
 

@@ -334,9 +334,12 @@ A blob (a video, an image, any file) is:
 1. **Encrypted** with a random per-blob key under XChaCha20-Poly1305 in
    fixed-size **pieces** (default 256 KiB; each piece's nonce is its index),
    so any piece can be decrypted alone and a stream can start anywhere.
-2. **Addressed** by a BLAKE3 tree over the ciphertext pieces: the blob ID is
-   the root, and every piece verifies against it with a short proof, so a
-   peer can serve and a fetcher can check any piece without the rest.
+2. **Addressed** by a BLAKE3 tree over the ciphertext pieces (RFC 6962's
+   shape, with separate leaf and node domains): the blob ID is a hash of
+   the root with the blob's size and piece size, so a blob can't be cut
+   short or added to, and every piece verifies against it with a short
+   proof, so a peer can serve and a fetcher can check any piece without
+   the rest.
 3. **Announced** by its author as an entry in its log (*Logs*): blob ID,
    size, the per-blob key wrapped under the current `epochKey`, and app
    metadata (title, thumbnail, MIME type), all encrypted.
