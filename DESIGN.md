@@ -1011,9 +1011,25 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       against its ID (each piece's length and the tree) before writing
       any plaintext; checking pieces as they stream in, by proof, comes
       with swarming.
-7. **Swarming**: bitfields, rarest-first, playhead order, work stealing,
-   resume, storage budget; inventories for mirrors. The scheduler is pure
-   and can also start alongside 4 and 5; wiring it needs 5.
+7. **Swarming**, in parts:
+   1. the scheduler, `group/swarm` (built): pure, no I/O. A `Bitfield`
+      with a canonical encoding (BitTorrent's bit order; decoding refuses
+      a wrong length or bits past the last piece). A `Fetch` per blob
+      tracks pieces held, each peer's bitfield and updates, and requests
+      outstanding; `Next(peer)` fills the peer's pipeline (its measured
+      throughput times a target round trip, within bounds) with pieces
+      within a window of the playhead in order when streaming, then the
+      rarest (availability kept as peers come, go and update; ties fall
+      randomly), and in the endgame steals the longest outstanding
+      requests from others. `Received` keeps only verified pieces and
+      names the peers to cancel duplicates at; a failed piece is a strike,
+      and enough strikes stop requests. A fetch resumes from a bitfield;
+   2. the wire protocol: content on its own stream beside the sync
+      session (inventories, bitfields, have, request, piece with its
+      proof, cancel), the serving side caching each blob's tree;
+   3. the node: `Node.Fetch` and a streaming reader moving the playhead,
+      serving on or off with a rate cap, the storage budget (least
+      recently used evicted), and resuming from what's stored.
 8. **Removal's runtime parts** (removal and rekey themselves are in the
    roster), in parts:
    1. following `G` (built): a running node moves to the roster's current
