@@ -46,7 +46,7 @@ func (s *MemStore) Get(id ID, i uint32) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, ok := s.blobs[id]
-	if !ok || int(i) >= len(b) {
+	if !ok || uint64(i) >= uint64(len(b)) {
 		return nil, ErrNotStored
 	}
 	return append([]byte(nil), b[i]...), nil

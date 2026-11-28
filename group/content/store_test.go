@@ -47,10 +47,15 @@ func TestReadChecksFirst(t *testing.T) {
 	if err := Read(store, a, &got); !errors.Is(err, ErrNotStored) || got.Len() != 0 {
 		t.Fatalf("a missing piece: %v, %d bytes written", err, got.Len())
 	}
-	wrong := *a
+	fresh := NewMemStore()
+	s, err = SealTo(fresh, bytes.NewReader(random(t, 3*MinPieceSize)), MinPieceSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := s.Announce(nil)
 	wrong.Key = Key{}
-	if err := Read(store, &wrong, &got); err == nil {
-		t.Fatal("read under the wrong key")
+	if err := Read(fresh, wrong, &got); !errors.Is(err, ErrOpen) || got.Len() != 0 {
+		t.Fatalf("under the wrong key: %v, %d bytes written", err, got.Len())
 	}
 }
 
