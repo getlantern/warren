@@ -31,6 +31,11 @@ func (n *Node) Paused() bool { return n.paused.Load() }
 // clears them. A roster that won't fold holds a post without these checks;
 // the flush makes them before appending it.
 func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
+	return n.post(ctx, memberlog.App, body)
+}
+
+// post is Post for an entry of kind (memberlog.App or memberlog.Blob).
+func (n *Node) post(ctx context.Context, kind memberlog.Kind, body []byte) (queued bool, err error) {
 	if len(body) > memberlog.MaxBody {
 		return false, fmt.Errorf("node: post of %d bytes is over memberlog.MaxBody", len(body))
 	}
@@ -61,11 +66,11 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 			if len(n.queue) >= MaxQueued {
 				return ErrQueueFull
 			}
-			held = &heldPost{body: append([]byte(nil), body...)}
+			held = &heldPost{kind: kind, body: append([]byte(nil), body...)}
 			n.queue = append(n.queue, held)
 			return nil
 		}
-		return n.write(r, logs, f, key, body)
+		return n.write(r, logs, f, key, kind, body)
 	})
 	if err != nil || held == nil {
 		return false, err
@@ -80,35 +85,55 @@ func (n *Node) Post(ctx context.Context, body []byte) (queued bool, err error) {
 // heldPost is a post held for publishing; written once a flush appends
 // it. mu held.
 type heldPost struct {
+	kind    memberlog.Kind
 	body    []byte
 	written bool
 }
 
+// Held is a held post TakeHeld hands over: an app entry (memberlog.App,
+// from Post) or a blob's announcement (memberlog.Blob, from PublishBlob, whose
+// body content.DecodeAnnouncement reads).
+type Held struct {
+	Kind memberlog.Kind
+	Body []byte
+}
+
 // TakeHeld hands over the posts held for publishing, oldest first (what
-// Post queued and a flush hasn't appended), and clears them, with any
-// failure appending them: the caller posts them again or drops them. After
-// Leave nothing appends them, so a caller taking the roster and logs back
-// takes these too. It waits for a running session or Do.
-func (n *Node) TakeHeld() [][]byte {
+// Post and PublishBlob queued and a flush hasn't appended), and clears them,
+// with any failure appending them: the caller posts them again (Repost,
+// which keeps their kind) or drops them. After Leave nothing appends them, so a caller taking the roster
+// and logs back takes these too. It waits for a running session or Do.
+func (n *Node) TakeHeld() []Held {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	h := make([][]byte, len(n.queue))
+	h := make([]Held, len(n.queue))
 	for i, p := range n.queue {
-		h[i] = p.body
+		h[i] = Held{Kind: p.kind, Body: p.body}
 	}
 	n.queue, n.flushErr = nil, nil
 	return h
 }
 
-// write appends body to this member's log under key, f's current epoch
+// Repost appends a post TakeHeld handed over, with its kind, as Post would
+// (a blob's announcement stays one: its pieces are still in the store
+// unless the caller deleted them). Only memberlog.App and memberlog.Blob
+// are kinds it takes.
+func (n *Node) Repost(ctx context.Context, h Held) (queued bool, err error) {
+	if h.Kind != memberlog.App && h.Kind != memberlog.Blob {
+		return false, fmt.Errorf("node: no such post kind %d", h.Kind)
+	}
+	return n.post(ctx, h.Kind, h.Body)
+}
+
+// write appends an entry of kind with body to this member's log under key, f's current epoch
 // key; logs must have been given f, and ownLog must have found nothing in
 // the way. mu held.
-func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, key keys.EpochKey, body []byte) error {
+func (n *Node) write(r *roster.Roster, logs *memberlog.Set, f *roster.Result, key keys.EpochKey, kind memberlog.Kind, body []byte) error {
 	var prev *memberlog.Entry
 	if l := logs.Log(n.cfg.Me.Public()); l != nil {
 		prev = l.Head()
 	}
-	e, err := memberlog.Write(n.cfg.Me, r.Group(), prev, f.Current, key, memberlog.App, body)
+	e, err := memberlog.Write(n.cfg.Me, r.Group(), prev, f.Current, key, kind, body)
 	if err != nil {
 		return err
 	}
@@ -188,7 +213,7 @@ func (n *Node) flush() {
 		if n.ownLog(logs) != nil {
 			return // held until the log can take them; Post says why
 		}
-		if err := n.write(r, logs, f, key, n.queue[0].body); err != nil {
+		if err := n.write(r, logs, f, key, n.queue[0].kind, n.queue[0].body); err != nil {
 			n.flushErr = err
 			return
 		}
