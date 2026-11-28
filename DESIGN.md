@@ -1008,7 +1008,32 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       runs one session at a time, so this is every session the removed
       key has; once content and swarming bring longer-lived ones, applying
       a removal must also close any others with that key;
-   3. the publish pause until a corrective rekey;
+   3. the publish pause until a corrective rekey (built):
+      `roster.NeedsRekey` is the model's *Removal* step 3 (any seal of the
+      current keys reached a key the fold leaves with no role, or the
+      current epoch key reached a mirror), checked against the model in
+      the conformance walks. It skips seals by keys the fold gives no
+      role, since `Holds` are unchecked and such a key could keep the
+      group paused with no one to remove. While it holds, `Node.Post`
+      queues app entries in memory (`node.MaxQueued`, then
+      `node.ErrQueueFull`), as it does for a member that holds no current
+      epoch key yet, and a post goes in behind anything held; a refresh
+      that finds the condition gone appends them in order under the new
+      epoch. If the member's own log holds entries that don't show (under
+      an epoch that stopped counting: an admin's rekey racing its
+      demotion), memberlog hides everything after them too, and an entry
+      after the visible head would fork the log; the same goes for own
+      entries held past a gap, or held once and dropped by a removal's cut
+      that stopped counting (`memberlog.Log.Peak`). So `Post` refuses
+      (`node.ErrHidden`) and held posts stay held; letting the chain show
+      past such entries is a memberlog change still to make. A failed
+      append is reported to later posts
+      (`node.ErrHeldFailed`), and `Node.TakeHeld` hands over what's held,
+      which `Leave` also leaves to the caller. A mirror's or removed
+      member's post is refused. An owner's or admin's node writes the
+      corrective `rekey` itself on its next `Tick` (`Join` ticks, so
+      straight away for one joining an exposed roster, though a failure
+      there doesn't fail the join). Content blobs join the queue in step 6;
    4. mirrors, once content and swarming exist.
 
 **B. DHT speed** (*Performance against libtorrent*): the hit median is

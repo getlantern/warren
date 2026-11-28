@@ -71,6 +71,8 @@ type Log struct {
 	// low is the lowest sequence number anchored to the recorded head
 	// (cutSeq+1 while the head itself is missing).
 	low uint64
+	// peak is the highest sequence number ever held, dropped since or not.
+	peak uint64
 }
 
 func newLog(author keys.PublicKey, ok func(*Entry) bool) *Log {
@@ -107,6 +109,40 @@ func (l *Log) Head() *Entry {
 	}
 	return l.bySeq[l.top].clone()
 }
+
+// Last returns a copy of the last entry on the visible chain's line: the
+// head, or past it the entries held ahead that chain from it (ones the
+// roster no longer lets show, say), or nil. An author whose Last isn't
+// its Head can't append anything that shows: an entry after Last is
+// hidden behind it, and one after Head forks the log against one it
+// already wrote.
+func (l *Log) Last() *Entry {
+	seq := l.top
+	for {
+		next, ok := l.bySeq[seq+1]
+		if !ok {
+			break
+		}
+		var prev ID
+		if seq > 0 {
+			prev = l.bySeq[seq].id
+		}
+		if next.Prev != prev {
+			break
+		}
+		seq++
+	}
+	if seq == 0 {
+		return nil
+	}
+	return l.bySeq[seq].clone()
+}
+
+// Peak returns the highest sequence number the log has ever held, shown
+// or not, including entries since dropped (by a removal's cut, say). An
+// author whose Peak is past its Last has signed entries the log can't
+// chain to now: past a gap, or cut, and peers may hold them.
+func (l *Log) Peak() uint64 { return l.peak }
 
 // limit is the highest sequence number the app may see: below a fork
 // point, except where a removal's head has anchored the chain past it, and
@@ -160,6 +196,7 @@ func (l *Log) ahead() int { return l.held - l.shown }
 func (l *Log) put(e *Entry) {
 	l.bySeq[e.Seq] = e
 	l.held += len(e.Box)
+	l.peak = max(l.peak, e.Seq)
 }
 
 // drop removes the entry at seq, reporting it in gone if it was visible.

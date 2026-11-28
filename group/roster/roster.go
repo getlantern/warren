@@ -367,6 +367,44 @@ func (h *ready) Pop() any {
 	return o
 }
 
+// NeedsRekey reports whether f's current keys have reached a key f doesn't
+// keep as a member (removed, or whose add didn't count), or the current
+// epoch key has reached a mirror (docs/groups-design.md, *Removal*, step
+// 3): an admin should issue a corrective rekey, sealed only to the members
+// f keeps, and until it lands members publish nothing. It reads every
+// operation's seals, counting or not: a member delivering the current keys
+// to a key of its own calls for one too (the answer to that is removing
+// it). Seals by keys f gives no role are skipped: Add stores any signed
+// operation, so a throwaway key could otherwise claim a seal (Holds are
+// unchecked) and keep the group paused with no one to remove, and such a
+// key can only seal current keys it holds, which a seal to it already
+// shows. f must be r's fold.
+func (r *Roster) NeedsRekey(f *Result) bool {
+	for _, o := range r.ops {
+		if f.Roles[o.Author] == None {
+			continue
+		}
+		for _, s := range o.Seals {
+			role := f.Roles[s.To]
+			if role != None && role != Mirror {
+				continue
+			}
+			for _, h := range s.Holds {
+				made := h.Made
+				if made == (ID{}) {
+					made = o.id
+				}
+				// Off the roster, either current key; a mirror, the epoch key
+				// (it's given the group secret by design).
+				if made == f.Current && (role == None || !h.Secret) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // countInvite applies a counting operation, by an author counting in role
 // author, to the invites: records an invite, spends one of a rejoin's
 // deliver, or kills those before a remove (an add spends in apply). Only an

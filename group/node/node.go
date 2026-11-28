@@ -43,6 +43,9 @@ const streamName = "warren-group:1"
 // listened under.
 const Grace = 24 * time.Hour
 
+// MaxQueued bounds the posts held while publishing is paused (Node.Post).
+var MaxQueued = 1000
+
 // busyTries and busyWait bound a call's tries of a busy group.
 const (
 	busyTries = 3
@@ -76,6 +79,19 @@ var (
 	ErrJoined = errors.New("node: already joined")
 	// ErrLeft means the node has left its host (Node.Leave).
 	ErrLeft = errors.New("node: left")
+	// ErrQueueFull means a post found the publish queue full (MaxQueued)
+	// while publishing is paused.
+	ErrQueueFull = errors.New("node: publish queue full")
+	// ErrHeldFailed means held posts failed to append (Node.Post); the
+	// error wraps why.
+	ErrHeldFailed = errors.New("node: held posts failed to append")
+	// ErrHidden means a post wasn't appended because this member's own log
+	// holds entries that don't show: under an epoch that stopped counting
+	// (an admin's rekey racing its demotion), which memberlog hides with
+	// everything after, or past a gap sync hasn't filled, which a new entry
+	// would fork against, or short of entries it once held (dropped by a
+	// removal's cut that stopped counting) until sync brings them back.
+	ErrHidden = errors.New("node: own log stalled behind entries that don't show")
 )
 
 // Host owns a warren endpoint and routes its listeners and connections to
@@ -273,6 +289,19 @@ type Node struct {
 	// rekeyed is set when refresh moves to a new secret, so whoever ends
 	// the session or Do rotates the listeners onto it.
 	rekeyed atomic.Bool
+
+	// paused is set while the roster calls for a corrective rekey
+	// (roster.NeedsRekey): the current keys have reached a key that isn't
+	// a member, so the node publishes nothing until the rekey lands.
+	paused atomic.Bool
+	// queue is the posts held while paused, in order. flushErr is the last
+	// flush's failure, nil once one succeeds. mu held.
+	queue    []*heldPost
+	flushErr error
+	// logsAt is the roster's size (it only grows) when Post or a flush
+	// last gave the logs its fold, so an unchanged roster isn't applied
+	// again: Set.Update re-walks every log. mu held.
+	logsAt int
 }
 
 // sighting is a session with a member: when, and under which group secret.
@@ -381,7 +410,9 @@ func (h *Host) Join(ctx context.Context, cfg Config) (*Node, error) {
 	}
 	h.groups = append(h.groups, n)
 	h.mu.Unlock()
-	if err := n.Tick(ctx); err != nil {
+	// A failed corrective rekey doesn't fail the join: the node stays
+	// Paused, and the next Tick tries again.
+	if _, err := n.tick(ctx); err != nil {
 		n.leave()
 		return nil, err
 	}
@@ -430,10 +461,19 @@ type rolesView struct {
 // retry grace) dropped, and the admission set rebuilt.
 // Run it every few minutes.
 func (n *Node) Tick(ctx context.Context) error {
+	cerr, err := n.tick(ctx)
+	return errors.Join(cerr, err)
+}
+
+// tick is Tick, with the corrective rekey's error apart from the rest.
+func (n *Node) tick(ctx context.Context) (cerr, err error) {
 	if n.left.Load() {
-		return ErrLeft // the roster is the caller's again
+		return nil, ErrLeft // the roster is the caller's again
 	}
-	err := n.rotate(ctx)
+	// Before rotating, so the listeners follow a corrective rekey's secret
+	// in this same Tick.
+	cerr = n.correct(ctx)
+	err = n.rotate(ctx)
 	// After lmu is released, as the host's admission and routing take it.
 	// A session holding mu refreshes when it ends, with the clock then.
 	// Leave may have run meanwhile: checked again under mu, which Leave's
@@ -444,7 +484,7 @@ func (n *Node) Tick(ctx context.Context) error {
 		}
 		n.mu.Unlock()
 	}
-	return err
+	return cerr, err
 }
 
 // rotate listens under this and the next period's rendezvous keys and
@@ -597,6 +637,11 @@ func (n *Node) refresh() {
 		if n.follow(g, cands, now) {
 			n.rekeyed.Store(true)
 		}
+	}
+	// A roster that won't fold pauses publishing too: fail closed.
+	n.paused.Store(err != nil || n.cfg.Roster.NeedsRekey(f))
+	if !n.paused.Load() && !n.left.Load() {
+		n.flush() // after Leave, held posts are the caller's (TakeHeld)
 	}
 	admit := map[keys.PublicKey]bool{}
 	p := keys.PeriodOf(now)
