@@ -17,9 +17,10 @@ type Config struct {
 	// is covered.
 	QueueTime time.Duration
 	// RequestTimeout is how long a request may stay outstanding before
-	// it goes back to the other peers (15s), and counts as a strike
-	// against its peer: a peer holding pieces back keeps them no longer,
-	// and is out after MaxStrikes. It may still deliver one late.
+	// it goes back to the other peers (15s); a peer found with any past
+	// it earns a strike (one, however many): a peer holding pieces back
+	// keeps them no longer, and is out after MaxStrikes. It may still
+	// deliver one late.
 	RequestTimeout time.Duration
 	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
 	// peer not yet measured gets MinDepth; a pipeline-limited one measures
@@ -30,7 +31,7 @@ type Config struct {
 	// when streaming (8).
 	Window uint32
 	// MaxStrikes is how many strikes a peer may earn, by sending a piece
-	// that fails verification or letting a request time out, before it's
+	// that fails verification or letting requests time out, before it's
 	// out of the fetch (3): its requests and holdings go to the rest, and
 	// SetPeer refuses it.
 	MaxStrikes int
@@ -335,15 +336,21 @@ func (f *Fetch[P]) expire() {
 	}
 }
 
-// overdue drops pr's requests past RequestTimeout, striking p for each,
-// and reports whether p struck out.
+// overdue drops pr's requests past RequestTimeout, and strikes p once if
+// any were (one stall is one strike, however deep its pipeline), wherever
+// that's noticed: Next, a delivery, a cancellation or removal. It reports
+// whether p has struck out, for the caller to remove it.
 func (f *Fetch[P]) overdue(p P, pr *peer) bool {
 	cutoff := f.cfg.Now().Add(-f.cfg.RequestTimeout)
+	late := false
 	for i, at := range pr.out {
 		if at.Before(cutoff) {
 			f.drop(pr, i)
-			f.strikes[p]++
+			late = true
 		}
+	}
+	if late {
+		f.strikes[p]++
 	}
 	return f.strikes[p] >= f.cfg.MaxStrikes
 }
@@ -387,10 +394,20 @@ func (f *Fetch[P]) steal(p P, pr *peer, ask func(uint32), slots int) {
 // peers it was asked of are returned, for the caller to cancel. A piece
 // that failed is a strike against p and goes back to the rest.
 func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P) {
+	// A failure is a strike against p whatever the index, and whether or
+	// not p is still in the fetch.
+	if !verified {
+		f.strike(p)
+	}
+	pr := f.peers[p]
+	if pr != nil && f.overdue(p, pr) {
+		f.RemovePeer(p)
+		pr = nil
+	}
 	if i >= f.have.Len() {
 		return nil
 	}
-	if pr := f.peers[p]; pr != nil {
+	if pr != nil {
 		if _, ok := pr.out[i]; ok {
 			if verified {
 				pr.bytes += float64(size)
@@ -407,23 +424,33 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 				pr.bytes, pr.busy = pr.bytes/2, pr.busy/2
 			}
 		}
-		if !verified {
-			if f.strikes[p]++; f.strikes[p] >= f.cfg.MaxStrikes {
-				f.RemovePeer(p) // its pieces and requests go to the rest
-			}
-		}
 	}
 	if !verified || f.have.Has(i) {
 		return nil
 	}
 	f.have.Set(i)
+	var out []P
 	for q, qr := range f.peers {
+		if f.overdue(q, qr) { // before the cancellation clears its request
+			out = append(out, q)
+		}
 		if _, ok := qr.out[i]; ok {
 			f.drop(qr, i)
 			cancel = append(cancel, q)
 		}
 	}
+	for _, q := range out {
+		f.RemovePeer(q)
+	}
 	return cancel
+}
+
+// strike counts a strike against p, and removes it from the fetch once it
+// has MaxStrikes.
+func (f *Fetch[P]) strike(p P) {
+	if f.strikes[p]++; f.strikes[p] >= f.cfg.MaxStrikes {
+		f.RemovePeer(p) // its pieces and requests go to the rest
+	}
 }
 
 // Outstanding is how many requests peer p has in flight.
@@ -434,6 +461,6 @@ func (f *Fetch[P]) Outstanding(p P) int {
 	return 0
 }
 
-// Strikes is how many pieces from peer p failed verification in this
-// fetch, kept across its removal.
+// Strikes is how many strikes peer p has in this fetch (failed pieces and
+// timed-out stalls), kept across its removal.
 func (f *Fetch[P]) Strikes(p P) int { return f.strikes[p] }

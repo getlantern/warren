@@ -749,15 +749,15 @@ func TestWithholdingPeer(t *testing.T) {
 	}
 	// Reconnecting before anything noticed its overdue requests doesn't
 	// escape them: removal counts them.
-	h := newFetch(t, n, c, Config{MaxStrikes: 2})
+	h := newFetch(t, n, c, Config{MaxStrikes: 1})
 	setPeer(t, h, "w", full(n))
 	if got := h.Next("w"); len(got) != 2 {
 		t.Fatalf("w asked for %v", got)
 	}
 	c.t = c.t.Add(16 * time.Second)
 	h.RemovePeer("w")
-	if err := h.SetPeer("w", full(n)); !errors.Is(err, ErrStruckOut) || h.Strikes("w") != 2 {
-		t.Fatalf("after removal with two overdue requests: %v, %d strikes", err, h.Strikes("w"))
+	if err := h.SetPeer("w", full(n)); !errors.Is(err, ErrStruckOut) || h.Strikes("w") != 1 {
+		t.Fatalf("after removal with overdue requests: %v, %d strikes", err, h.Strikes("w"))
 	}
 	// A slow peer, the only holder, is still asked again after one timeout.
 	g := newFetch(t, 1, c, Config{})
@@ -803,4 +803,61 @@ func (pr *peer) oldestOut() uint32 {
 		}
 	}
 	return oldest
+}
+
+// TestOneStallOneStrike: a deep pipeline timing out at once is one stall,
+// one strike, not one per request; the peer stays.
+func TestOneStallOneStrike(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 64, c, Config{MinDepth: 32, MaxDepth: 32})
+	setPeer(t, f, "p", full(64))
+	if got := f.Next("p"); len(got) != 32 {
+		t.Fatalf("asked for %d", len(got))
+	}
+	c.t = c.t.Add(16 * time.Second)
+	if got := f.Next("p"); f.Strikes("p") != 1 || len(got) == 0 {
+		t.Fatalf("after one stall of 32 requests: %d strikes, asked for %v", f.Strikes("p"), got)
+	}
+}
+
+// TestLateTimeoutsCounted: a stall noticed by a late delivery, or by a
+// duplicate's cancellation, rather than by Next, still strikes.
+func TestLateTimeoutsCounted(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "p", full(4))
+	i := f.Next("p")[0]
+	c.t = c.t.Add(16 * time.Second)
+	f.Received("p", i, pieceSize, true) // late, before any Next
+	if f.Strikes("p") != 1 || !f.Have().Has(i) {
+		t.Fatalf("a late delivery: %d strikes, kept %v", f.Strikes("p"), f.Have().Has(i))
+	}
+	g := newFetch(t, 1, c, Config{})
+	setPeer(t, g, "slow", full(1))
+	setPeer(t, g, "fast", full(1))
+	g.Next("slow")
+	c.t = c.t.Add(16 * time.Second)
+	g.peers["fast"].out[0] = c.t // asked of fast too, just now
+	g.asked[0]++
+	g.peers["fast"].busySince = c.t
+	if cancel := g.Received("fast", 0, pieceSize, true); g.Strikes("slow") != 1 || len(cancel) != 0 {
+		t.Fatalf("an overdue duplicate cancelled: slow has %d strikes, cancel %v", g.Strikes("slow"), cancel)
+	}
+}
+
+// TestFailuresAlwaysStrike: a failed piece strikes its sender whatever its
+// index, and after it left the fetch.
+func TestFailuresAlwaysStrike(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MaxStrikes: 2})
+	setPeer(t, f, "bad", full(4))
+	f.Received("bad", 99, pieceSize, false)
+	if f.Strikes("bad") != 1 {
+		t.Fatalf("an out-of-range failed piece: %d strikes", f.Strikes("bad"))
+	}
+	f.RemovePeer("bad")
+	f.Received("bad", 1, pieceSize, false) // its verification finished after it left
+	if err := f.SetPeer("bad", full(4)); !errors.Is(err, ErrStruckOut) {
+		t.Fatalf("back after two failures: %v", err)
+	}
 }

@@ -1028,12 +1028,14 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       pipeline-limited peer measures its depth over its round trip, so
       its pipeline grows until throughput is the limit, for any round trip
       under 3 s. `Received` keeps only verified pieces and names the peers
-      to cancel duplicates at. A failed piece is a strike, and so is a
-      request outstanding 15 s, which goes back to the others; a peer
-      that strikes out (three) leaves the fetch for good, its requests and
-      holdings released, so a peer holding pieces back keeps them no
-      longer, and reconnecting (strikes are kept per identity, overdue
-      requests counted at removal) doesn't escape it. A fetch resumes
+      to cancel duplicates at. A failed piece is a strike (whatever its
+      index, even after the peer left), and so is a stall: requests
+      outstanding 15 s go back to the others, with one strike however
+      many there were, wherever that's noticed (`Next`, a late delivery,
+      a cancellation, removal). A peer that strikes out (three) leaves
+      the fetch for good, its requests and holdings released, so a peer
+      holding pieces back keeps them no longer, and reconnecting
+      (strikes are kept per identity) doesn't escape it. A fetch resumes
       from a bitfield, keeps about 8 bytes a piece (at most
       `swarm.MaxPieces`), and expects its caller to serialize calls, with
       peers authenticated members;
