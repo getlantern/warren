@@ -3,6 +3,9 @@ package content
 import (
 	"bytes"
 	"errors"
+	"io"
+	"runtime"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -54,7 +57,9 @@ func TestReadChecksFirst(t *testing.T) {
 // TestSealToAborts: a failed seal commits nothing.
 func TestSealToAborts(t *testing.T) {
 	store := NewMemStore()
-	if _, err := SealTo(store, errReader{errors.New("boom")}, MinPieceSize); err == nil {
+	// A full piece put, then the reader fails.
+	r := io.MultiReader(bytes.NewReader(random(t, MinPieceSize+1)), errReader{errors.New("boom")})
+	if _, err := SealTo(store, r, MinPieceSize); err == nil {
 		t.Fatal("sealed a failing reader")
 	}
 	if len(store.blobs) != 0 {
@@ -113,4 +118,75 @@ func sealPiece(t *testing.T, key Key, i uint32, pt []byte) []byte {
 		t.Fatal(err)
 	}
 	return aead.Seal(nil, nonce(i), pt, ad)
+}
+
+// swapStore serves the real piece first, then a substitute for piece 1.
+type swapStore struct {
+	*MemStore
+	sub   []byte
+	calls int
+}
+
+func (s *swapStore) Get(id ID, i uint32) ([]byte, error) {
+	if i == 1 {
+		s.calls++
+		if s.calls > 1 {
+			return s.sub, nil
+		}
+	}
+	return s.MemStore.Get(id, i)
+}
+
+// TestReadSubstitution: a piece swapped between Read's passes for another
+// that's valid under the blob's key and index fails, not written.
+func TestReadSubstitution(t *testing.T) {
+	mem := NewMemStore()
+	s, err := SealTo(mem, bytes.NewReader(random(t, 3*MinPieceSize)), MinPieceSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &swapStore{MemStore: mem, sub: sealPiece(t, s.Key, 1, random(t, MinPieceSize))}
+	var got bytes.Buffer
+	if err := Read(store, s.Announce(nil), &got); !errors.Is(err, ErrPiece) {
+		t.Fatalf("a substituted piece: %v", err)
+	}
+	if got.Len() > MinPieceSize {
+		t.Fatal("the substitute was written")
+	}
+}
+
+// TestReadBoundedByStore: an announcement claiming the largest blob costs
+// little to refuse when the store has none of it.
+func TestReadBoundedByStore(t *testing.T) {
+	a := &Announcement{Size: MaxPieces * DefaultPieceSize, PieceSize: DefaultPieceSize}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if err := Read(NewMemStore(), a, io.Discard); !errors.Is(err, ErrNotStored) {
+		t.Fatalf("an absent blob: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	if d := after.TotalAlloc - before.TotalAlloc; d > 1<<20 {
+		t.Fatalf("refusing an absent blob allocated %d bytes", d)
+	}
+}
+
+// abortFails is a store whose writers fail to abort.
+type abortFails struct{ *MemStore }
+
+func (s abortFails) Create() (BlobWriter, error) {
+	w, err := s.MemStore.Create()
+	return failingAbort{w}, err
+}
+
+type failingAbort struct{ BlobWriter }
+
+func (failingAbort) Abort() error { return errors.New("abort failed") }
+
+// TestSealToAbortError: a failed seal that can't abort says so.
+func TestSealToAbortError(t *testing.T) {
+	boom := errors.New("boom")
+	_, err := SealTo(abortFails{NewMemStore()}, errReader{boom}, MinPieceSize)
+	if !errors.Is(err, boom) || err == nil || !strings.Contains(err.Error(), "abort failed") {
+		t.Fatalf("an abort failure: %v", err)
+	}
 }

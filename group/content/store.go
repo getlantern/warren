@@ -2,6 +2,7 @@ package content
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -90,19 +91,21 @@ func (w *memWriter) Abort() error {
 }
 
 // SealTo seals a blob from r into store (Seal with pieceSize), committing
-// it under its ID, or aborting it on any failure.
+// it under its ID, or aborting it on any failure; an error aborting is
+// joined to the one returned.
 func SealTo(store Store, r io.Reader, pieceSize uint32) (*Sealed, error) {
 	w, err := store.Create()
 	if err != nil {
 		return nil, err
 	}
 	s, err := Seal(r, pieceSize, w.Put)
-	if err != nil {
-		_ = w.Abort()
-		return nil, err
+	if err == nil {
+		err = w.Commit(s.ID)
 	}
-	if err := w.Commit(s.ID); err != nil {
-		_ = w.Abort()
+	if err != nil {
+		if aerr := w.Abort(); aerr != nil {
+			err = errors.Join(err, fmt.Errorf("content: aborting the blob: %w", aerr))
+		}
 		return nil, err
 	}
 	return s, nil
@@ -111,15 +114,16 @@ func SealTo(store Store, r io.Reader, pieceSize uint32) (*Sealed, error) {
 // Read writes the blob a announces, from store's pieces, to w. It checks
 // the whole blob against a's ID before writing any plaintext: every
 // piece's length, and the tree they make. Then it opens the pieces in
-// order, getting them again: each opens only as itself (its key and
-// index), so a piece changed in the store since fails rather than
-// writing something else.
+// order, getting them again, each checked against the leaf verified for
+// it: a piece changed in the store since fails rather than writing
+// something else, even one valid under the blob's key. Its memory grows
+// with the pieces the store has, not the size a claims.
 func Read(store Store, a *Announcement, w io.Writer) error {
 	n, err := Pieces(a.Size, a.PieceSize)
 	if err != nil {
 		return err
 	}
-	leaves := make([]Hash, n)
+	var leaves []Hash
 	for i := range n {
 		p, err := store.Get(a.ID, i)
 		if err != nil {
@@ -128,7 +132,7 @@ func Read(store Store, a *Announcement, w io.Writer) error {
 		if len(p) != PieceLen(a.Size, a.PieceSize, i) {
 			return ErrPiece
 		}
-		leaves[i] = LeafHash(p)
+		leaves = append(leaves, LeafHash(p))
 	}
 	if BlobID(NewTree(leaves).Root(), a.Size, a.PieceSize) != a.ID {
 		return ErrPiece
@@ -137,6 +141,9 @@ func Read(store Store, a *Announcement, w io.Writer) error {
 		p, err := store.Get(a.ID, i)
 		if err != nil {
 			return err
+		}
+		if LeafHash(p) != leaves[i] {
+			return ErrPiece
 		}
 		pt, err := Open(a.Key, i, p)
 		if err != nil {

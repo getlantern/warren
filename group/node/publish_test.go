@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -197,5 +198,26 @@ func TestPublishBlobRefused(t *testing.T) {
 	n.cfg.Store = nil
 	if _, _, err := n.PublishBlob(context.Background(), bytes.NewReader(nil), nil); !errors.Is(err, ErrNoStore) {
 		t.Fatalf("without a store: %v", err)
+	}
+}
+
+// deleteFails is a store that can't delete.
+type deleteFails struct{ *content.MemStore }
+
+func (deleteFails) Delete(content.ID) error { return errors.New("delete failed") }
+
+// TestPublishBlobDeleteError: a refused blob the store can't delete comes
+// back named, with both errors.
+func TestPublishBlobDeleteError(t *testing.T) {
+	x := newGroup(t)
+	mirror := me(7)
+	if _, err := (&roster.Writer{R: x.r, Me: x.owner}).Add(mirror.Public(), "mirror", roster.Mirror, keys.PublicKey{}); err != nil {
+		t.Fatal(err)
+	}
+	mn := x.join(t, host(t, network(t, 5)), mirror, x.r)
+	mn.cfg.Store = deleteFails{content.NewMemStore()}
+	id, _, err := mn.PublishBlob(context.Background(), bytes.NewReader(blobData(t, 100)), nil)
+	if !errors.Is(err, roster.ErrNotAllowed) || !strings.Contains(err.Error(), "delete failed") || id == (content.ID{}) {
+		t.Fatalf("a refused blob that can't be deleted: id %x, %v", id, err)
 	}
 }
