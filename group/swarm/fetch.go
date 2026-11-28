@@ -15,7 +15,8 @@ type Config struct {
 	// flight: its pipeline holds TargetRTT's worth of pieces (1s).
 	TargetRTT time.Duration
 	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
-	// peer not yet measured gets MinDepth.
+	// peer starts at MinDepth, doubling as it shows it can fill more (slow
+	// start).
 	MinDepth, MaxDepth int
 	// Window is how many pieces from the playhead are fetched in order
 	// when streaming (8).
@@ -57,11 +58,12 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// rateWeight is the weight of a lower throughput sample in a peer's moving
-// average, and sampleSpan the least time a sample spans.
+// A peer's throughput is the bytes it delivered over the time it was busy
+// (had requests outstanding): measured once that spans minBusy, and both
+// halved past maxBusy, so it follows the peer's recent rate.
 const (
-	rateWeight = 0.3
-	sampleSpan = 250 * time.Millisecond
+	minBusy = 250 * time.Millisecond
+	maxBusy = 2 * time.Second
 )
 
 // MaxPieces bounds a fetch's blob: a fetch keeps about 8 bytes a piece of
@@ -97,13 +99,57 @@ type Fetch[P comparable] struct {
 }
 
 type peer struct {
-	has  *Bitfield
-	out  map[uint32]time.Time // pieces requested, and when
-	rate float64              // bytes per second, a moving average; 0 unmeasured
-	// The current sample: bytes delivered since start, while the peer has
-	// had requests outstanding throughout; lastAt is its last delivery.
-	start, lastAt time.Time
-	bytes         int
+	has *Bitfield
+	out map[uint32]time.Time // pieces requested, and when
+	// Throughput: bytes delivered over busy time, plus the busy spell
+	// running since busySince while out isn't empty.
+	bytes     float64
+	busy      time.Duration
+	busySince time.Time
+	// Slow start: a measured rate only shows what the pipeline allowed,
+	// so while doubling it keeps raising the rate (slowStart), the
+	// pipeline doubles (ssDepth) each time it delivers a full pipeline's
+	// worth (ssCount), against the rate at the last doubling (ssRate).
+	slowStart bool
+	ssDepth   int
+	ssCount   int
+	ssRate    float64
+}
+
+// ask records piece i outstanding at pr; drop removes it. Every request
+// goes through both, so busy time counts exactly the spells pr had
+// requests out, whatever ended them.
+func (f *Fetch[P]) ask(pr *peer, i uint32) {
+	now := f.cfg.Now()
+	if len(pr.out) == 0 {
+		pr.busySince = now
+	}
+	pr.out[i] = now
+	f.asked[i]++
+}
+
+func (f *Fetch[P]) drop(pr *peer, i uint32) {
+	if _, ok := pr.out[i]; !ok {
+		return
+	}
+	delete(pr.out, i)
+	f.asked[i]--
+	if len(pr.out) == 0 {
+		pr.busy += f.cfg.Now().Sub(pr.busySince)
+	}
+}
+
+// rate is pr's throughput in bytes a second; 0 until it has been busy
+// minBusy.
+func (f *Fetch[P]) rate(pr *peer) float64 {
+	busy := pr.busy
+	if len(pr.out) > 0 {
+		busy += f.cfg.Now().Sub(pr.busySince)
+	}
+	if busy < minBusy {
+		return 0
+	}
+	return pr.bytes / busy.Seconds()
 }
 
 // NewFetch starts fetching a blob of n pieces, holding have already (nil
@@ -141,7 +187,7 @@ func (f *Fetch[P]) SetPeer(p P, has *Bitfield) error {
 	}
 	pr := f.peers[p]
 	if pr == nil {
-		pr = &peer{out: map[uint32]time.Time{}}
+		pr = &peer{out: map[uint32]time.Time{}, slowStart: true, ssDepth: f.cfg.MinDepth}
 		f.peers[p] = pr
 	} else {
 		f.count(pr.has, -1)
@@ -178,7 +224,7 @@ func (f *Fetch[P]) RemovePeer(p P) {
 	}
 	f.count(pr.has, -1)
 	for i := range pr.out {
-		f.asked[i]--
+		f.drop(pr, i)
 	}
 	delete(f.peers, p)
 }
@@ -193,8 +239,11 @@ func (f *Fetch[P]) StopStreaming() { f.streaming = false }
 // depth is peer pr's pipeline: TargetRTT of its measured throughput.
 func (f *Fetch[P]) depth(pr *peer) int {
 	d := f.cfg.MinDepth
-	if pr.rate > 0 && f.cfg.PieceSize > 0 {
-		d = int(pr.rate * f.cfg.TargetRTT.Seconds() / float64(f.cfg.PieceSize))
+	if r := f.rate(pr); r > 0 && f.cfg.PieceSize > 0 {
+		d = int(r * f.cfg.TargetRTT.Seconds() / float64(f.cfg.PieceSize))
+	}
+	if pr.slowStart {
+		d = max(d, pr.ssDepth)
 	}
 	return min(max(d, f.cfg.MinDepth), f.cfg.MaxDepth)
 }
@@ -223,8 +272,7 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 	}
 	var picks []uint32
 	ask := func(i uint32) {
-		pr.out[i] = f.cfg.Now()
-		f.asked[i]++
+		f.ask(pr, i)
 		picks = append(picks, i)
 		slots--
 	}
@@ -310,11 +358,16 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 		return nil
 	}
 	if pr := f.peers[p]; pr != nil {
-		if at, ok := pr.out[i]; ok {
-			delete(pr.out, i)
-			f.asked[i]--
+		if _, ok := pr.out[i]; ok {
 			if verified {
-				f.measure(pr, at, size)
+				pr.bytes += float64(size)
+			}
+			f.drop(pr, i)
+			if pr.busy > maxBusy {
+				pr.bytes, pr.busy = pr.bytes/2, pr.busy/2
+			}
+			if verified && pr.slowStart {
+				f.slowStart(pr)
 			}
 		}
 		if !verified {
@@ -329,55 +382,31 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 	f.have.Set(i)
 	for q, qr := range f.peers {
 		if _, ok := qr.out[i]; ok {
-			delete(qr.out, i)
-			f.asked[i]--
+			f.drop(qr, i)
 			cancel = append(cancel, q)
 		}
 	}
 	return cancel
 }
 
-// measure adds a delivered piece, asked for at at, to peer pr's throughput:
-// bytes delivered over the time it has been busy, so its rate isn't
-// mistaken for each piece's round trip or its wait in the pipeline. A
-// sample spans at least sampleSpan, and closes only after the pieces it
-// counts: at the first delivery after them, or when the peer goes idle,
-// so pieces landing together are counted together.
-func (f *Fetch[P]) measure(pr *peer, at time.Time, size int) {
-	now := f.cfg.Now()
-	if pr.start.IsZero() {
-		pr.start = at
-	}
-	if now.After(pr.lastAt) && pr.lastAt.Sub(pr.start) >= sampleSpan {
-		f.sample(pr, pr.lastAt)
-		pr.start = pr.lastAt
-	}
-	pr.bytes += size
-	pr.lastAt = now
-	if len(pr.out) == 0 { // idle: close what's counted, and start afresh
-		if now.Sub(pr.start) > 0 {
-			f.sample(pr, now)
-		}
-		pr.start, pr.bytes = time.Time{}, 0
-	}
-}
-
-// sample closes peer pr's sample at end, folding it into its rate.
-func (f *Fetch[P]) sample(pr *peer, end time.Time) {
-	el := end.Sub(pr.start).Seconds()
-	if el <= 0 {
+// slowStart doubles pr's pipeline each time it delivers a full one, while
+// that keeps raising its rate by slowStartGain; once a doubling doesn't,
+// the pipeline follows its measured rate alone.
+func (f *Fetch[P]) slowStart(pr *peer) {
+	if pr.ssCount++; pr.ssCount < pr.ssDepth {
 		return
 	}
-	// A rise is taken whole, so a pipeline grows as fast as the peer shows
-	// it can fill one; a fall is smoothed, so one slow sample doesn't
-	// empty it.
-	if s := float64(pr.bytes) / el; s > pr.rate {
-		pr.rate = s
-	} else {
-		pr.rate += rateWeight * (s - pr.rate)
+	pr.ssCount = 0
+	r := f.rate(pr)
+	if pr.ssRate > 0 && r < pr.ssRate*slowStartGain || pr.ssDepth >= f.cfg.MaxDepth {
+		pr.slowStart = false
+		return
 	}
-	pr.bytes = 0
+	pr.ssDepth, pr.ssRate = min(2*pr.ssDepth, f.cfg.MaxDepth), r
 }
+
+// slowStartGain is the rise in rate a doubling must bring to keep doubling.
+const slowStartGain = 1.1
 
 // Outstanding is how many requests peer p has in flight.
 func (f *Fetch[P]) Outstanding(p P) int {

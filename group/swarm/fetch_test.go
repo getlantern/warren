@@ -266,8 +266,8 @@ func TestCancelDuplicates(t *testing.T) {
 	}
 }
 
-// TestPipelineDepth: a peer's pipeline follows its measured throughput,
-// within bounds.
+// TestPipelineDepth: a peer's pipeline follows its measured throughput
+// (bytes over busy time), within bounds.
 func TestPipelineDepth(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	const n = 200
@@ -277,6 +277,16 @@ func TestPipelineDepth(t *testing.T) {
 	if len(first) != 2 {
 		t.Fatalf("an unmeasured peer got %d requests", len(first))
 	}
+	// One quick piece isn't a measurement.
+	q := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 16})
+	setPeer(t, q, "p", full(n))
+	qi := q.Next("p")
+	c.t = c.t.Add(10 * time.Millisecond)
+	q.Received("p", qi[0], pieceSize, true)
+	if r, d := q.rate(q.peers["p"]), q.depth(q.peers["p"]); r != 0 || d != 2 {
+		t.Fatalf("after one piece in 10ms: rate %.0f, pipeline %d", r, d)
+	}
+	c.t = time.Unix(0, 0)
 	// 10 pieces a second, busy throughout, past the least sample span (a
 	// sample closes at the delivery after it).
 	for range 4 {
@@ -290,16 +300,12 @@ func TestPipelineDepth(t *testing.T) {
 	if got := f.Outstanding("p") + len(f.Next("p")); got != 10 {
 		t.Fatalf("at 10 pieces a second, a 1s pipeline of %d", got)
 	}
-	// A slow sample lowers it, smoothed: not straight down to the sample.
-	for range 2 { // a piece a second; the second closes the sample
-		c.t = c.t.Add(time.Second)
-		for i := range f.peers["p"].out {
-			f.Received("p", i, pieceSize, true)
-			break
-		}
-	}
+	// A slower piece lowers it, as an average over busy time: not straight
+	// down to the slow piece's rate.
+	c.t = c.t.Add(time.Second)
+	f.Received("p", f.peers["p"].firstOut(), pieceSize, true)
 	if d := f.depth(f.peers["p"]); d <= 2 || d >= 10 {
-		t.Fatalf("after one slow sample, a pipeline of %d", d)
+		t.Fatalf("after a slow piece, a pipeline of %d", d)
 	}
 	for range 10 { // everything outstanding lands together, 300ms on: capped
 		f.Next("p")
@@ -467,8 +473,10 @@ func TestThroughputThroughLatency(t *testing.T) {
 	if took := c.t.Sub(time.Unix(0, 0)); took > 10*time.Second {
 		t.Fatalf("300 pieces took %v", took)
 	}
-	if r := f.peers["p"].rate; r < 90000 {
-		t.Fatalf("measured %.0f bytes a second of a 100000 peer", r)
+	// MaxDepth 32 over a 500ms round trip delivers at most 64000 bytes a
+	// second; the rate, an average over recent busy time, nears it.
+	if r := f.rate(f.peers["p"]); r < 32000 || r > 64000 {
+		t.Fatalf("measured %.0f bytes a second, delivering at most 64000", r)
 	}
 }
 
@@ -551,23 +559,76 @@ func TestEndgameSameCall(t *testing.T) {
 	}
 }
 
-// TestBurstThroughput: ten pieces landing together after a second aren't
-// measured as one piece a second each: the ones after the sampling piece
-// count toward the next sample, which then shows the rate.
+// TestBurstThroughput: pieces landing together count over the time the
+// peer was busy, not as one piece over its round trip each; nor does a
+// burst's tail make a tiny sample.
 func TestBurstThroughput(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	const n = 100
-	f := newFetch(t, n, c, Config{MinDepth: 12, MaxDepth: 32}) // one stays outstanding
+	f := newFetch(t, n, c, Config{MinDepth: 11, MaxDepth: 32})
 	setPeer(t, f, "p", full(n))
 	got := f.Next("p")
 	c.t = c.t.Add(time.Second)
 	for _, i := range got[:10] {
 		f.Received("p", i, pieceSize, true)
 	}
-	c.t = c.t.Add(sampleSpan)
-	f.Received("p", got[10], pieceSize, true)
-	if r := f.peers["p"].rate; r < 9000 {
-		t.Fatalf("a burst of ten pieces then one more measured %.0f bytes a second", r)
+	if r := f.rate(f.peers["p"]); r < 9500 || r > 10500 {
+		t.Fatalf("ten pieces in a busy second measured %.0f bytes a second", r)
+	}
+	// Two pieces a microsecond apart after a second: about 2 KB/s, not a
+	// microsecond's worth.
+	g := newFetch(t, n, c, Config{MinDepth: 2})
+	setPeer(t, g, "q", full(n))
+	two := g.Next("q")
+	c.t = c.t.Add(time.Second)
+	g.Received("q", two[0], pieceSize, true)
+	c.t = c.t.Add(time.Microsecond)
+	g.Received("q", two[1], pieceSize, true)
+	if r := g.rate(g.peers["q"]); r > 2100 {
+		t.Fatalf("a burst's tail measured %.0f bytes a second", r)
+	}
+}
+
+// TestIdleNotBusy: time with nothing outstanding, however the pipeline
+// emptied (a cancelled duplicate, a failed piece), doesn't count as busy.
+func TestIdleNotBusy(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "a", full(4))
+	setPeer(t, f, "b", set(4, 0))
+	// b's only request is cancelled when a delivers it.
+	if got := f.Next("b"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("b asked for %v", got)
+	}
+	c.t = c.t.Add(500 * time.Millisecond)
+	f.Next("a")
+	c.t = c.t.Add(100 * time.Millisecond)
+	f.Received("a", f.peers["a"].firstOut(), pieceSize, true)
+	f.Received("a", 0, pieceSize, true) // unsolicited, but cancels b's
+	if f.Outstanding("b") != 0 {
+		t.Fatal("b's request wasn't cancelled")
+	}
+	busy := f.peers["b"].busy
+	if busy != 600*time.Millisecond {
+		t.Fatalf("b was busy 600ms until its request was cancelled; counted %v", busy)
+	}
+	c.t = c.t.Add(time.Minute)
+	if f.peers["b"].busy != busy {
+		t.Fatal("idle time counted as busy")
+	}
+	// A failed last piece ends a spell too.
+	g := newFetch(t, 4, c, Config{MinDepth: 1, MaxDepth: 1, MaxStrikes: 5})
+	setPeer(t, g, "p", full(4))
+	i := g.Next("p")[0]
+	c.t = c.t.Add(300 * time.Millisecond)
+	g.Received("p", i, pieceSize, false)
+	b2 := g.peers["p"].busy
+	c.t = c.t.Add(time.Minute)
+	if g.peers["p"].busy != b2 || b2 != 300*time.Millisecond {
+		t.Fatalf("busy %v after a failed last piece and a minute idle", g.peers["p"].busy)
+	}
+	if g.peers["p"].bytes != 0 {
+		t.Fatal("a failed piece counted toward throughput")
 	}
 }
 
@@ -575,5 +636,73 @@ func TestBurstThroughput(t *testing.T) {
 func TestTooLarge(t *testing.T) {
 	if _, err := NewFetch[string](MaxPieces+1, nil, Config{}); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("past MaxPieces: %v", err)
+	}
+}
+
+// firstOut is one of pr's outstanding pieces, for tests.
+func (pr *peer) firstOut() uint32 {
+	for i := range pr.out {
+		return i
+	}
+	panic("nothing outstanding")
+}
+
+// TestSlowStartStops: a peer whose rate stops rising as its pipeline
+// doubles leaves slow start, and its pipeline follows its rate.
+func TestSlowStartStops(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 400
+	f := newFetch(t, n, c, Config{})
+	setPeer(t, f, "p", full(n))
+	// 10 pieces a second however many are outstanding, little latency:
+	// doubling past 2 brings nothing.
+	var free time.Time
+	type arrival struct {
+		at time.Time
+		i  uint32
+	}
+	var arrivals []arrival
+	for range 120 {
+		for _, i := range f.Next("p") {
+			start := c.t
+			if free.After(start) {
+				start = free
+			}
+			free = start.Add(100 * time.Millisecond)
+			arrivals = append(arrivals, arrival{free, i})
+		}
+		a := arrivals[0]
+		arrivals = arrivals[1:]
+		c.t = a.at
+		f.Received("p", a.i, pieceSize, true)
+	}
+	pr := f.peers["p"]
+	if pr.slowStart || pr.ssDepth >= 16 {
+		t.Fatalf("slow start: still on %v, doubled to %d", pr.slowStart, pr.ssDepth)
+	}
+	if d := f.depth(pr); d > 12 {
+		t.Fatalf("a 10-piece-a-second peer's pipeline of %d", d)
+	}
+}
+
+// TestRateFollowsRecent: a peer fast for a long while, then slow, is soon
+// measured slow: old busy time is halved away.
+func TestRateFollowsRecent(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 200, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "p", full(200))
+	step := func(d time.Duration) {
+		i := f.Next("p")[0]
+		c.t = c.t.Add(d)
+		f.Received("p", i, pieceSize, true)
+	}
+	for range 100 {
+		step(100 * time.Millisecond) // 10s at 10000 bytes a second
+	}
+	for range 4 {
+		step(time.Second) // then 4s at 1000
+	}
+	if r := f.rate(f.peers["p"]); r > 5000 {
+		t.Fatalf("4s after slowing to 1000 bytes a second, measured %.0f", r)
 	}
 }
