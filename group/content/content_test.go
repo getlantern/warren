@@ -435,3 +435,20 @@ func TestPutOwnsPiece(t *testing.T) {
 		}
 	}
 }
+
+// TestNewTreeCopies: reusing the leaves slice after NewTree doesn't change
+// the tree's proofs.
+func TestNewTreeCopies(t *testing.T) {
+	leaves := []Hash{LeafHash([]byte("a")), LeafHash([]byte("b"))}
+	b := leaves[1]
+	tr := NewTree(leaves)
+	root := tr.Root()
+	leaves[0] = Hash{}
+	p, err := tr.Proof(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := rootFrom(1, 2, b, p); !ok || got != root {
+		t.Fatal("reusing the leaves slice changed the tree's proofs")
+	}
+}

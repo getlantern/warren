@@ -263,8 +263,10 @@ type Tree struct {
 }
 
 // NewTree builds the tree over leaves (LeafHash of each ciphertext piece,
-// in order); there is at least one.
+// in order); there is at least one. It keeps a copy, so the caller may
+// reuse leaves.
 func NewTree(leaves []Hash) *Tree {
+	leaves = append([]Hash(nil), leaves...)
 	t := &Tree{levels: [][]Hash{leaves}, n: uint32(len(leaves))}
 	for lv := leaves; len(lv) > 1; {
 		up := make([]Hash, len(lv)/2)
