@@ -14,6 +14,7 @@ import (
 	"github.com/getlantern/warren/dht"
 	"github.com/getlantern/warren/driver"
 	"github.com/getlantern/warren/endpoint"
+	"github.com/getlantern/warren/group/content"
 	"github.com/getlantern/warren/group/keys"
 	"github.com/getlantern/warren/group/memberlog"
 	"github.com/getlantern/warren/group/roster"
@@ -140,7 +141,7 @@ func (x *group) join(t *testing.T, h *Host, id *keys.Identity, r *roster.Roster)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	n, err := h.Join(ctx, Config{Me: id, Group: x.g, Roster: c, Logs: logs, Now: x.clock, CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second})
+	n, err := h.Join(ctx, Config{Me: id, Group: x.g, Roster: c, Logs: logs, Now: x.clock, CallTimeout: 3 * time.Second, SessionTimeout: 15 * time.Second, Store: content.NewMemStore()})
 	if err != nil {
 		t.Fatal(err)
 	}

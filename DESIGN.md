@@ -998,8 +998,18 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       size, piece size, key and app metadata (the entry's epoch-key
       encryption is what wraps the key). Any piece verifies alone against
       the ID with an O(log n) proof and opens alone;
-   2. wiring it into the node: `Node.Publish`, piece storage, and
-      announcements going through the publish pause's queue.
+   2. wiring it into the node (built): `content.Store` holds pieces, a
+      blob written through a `BlobWriter` committed under its ID once
+      sealed (`content.MemStore` in memory; `content.SealTo` aborts a
+      failed seal). `Node.PublishBlob` seals into `Config.Store` without
+      holding the group, then announces the blob the way `Post` appends
+      an entry (held while paused, refused in the same cases), deleting
+      the pieces if the announcement is refused. Held posts carry their
+      kind, so posts and announcements keep one order (`Node.TakeHeld`
+      returns `Held` values). `content.Read` checks a whole stored blob
+      against its ID (each piece's length and the tree) before writing
+      any plaintext; checking pieces as they stream in, by proof, comes
+      with swarming.
 7. **Swarming**: bitfields, rarest-first, playhead order, work stealing,
    resume, storage budget; inventories for mirrors. The scheduler is pure
    and can also start alongside 4 and 5; wiring it needs 5.

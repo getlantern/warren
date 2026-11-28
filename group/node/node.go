@@ -20,6 +20,7 @@ import (
 
 	"github.com/getlantern/warren/dht"
 	"github.com/getlantern/warren/endpoint"
+	"github.com/getlantern/warren/group/content"
 	"github.com/getlantern/warren/group/directory"
 	"github.com/getlantern/warren/group/join"
 	"github.com/getlantern/warren/group/keys"
@@ -82,6 +83,8 @@ var (
 	// ErrQueueFull means a post found the publish queue full (MaxQueued)
 	// while publishing is paused.
 	ErrQueueFull = errors.New("node: publish queue full")
+	// ErrNoStore means PublishBlob found no Config.Store to seal into.
+	ErrNoStore = errors.New("node: no content store")
 	// ErrHeldFailed means held posts failed to append (Node.Post); the
 	// error wraps why.
 	ErrHeldFailed = errors.New("node: held posts failed to append")
@@ -227,6 +230,9 @@ type Config struct {
 	// SessionTimeout), should return when that ends, and nothing is
 	// committed once it has. A retry after a lost answer isn't put to it.
 	Approve func(context.Context, join.Request) bool
+	// Store holds blobs' pieces: those this member publishes (PublishBlob).
+	// Without one, PublishBlob refuses (ErrNoStore).
+	Store content.Store
 }
 
 func withDefaults(cfg Config) Config {

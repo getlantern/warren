@@ -207,7 +207,7 @@ func TestAdminCorrectsOnTick(t *testing.T) {
 	if err := m.Leave(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if h := m.TakeHeld(); len(h) != 1 || string(h[0]) != "one" {
+	if h := m.TakeHeld(); len(h) != 1 || string(h[0].Body) != "one" {
 		t.Fatalf("held after Leave %q", h)
 	}
 
@@ -305,7 +305,7 @@ func TestPostRefusals(t *testing.T) {
 	seed := network(t, 6)
 	n := x.join(t, host(t, seed), x.m1, x.r)
 	n.mu.Lock()
-	n.queue = append(n.queue, &heldPost{body: []byte("held")})
+	n.queue = append(n.queue, &heldPost{kind: memberlog.App, body: []byte("held")})
 	n.mu.Unlock()
 	// Queued behind it, then Do's refresh flushes both, the held one first,
 	// so it's no longer held when Post returns.
@@ -408,7 +408,7 @@ func TestPostAfterEpochStopsCounting(t *testing.T) {
 		t.Fatalf("a post behind hidden entries: queued %v, %v", queued, err)
 	}
 	n.mu.Lock()
-	n.queue = append(n.queue, &heldPost{body: []byte("held")})
+	n.queue = append(n.queue, &heldPost{kind: memberlog.App, body: []byte("held")})
 	n.mu.Unlock()
 	if err := n.Do(ctx, func(r *roster.Roster, _ *memberlog.Set) error {
 		_, err := (&roster.Writer{R: r, Me: x.owner}).Rekey()
@@ -429,7 +429,7 @@ func TestPostAfterEpochStopsCounting(t *testing.T) {
 	if last == nil || last.Seq != 1 || fork != nil || ferr != nil {
 		t.Fatalf("the member's own chain: last %v, fork %v, flush %v", last, fork != nil, ferr)
 	}
-	if h := n.TakeHeld(); len(h) != 1 || string(h[0]) != "held" {
+	if h := n.TakeHeld(); len(h) != 1 || string(h[0].Body) != "held" {
 		t.Fatalf("held %q", h)
 	}
 }
@@ -442,7 +442,7 @@ func TestHeldFailureSurfaces(t *testing.T) {
 	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
 	ctx := context.Background()
 	n.mu.Lock()
-	n.queue = append(n.queue, &heldPost{body: make([]byte, memberlog.MaxBody+1)}) // can't be written
+	n.queue = append(n.queue, &heldPost{kind: memberlog.App, body: make([]byte, memberlog.MaxBody+1)}) // can't be written
 	n.mu.Unlock()
 	if _, err := n.Post(ctx, []byte("a")); err != nil {
 		t.Fatal(err) // queued behind it; its flush fails
@@ -450,7 +450,7 @@ func TestHeldFailureSurfaces(t *testing.T) {
 	if _, err := n.Post(ctx, []byte("b")); !errors.Is(err, ErrHeldFailed) {
 		t.Fatalf("a post behind a failing one: %v", err)
 	}
-	if h := n.TakeHeld(); len(h) != 2 || string(h[1]) != "a" {
+	if h := n.TakeHeld(); len(h) != 2 || string(h[1].Body) != "a" {
 		t.Fatalf("held %d", len(h))
 	}
 	if queued, err := n.Post(ctx, []byte("b")); err != nil || queued {
@@ -464,12 +464,12 @@ func TestLeaveDoesntFlush(t *testing.T) {
 	x := newGroup(t)
 	n := x.join(t, host(t, network(t, 5)), x.m1, x.r)
 	n.mu.Lock()
-	n.queue = append(n.queue, &heldPost{body: []byte("held")}) // unpaused, holding the key
+	n.queue = append(n.queue, &heldPost{kind: memberlog.App, body: []byte("held")}) // unpaused, holding the key
 	n.mu.Unlock()
 	if err := n.Leave(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h := n.TakeHeld(); len(h) != 1 || string(h[0]) != "held" {
+	if h := n.TakeHeld(); len(h) != 1 || string(h[0].Body) != "held" {
 		t.Fatalf("held after Leave %q", h)
 	}
 	n.mu.Lock()
