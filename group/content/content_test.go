@@ -411,3 +411,27 @@ func TestAnnouncementFitsAnEntry(t *testing.T) {
 		t.Fatalf("decoded: %v", err)
 	}
 }
+
+// TestPutOwnsPiece: put may change the slice it's handed (reusing it, say)
+// without changing the blob's ID.
+func TestPutOwnsPiece(t *testing.T) {
+	data := random(t, 2*MinPieceSize+3)
+	var kept [][]byte
+	s, err := Seal(bytes.NewReader(data), MinPieceSize, func(_ uint32, p []byte) error {
+		kept = append(kept, append([]byte(nil), p...))
+		clear(p)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range kept {
+		proof, err := s.Tree.Proof(uint32(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Verify(s.ID, s.Size, s.PieceSize, uint32(i), p, proof); err != nil {
+			t.Fatalf("piece %d, changed by put after sealing: %v", i, err)
+		}
+	}
+}

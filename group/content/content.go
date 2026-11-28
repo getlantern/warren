@@ -136,8 +136,8 @@ type Sealed struct {
 
 // Seal reads a blob from r to its end and encrypts it under a fresh key in
 // pieces of pieceSize (DefaultPieceSize for 0), handing each ciphertext
-// piece to put in order; put may keep the slice. It holds one piece and
-// the tree's hashes, not the blob.
+// piece to put in order; the slice is put's to keep or change. It holds
+// one piece and the tree's hashes, not the blob.
 func Seal(r io.Reader, pieceSize uint32, put func(i uint32, piece []byte) error) (*Sealed, error) {
 	if pieceSize == 0 {
 		pieceSize = DefaultPieceSize
@@ -167,10 +167,10 @@ func Seal(r io.Reader, pieceSize uint32, put func(i uint32, piece []byte) error)
 			return nil, ErrTooLarge
 		}
 		piece := aead.Seal(nil, nonce(i), buf[:n], ad)
+		leaves = append(leaves, LeafHash(piece)) // before put, which owns piece
 		if err := put(i, piece); err != nil {
 			return nil, err
 		}
-		leaves = append(leaves, LeafHash(piece))
 		s.Size += uint64(n)
 		if last {
 			break
