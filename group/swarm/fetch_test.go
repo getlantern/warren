@@ -729,33 +729,38 @@ func TestRequestTimeout(t *testing.T) {
 	}
 }
 
-// TestWithholdingPeer: a peer answering every request 30s late, at a
-// piece a second, keeps a small pipeline, and its requests time out to
-// the others.
+// TestWithholdingPeer: a peer that never answers, asked first every time,
+// can't keep pieces an honest peer holds: once its requests time out,
+// they go to the honest peer, not back to it.
 func TestWithholdingPeer(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
-	const n = 400
+	const n = 4
 	f := newFetch(t, n, c, Config{})
 	setPeer(t, f, "w", full(n))
-	f.Next("w")
-	peak := 0
-	for range 120 {
-		c.t = c.t.Add(time.Second)
-		var oldest uint32
-		var at time.Time
-		for i, a := range f.peers["w"].out {
-			if at.IsZero() || a.Before(at) {
-				oldest, at = i, a
-			}
-		}
-		if !at.IsZero() && c.t.Sub(at) >= 30*time.Second {
-			f.Received("w", oldest, pieceSize, true)
-		}
-		f.Next("w")
-		peak = max(peak, f.Outstanding("w"))
+	setPeer(t, f, "honest", set(n, 0, 1))
+	f.SetPlayhead(0)
+	if got := f.Next("w"); !slices.Contains(got, 0) {
+		t.Fatalf("w asked for %v", got)
 	}
-	if peak > 16 {
-		t.Fatalf("a peer answering 30s late held %d requests", peak)
+	got := map[uint32]bool{}
+	for range 4 {
+		c.t = c.t.Add(16 * time.Second)
+		f.Next("w") // polled first, every time
+		for _, i := range f.Next("honest") {
+			got[i] = true
+			f.Received("honest", i, pieceSize, true)
+		}
+	}
+	if !f.Have().Has(0) || !f.Have().Has(1) {
+		t.Fatalf("the honest peer's pieces never came: have %v, honest asked %v", f.Have().Encode(), got)
+	}
+	// The only holder of a piece it timed out on is still asked for it.
+	g := newFetch(t, 1, c, Config{})
+	setPeer(t, g, "slow", full(1))
+	g.Next("slow")
+	c.t = c.t.Add(16 * time.Second)
+	if again := g.Next("slow"); !slices.Equal(again, []uint32{0}) {
+		t.Fatalf("the only holder, after timing out, asked for %v", again)
 	}
 }
 

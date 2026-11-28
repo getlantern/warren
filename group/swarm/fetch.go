@@ -17,8 +17,9 @@ type Config struct {
 	// is covered.
 	QueueTime time.Duration
 	// RequestTimeout is how long a request may stay outstanding before
-	// it goes back to the other peers (15s): a peer holding its pieces
-	// back keeps them no longer. It may still deliver one late.
+	// it goes back to the other peers (15s), and isn't asked of that peer
+	// again while another holds it: a peer holding its pieces back keeps
+	// them no longer. It may still deliver one late.
 	RequestTimeout time.Duration
 	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
 	// peer not yet measured gets MinDepth; a pipeline-limited one measures
@@ -111,6 +112,9 @@ type Fetch[P comparable] struct {
 type peer struct {
 	has *Bitfield
 	out map[uint32]time.Time // pieces requested, and when
+	// timedOut is the pieces it held past RequestTimeout: it isn't asked
+	// for one again while another peer holds it.
+	timedOut map[uint32]bool
 	// Throughput: bytes delivered over busy time, plus the busy spell
 	// running since busySince while out isn't empty.
 	bytes     float64
@@ -189,7 +193,7 @@ func (f *Fetch[P]) SetPeer(p P, has *Bitfield) error {
 	}
 	pr := f.peers[p]
 	if pr == nil {
-		pr = &peer{out: map[uint32]time.Time{}}
+		pr = &peer{out: map[uint32]time.Time{}, timedOut: map[uint32]bool{}}
 		f.peers[p] = pr
 	} else {
 		f.count(pr.has, -1)
@@ -248,10 +252,11 @@ func (f *Fetch[P]) depth(pr *peer) int {
 }
 
 // wanted reports whether p could be asked for piece i: missing here, held
-// by p, and not already asked of it.
+// by p, not already asked of it, and not one it timed out on while another
+// peer holds it.
 func (f *Fetch[P]) wanted(pr *peer, i uint32) bool {
 	_, out := pr.out[i]
-	return !f.have.Has(i) && pr.has.Has(i) && !out
+	return !f.have.Has(i) && pr.has.Has(i) && !out && (!pr.timedOut[i] || f.avail[i] <= 1)
 }
 
 // Next returns the pieces to request from peer p now, filling its
@@ -323,6 +328,7 @@ func (f *Fetch[P]) expire() {
 		for i, at := range pr.out {
 			if at.Before(cutoff) {
 				f.drop(pr, i)
+				pr.timedOut[i] = true
 			}
 		}
 	}
