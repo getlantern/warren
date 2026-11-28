@@ -1024,7 +1024,7 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       pipeline holds 3 s of the peer's measured throughput, as
       libtorrent's request queue time, within bounds. Throughput is bytes
       delivered over the time the peer had requests out, measured once
-      that's 250 ms and halved past 2 s so it follows the recent rate; a
+      that's 250 ms and halved past 6 s so it follows the recent rate; a
       pipeline-limited peer measures its depth over its round trip, so
       its pipeline grows until throughput is the limit, for any round trip
       under 3 s. `Received` keeps only verified pieces and names the peers

@@ -605,8 +605,19 @@ func TestBurstThroughput(t *testing.T) {
 	g.Received("q", two[0], pieceSize, true)
 	c.t = c.t.Add(time.Microsecond)
 	g.Received("q", two[1], pieceSize, true)
-	if r := g.rate(g.peers["q"]); r > 2100 {
+	if r := g.rate(g.peers["q"]); r < 1900 || r > 2100 {
 		t.Fatalf("a burst's tail measured %.0f bytes a second", r)
+	}
+	// A burst after more than maxBusy weighs its pieces alike: two pieces
+	// at 7s are 286 bytes a second, not inflated by halving between them.
+	b := newFetch(t, n, c, Config{MinDepth: 2})
+	setPeer(t, b, "r", full(n))
+	pair := b.Next("r")
+	c.t = c.t.Add(7 * time.Second)
+	b.Received("r", pair[0], pieceSize, true)
+	b.Received("r", pair[1], pieceSize, true)
+	if r := b.rate(b.peers["r"]); r < 260 || r > 315 {
+		t.Fatalf("two pieces in a busy 7s measured %.0f bytes a second", r)
 	}
 }
 
@@ -889,5 +900,33 @@ func TestNextAllocatesLittle(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	if d := after.TotalAlloc - before.TotalAlloc; d > 64<<10 {
 		t.Fatalf("one Next on a %d-piece blob allocated %d bytes", n, d)
+	}
+}
+
+// TestDepthRoundsUp: a pipeline-limited peer at MinDepth 1, a piece every
+// 2s, can grow: 0.5 pieces a second over QueueTime 3s is 1.5, rounded up.
+func TestDepthRoundsUp(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 20, c, Config{MinDepth: 1})
+	setPeer(t, f, "p", full(20))
+	f.Next("p")
+	for range 3 {
+		c.t = c.t.Add(2 * time.Second)
+		f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
+		f.Next("p")
+	}
+	if d := f.depth(f.peers["p"]); d < 2 {
+		t.Fatalf("a pipeline-limited peer stuck at depth %d", d)
+	}
+}
+
+// TestNegativeDepths: negative bounds take the defaults, not a pipeline
+// that never asks.
+func TestNegativeDepths(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MinDepth: -1, MaxDepth: -1})
+	setPeer(t, f, "p", full(4))
+	if got := f.Next("p"); len(got) != 2 {
+		t.Fatalf("with negative depths, asked for %v", got)
 	}
 }

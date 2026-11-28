@@ -3,6 +3,7 @@ package swarm
 import (
 	"container/heap"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"time"
@@ -23,7 +24,8 @@ type Config struct {
 	// keeps them no longer, and is out after MaxStrikes. It may still
 	// deliver one late.
 	RequestTimeout time.Duration
-	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
+	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces; zero
+	// or less takes the default). A
 	// peer not yet measured gets MinDepth; a pipeline-limited one measures
 	// its depth over its round trip, so QueueTime of that grows its
 	// pipeline until its throughput, not the pipeline, is the limit.
@@ -48,10 +50,10 @@ func (c Config) withDefaults() Config {
 	if c.RequestTimeout == 0 {
 		c.RequestTimeout = 15 * time.Second
 	}
-	if c.MinDepth == 0 {
+	if c.MinDepth <= 0 {
 		c.MinDepth = 2
 	}
-	if c.MaxDepth == 0 {
+	if c.MaxDepth <= 0 {
 		c.MaxDepth = 32
 	}
 	if c.MaxDepth < c.MinDepth {
@@ -74,10 +76,12 @@ func (c Config) withDefaults() Config {
 
 // A peer's throughput is the bytes it delivered over the time it was busy
 // (had requests outstanding): measured once that spans minBusy, and both
-// halved past maxBusy, so it follows the peer's recent rate.
+// halved past maxBusy (twice QueueTime, longer than a distant peer's burst
+// cycle, so a burst doesn't read as its rate), so it follows the peer's
+// recent rate.
 const (
 	minBusy = 250 * time.Millisecond
-	maxBusy = 2 * time.Second
+	maxBusy = 6 * time.Second
 )
 
 // MaxPieces bounds a fetch's blob: a fetch keeps about 8 bytes a piece of
@@ -120,6 +124,7 @@ type peer struct {
 	bytes     float64
 	busy      time.Duration
 	busySince time.Time
+	lastAt    time.Time // its last delivery
 }
 
 // ask records piece i outstanding at pr; drop removes it. Every request
@@ -249,7 +254,8 @@ func (f *Fetch[P]) StopStreaming() { f.streaming = false }
 func (f *Fetch[P]) depth(pr *peer) int {
 	d := f.cfg.MinDepth
 	if r := f.rate(pr); r > 0 && f.cfg.PieceSize > 0 {
-		d = int(r * f.cfg.QueueTime.Seconds() / float64(f.cfg.PieceSize))
+		// Rounded up, so a pipeline-limited peer at MinDepth 1 can grow.
+		d = int(math.Ceil(r * f.cfg.QueueTime.Seconds() / float64(f.cfg.PieceSize)))
 	}
 	return min(max(d, f.cfg.MinDepth), f.cfg.MaxDepth)
 }
@@ -445,6 +451,13 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 	}
 	if pr != nil {
 		if _, ok := pr.out[i]; ok {
+			now := f.cfg.Now()
+			// Halve the history once time has moved past the last
+			// delivery, with bytes and busy time both as of then, so the
+			// pieces of one burst are weighed alike.
+			if now.After(pr.lastAt) && pr.busy > maxBusy {
+				pr.bytes, pr.busy = pr.bytes/2, pr.busy/2
+			}
 			if verified {
 				pr.bytes += float64(size)
 			}
@@ -452,13 +465,10 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 			// The running spell too, or a pipeline kept full would never
 			// decay.
 			if len(pr.out) > 0 {
-				now := f.cfg.Now()
 				pr.busy += now.Sub(pr.busySince)
 				pr.busySince = now
 			}
-			if pr.busy > maxBusy {
-				pr.bytes, pr.busy = pr.bytes/2, pr.busy/2
-			}
+			pr.lastAt = now
 		}
 	}
 	if !verified || f.have.Has(i) {
