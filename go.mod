@@ -6,6 +6,7 @@ require (
 	filippo.io/edwards25519 v1.2.0
 	github.com/sagernet/sing v0.9.6-0.20260922013354-87c33f17688f
 	github.com/sagernet/sing-quic v0.7.1-0.20260924092235-6a3a24d65b99
+	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/crypto v0.54.0
 	golang.org/x/sys v0.47.0
 )
@@ -16,6 +17,7 @@ require (
 	github.com/huin/goupnp v1.2.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/klauspost/compress v1.18.7 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
