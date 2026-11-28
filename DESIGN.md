@@ -1003,8 +1003,9 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       sealed (`content.MemStore` in memory; `content.SealTo` aborts a
       failed seal). `Node.PublishBlob` seals into `Config.Store` without
       holding the group, then announces the blob the way `Post` appends
-      an entry (held while paused, refused in the same cases), deleting
-      the pieces if the announcement is refused. Held posts carry their
+      an entry (held while paused, refused in the same cases), trying to
+      delete the pieces if the announcement is refused (a failed delete
+      is reported with the blob's ID, for the caller to retry). Held posts carry their
       kind, so posts and announcements keep one order (`Node.TakeHeld`
       returns `Held` values, and `Node.Repost` appends one with its kind). `content.Read` checks a whole stored blob
       against its ID (each piece's length and the tree) before writing
