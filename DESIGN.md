@@ -987,9 +987,19 @@ line, B runs alongside it, C waits on device time, D is maintenance.
          the next, then the previous period's), run `join.Join`, and join
          the group with the roster and `G` they get; `Node.Leave` drops a
          group.
-6. **Content** (`group/content`): per-blob XChaCha20 pieces, the BLAKE3
-   tree over ciphertext, announcements. Pure library, so it can be built
-   alongside steps 4 and 5.
+6. **Content**, in parts:
+   1. the library, `group/content` (built): a blob is sealed under a
+      fresh key in XChaCha20-Poly1305 pieces (16 KiB to 4 MiB, a power
+      of two, 256 KiB by default; each piece's nonce is its index), named
+      by a BLAKE3 tree over the ciphertext pieces in RFC 6962's shape
+      (separate leaf and node domains; the ID hashes the root with the
+      size and piece size, so a blob can't be cut short or added to), and
+      announced by a `memberlog.Blob` entry whose body carries the ID,
+      size, piece size, key and app metadata (the entry's epoch-key
+      encryption is what wraps the key). Any piece verifies alone against
+      the ID with an O(log n) proof and opens alone;
+   2. wiring it into the node: `Node.Publish`, piece storage, and
+      announcements going through the publish pause's queue.
 7. **Swarming**: bitfields, rarest-first, playhead order, work stealing,
    resume, storage budget; inventories for mirrors. The scheduler is pure
    and can also start alongside 4 and 5; wiring it needs 5.
