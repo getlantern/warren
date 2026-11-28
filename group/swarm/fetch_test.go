@@ -437,14 +437,14 @@ func TestResumeMismatch(t *testing.T) {
 // a long round trip (half TargetRTT, or as long as it) gets a pipeline
 // deep enough to use it.
 func TestThroughputThroughLatency(t *testing.T) {
-	for _, rtt := range []time.Duration{500 * time.Millisecond, time.Second} {
+	for _, rtt := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
 		t.Run(rtt.String(), func(t *testing.T) { throughLatency(t, rtt) })
 	}
 }
 
 func throughLatency(t *testing.T, rtt time.Duration) {
 	c := &clock{t: time.Unix(0, 0)}
-	const n = 300
+	const n = 1000 // long enough to settle after slow start
 	f := newFetch(t, n, c, Config{})
 	setPeer(t, f, "p", full(n))
 	const service = 10 * time.Millisecond
@@ -474,12 +474,12 @@ func throughLatency(t *testing.T, rtt time.Duration) {
 		c.t = a.at
 		f.Received("p", a.i, pieceSize, true)
 	}
-	// MaxDepth 32 delivers at most 32 pieces a round trip: 300 take about
-	// 300/32 round trips once ramped, plus the ramp (doubling from 2 is 4
-	// round trips more); a pipeline stuck at 2 takes 150.
-	limit := time.Duration(float64(rtt) * (300.0/32 + 8))
+	// MaxDepth 32 delivers at most 32 pieces a round trip: 1000 take about
+	// 1000/32 round trips once ramped, plus the ramp (doubling from 2 is 4
+	// round trips more); a pipeline stuck at 2 takes 500.
+	limit := time.Duration(float64(rtt) * (1000.0/32 + 8))
 	if took := c.t.Sub(time.Unix(0, 0)); took > limit {
-		t.Fatalf("300 pieces took %v, over %v", took, limit)
+		t.Fatalf("1000 pieces took %v, over %v", took, limit)
 	}
 	// About 32 pieces a round trip: the blob's tail lands back to back, so
 	// the recent rate can run a little over.

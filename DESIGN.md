@@ -1017,7 +1017,9 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       a wrong length or bits past the last piece). A `Fetch` per blob
       tracks pieces held, each peer's bitfield and updates, and requests
       outstanding; `Next(peer)` fills the peer's pipeline (its measured
-      throughput times a target round trip, within bounds; throughput is
+      throughput times a target round trip, or twice the peer's shortest
+      round trip if longer, so a distant peer's pipeline doesn't shrink
+      with its own throughput, within bounds; throughput is
       bytes delivered over the time the peer had requests out, measured
       once that's 250 ms and halved past 2 s so it follows the recent
       rate; a new peer's pipeline doubles each time it delivers a full

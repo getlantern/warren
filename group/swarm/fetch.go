@@ -12,7 +12,8 @@ type Config struct {
 	// PieceSize is the blob's piece size, for sizing pipelines.
 	PieceSize uint32
 	// TargetRTT is how much of a peer's measured throughput to keep in
-	// flight: its pipeline holds TargetRTT's worth of pieces (1s).
+	// flight: its pipeline holds TargetRTT's worth of pieces (1s), or
+	// twice its shortest round trip's worth if that's longer.
 	TargetRTT time.Duration
 	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
 	// peer starts at MinDepth, doubling as it shows it can fill more (slow
@@ -106,6 +107,9 @@ type peer struct {
 	bytes     float64
 	busy      time.Duration
 	busySince time.Time
+	// minLat is the shortest a piece took from request to delivery: the
+	// round trip with the least queueing.
+	minLat time.Duration
 	// allBytes and allBusy are the same, never halved, for measuring
 	// slow start's phases.
 	allBytes float64
@@ -245,11 +249,15 @@ func (f *Fetch[P]) SetPlayhead(i uint32) { f.streaming, f.playhead = true, i }
 // StopStreaming goes back to rarest first throughout.
 func (f *Fetch[P]) StopStreaming() { f.streaming = false }
 
-// depth is peer pr's pipeline: TargetRTT of its measured throughput.
+// depth is peer pr's pipeline: its measured throughput over TargetRTT, or
+// over twice its shortest round trip if longer, so a peer farther away
+// than TargetRTT keeps the pipeline its throughput needs rather than
+// shrinking with it (in flight is throughput times round trip).
 func (f *Fetch[P]) depth(pr *peer) int {
 	d := f.cfg.MinDepth
 	if r := f.rate(pr); r > 0 && f.cfg.PieceSize > 0 {
-		d = int(r * f.cfg.TargetRTT.Seconds() / float64(f.cfg.PieceSize))
+		horizon := max(f.cfg.TargetRTT, 2*pr.minLat)
+		d = int(r * horizon.Seconds() / float64(f.cfg.PieceSize))
 	}
 	if pr.slowStart {
 		d = max(d, pr.ssDepth)
@@ -367,10 +375,13 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 		return nil
 	}
 	if pr := f.peers[p]; pr != nil {
-		if _, ok := pr.out[i]; ok {
+		if at, ok := pr.out[i]; ok {
 			if verified {
 				pr.bytes += float64(size)
 				pr.allBytes += float64(size)
+				if lat := f.cfg.Now().Sub(at); lat > 0 && (pr.minLat == 0 || lat < pr.minLat) {
+					pr.minLat = lat
+				}
 			}
 			f.drop(pr, i)
 			// The running spell too, or a pipeline kept full would never
