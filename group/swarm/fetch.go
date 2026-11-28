@@ -86,8 +86,8 @@ const MaxPieces = 1 << 24
 var (
 	// ErrTooLarge means a blob has more than MaxPieces pieces.
 	ErrTooLarge = errors.New("swarm: blob too large")
-	// ErrStruckOut means a peer sent MaxStrikes pieces that failed
-	// verification, and is out of this fetch.
+	// ErrStruckOut means a peer earned MaxStrikes (failed pieces and
+	// stalls), and is out of this fetch.
 	ErrStruckOut = errors.New("swarm: peer struck out")
 )
 
@@ -323,7 +323,7 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 }
 
 // expire gives requests outstanding past RequestTimeout back to the rest,
-// each a strike against its peer.
+// a strike for each peer that had any, and removes those that struck out.
 func (f *Fetch[P]) expire() {
 	var out []P
 	for p, pr := range f.peers {
