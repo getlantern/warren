@@ -6,6 +6,10 @@ import (
 	"errors"
 	"math"
 	"testing"
+
+	"github.com/getlantern/warren/group/keys"
+	"github.com/getlantern/warren/group/memberlog"
+	"github.com/getlantern/warren/group/roster"
 )
 
 // seal seals data, returning the result and its ciphertext pieces.
@@ -345,5 +349,28 @@ func TestMisshapenBlob(t *testing.T) {
 	}
 	if err := Verify(id, size, ps, 0, short, proof); !errors.Is(err, ErrPiece) {
 		t.Fatalf("a short middle piece: %v", err)
+	}
+}
+
+// TestAnnouncementFitsAnEntry: an announcement with MaxMeta of metadata is
+// a memberlog.Blob entry's body, and opens back to itself.
+func TestAnnouncementFitsAnEntry(t *testing.T) {
+	s, _ := seal(t, random(t, 10), MinPieceSize)
+	b, err := s.Announce(random(t, MaxMeta)).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key keys.EpochKey
+	e, err := memberlog.Write(keys.IdentityFromSeed([32]byte{1}), roster.ID{1}, nil, roster.ID{2}, key, memberlog.Blob, b)
+	if err != nil {
+		t.Fatalf("a MaxMeta announcement as an entry: %v", err)
+	}
+	kind, body, err := e.Open(key)
+	if err != nil || kind != memberlog.Blob || !bytes.Equal(body, b) {
+		t.Fatalf("opened: kind %v, %v", kind, err)
+	}
+	a, err := DecodeAnnouncement(body)
+	if err != nil || a.ID != s.ID || a.Key != s.Key {
+		t.Fatalf("decoded: %v", err)
 	}
 }
