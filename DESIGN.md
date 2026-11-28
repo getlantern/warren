@@ -1036,12 +1036,17 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       the fetch for good, its requests and holdings released, so a peer
       holding pieces back keeps them no longer, and reconnecting
       (strikes are kept per identity) doesn't escape it. A fetch resumes
-      from a bitfield, keeps about 8 bytes a piece (at most
-      `swarm.MaxPieces`), and expects its caller to serialize calls, with
-      peers authenticated members;
+      from a bitfield, keeps about 8 bytes a piece of accounting plus a
+      bit a piece for each peer's holdings (at most `swarm.MaxPieces`
+      pieces), and expects its caller to serialize calls, with peers
+      authenticated members;
    2. the wire protocol: content on its own stream beside the sync
       session (inventories, bitfields, have, request, piece with its
-      proof, cancel), the serving side caching each blob's tree;
+      proof, cancel), the serving side caching each blob's tree. A
+      request the scheduler expires must be cancelled at its peer (the
+      scheduler reporting which), and responses paired with the request
+      they answer, so a late reply to an expired request isn't taken for
+      its retry's;
    3. the node: `Node.Fetch` and a streaming reader moving the playhead,
       serving on or off with a rate cap, the storage budget (least
       recently used evicted), and resuming from what's stored.

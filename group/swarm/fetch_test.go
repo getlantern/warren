@@ -105,6 +105,9 @@ func sim(t testing.TB, f *Fetch[string], c *clock, peers map[string]*simPeer) (t
 			qp := peers[q]
 			if k := slices.Index(qp.queue, i); k >= 0 {
 				qp.queue = slices.Delete(qp.queue, k, k+1)
+				if k == 0 && len(qp.queue) > 0 && qp.rate > 0 { // its piece in service: start the next afresh
+					qp.busy = c.t.Add(time.Duration(pieceSize / qp.rate * float64(time.Second)))
+				}
 			}
 		}
 	}
@@ -142,7 +145,11 @@ func TestRarestFirst(t *testing.T) {
 	f := newFetch(t, n, c, Config{MinDepth: 4})
 	setPeer(t, f, "all", full(n))
 	setPeer(t, f, "half", set(n, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9))
-	for _, i := range f.Next("all") {
+	got := f.Next("all")
+	if len(got) != 4 {
+		t.Fatalf("asked the full peer for %v, want 4 pieces", got)
+	}
+	for _, i := range got {
 		if i < 10 {
 			t.Fatalf("asked the full peer for piece %d, which two peers hold, before the rare ones", i)
 		}
@@ -189,7 +196,11 @@ func TestPlayhead(t *testing.T) {
 	setPeer(t, f2, "some", set(n, 10, 11, 12, 13))
 	f2.SetPlayhead(10)
 	f2.StopStreaming()
-	for _, i := range f2.Next("all") {
+	got2 := f2.Next("all")
+	if len(got2) != 4 {
+		t.Fatalf("after streaming stopped, asked for %v, want 4 pieces", got2)
+	}
+	for _, i := range got2 {
 		if i >= 10 && i <= 13 {
 			t.Fatalf("not streaming, asked for %d, which two peers hold", i)
 		}

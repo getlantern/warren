@@ -50,10 +50,8 @@ func FuzzDecodeBitfield(f *testing.F) {
 		if !bytes.Equal(g.Encode(), b) {
 			t.Fatal("a decoded bitfield doesn't encode back to its bytes")
 		}
-		for i := n; i < uint32(len(b))*8; i++ {
-			if g.Has(i) {
-				t.Fatalf("piece %d past the end is set", i)
-			}
+		if spare := n % 8; spare != 0 && b[len(b)-1]&(0xff>>spare) != 0 {
+			t.Fatal("decoded a bitfield with bits set past its last piece")
 		}
 	})
 }
