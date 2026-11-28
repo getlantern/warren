@@ -706,3 +706,50 @@ func TestRateFollowsRecent(t *testing.T) {
 		t.Fatalf("4s after slowing to 1000 bytes a second, measured %.0f", r)
 	}
 }
+
+// TestRateDecaysWhileBusy: a peer whose pipeline is never empty still has
+// its old throughput halved away once it slows.
+func TestRateDecaysWhileBusy(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 2000, c, Config{MinDepth: 4, MaxDepth: 4})
+	setPeer(t, f, "p", full(2000))
+	f.Next("p")
+	deliver := func(gap time.Duration) {
+		c.t = c.t.Add(gap)
+		f.Received("p", f.peers["p"].firstOut(), pieceSize, true)
+		f.Next("p") // refilled: never empty
+	}
+	for range 1000 {
+		deliver(10 * time.Millisecond) // 10s at 100 pieces a second
+	}
+	for range 4 {
+		deliver(time.Second) // then 4s at 1
+	}
+	if r := f.rate(f.peers["p"]); r > 50000 {
+		t.Fatalf("4s after slowing to 1000 bytes a second, measured %.0f", r)
+	}
+}
+
+// TestSlowStartNotGamed: a peer opening slowly and then trickling a piece
+// a second sees its rate climb, but can't double its way to MaxDepth.
+func TestSlowStartNotGamed(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 200, c, Config{})
+	setPeer(t, f, "p", full(200))
+	f.Next("p")
+	deliver := func(gap time.Duration) {
+		c.t = c.t.Add(gap)
+		f.Received("p", f.peers["p"].firstOut(), pieceSize, true)
+		f.Next("p")
+	}
+	deliver(10 * time.Second)
+	deliver(10 * time.Second)
+	peak := 0
+	for range 60 {
+		deliver(time.Second)
+		peak = max(peak, f.depth(f.peers["p"]))
+	}
+	if peak > 4 {
+		t.Fatalf("a piece-a-second peer's pipeline reached %d", peak)
+	}
+}

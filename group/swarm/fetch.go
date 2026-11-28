@@ -363,6 +363,13 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 				pr.bytes += float64(size)
 			}
 			f.drop(pr, i)
+			// The running spell too, or a pipeline kept full would never
+			// decay.
+			if len(pr.out) > 0 {
+				now := f.cfg.Now()
+				pr.busy += now.Sub(pr.busySince)
+				pr.busySince = now
+			}
 			if pr.busy > maxBusy {
 				pr.bytes, pr.busy = pr.bytes/2, pr.busy/2
 			}
@@ -390,15 +397,18 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 }
 
 // slowStart doubles pr's pipeline each time it delivers a full one, while
-// that keeps raising its rate by slowStartGain; once a doubling doesn't,
-// the pipeline follows its measured rate alone.
+// that keeps raising its rate by slowStartGain and its rate fills the
+// pipeline within TargetRTT (as a pipeline-limited peer's does: a slow
+// one's doesn't, however its rate climbs); once either fails, the
+// pipeline follows its measured rate alone.
 func (f *Fetch[P]) slowStart(pr *peer) {
 	if pr.ssCount++; pr.ssCount < pr.ssDepth {
 		return
 	}
 	pr.ssCount = 0
 	r := f.rate(pr)
-	if pr.ssRate > 0 && r < pr.ssRate*slowStartGain || pr.ssDepth >= f.cfg.MaxDepth {
+	fills := f.cfg.PieceSize == 0 || r*f.cfg.TargetRTT.Seconds()/float64(f.cfg.PieceSize) >= float64(pr.ssDepth)
+	if r > 0 && !fills || pr.ssRate > 0 && r < pr.ssRate*slowStartGain || pr.ssDepth >= f.cfg.MaxDepth {
 		pr.slowStart = false
 		return
 	}
