@@ -1021,7 +1021,8 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       bytes delivered over the time the peer had requests out, measured
       once that's 250 ms and halved past 2 s so it follows the recent
       rate; a new peer's pipeline doubles each time it delivers a full
-      one, while that keeps raising its rate, as in TCP's slow start)
+      one, while each doubling raises its rate, measured afresh per
+      phase, as in TCP's slow start)
       with pieces
       within a window of the playhead in order when streaming, then the
       rarest (availability kept as peers come, go and update; ties fall

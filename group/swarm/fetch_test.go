@@ -434,14 +434,20 @@ func TestResumeMismatch(t *testing.T) {
 }
 
 // TestThroughputThroughLatency: a peer serving 100 pieces a second behind
-// a 500ms round trip gets a pipeline deep enough to use it: back-to-back
-// arrivals measure its rate, not each piece's round trip.
+// a long round trip (half TargetRTT, or as long as it) gets a pipeline
+// deep enough to use it.
 func TestThroughputThroughLatency(t *testing.T) {
+	for _, rtt := range []time.Duration{500 * time.Millisecond, time.Second} {
+		t.Run(rtt.String(), func(t *testing.T) { throughLatency(t, rtt) })
+	}
+}
+
+func throughLatency(t *testing.T, rtt time.Duration) {
 	c := &clock{t: time.Unix(0, 0)}
 	const n = 300
 	f := newFetch(t, n, c, Config{})
 	setPeer(t, f, "p", full(n))
-	const service, rtt = 10 * time.Millisecond, 500 * time.Millisecond
+	const service = 10 * time.Millisecond
 	type arrival struct {
 		at time.Time
 		i  uint32
@@ -468,15 +474,18 @@ func TestThroughputThroughLatency(t *testing.T) {
 		c.t = a.at
 		f.Received("p", a.i, pieceSize, true)
 	}
-	// 300 pieces at 100 a second is 3s plus the round trip; measuring each
-	// piece's round trip kept the pipeline at 2, about 4 pieces a second.
-	if took := c.t.Sub(time.Unix(0, 0)); took > 10*time.Second {
-		t.Fatalf("300 pieces took %v", took)
+	// MaxDepth 32 delivers at most 32 pieces a round trip: 300 take about
+	// 300/32 round trips once ramped, plus the ramp (doubling from 2 is 4
+	// round trips more); a pipeline stuck at 2 takes 150.
+	limit := time.Duration(float64(rtt) * (300.0/32 + 8))
+	if took := c.t.Sub(time.Unix(0, 0)); took > limit {
+		t.Fatalf("300 pieces took %v, over %v", took, limit)
 	}
-	// MaxDepth 32 over a 500ms round trip delivers at most 64000 bytes a
-	// second; the rate, an average over recent busy time, nears it.
-	if r := f.rate(f.peers["p"]); r < 32000 || r > 64000 {
-		t.Fatalf("measured %.0f bytes a second, delivering at most 64000", r)
+	// About 32 pieces a round trip: the blob's tail lands back to back, so
+	// the recent rate can run a little over.
+	most := 32 * pieceSize / rtt.Seconds()
+	if r := f.rate(f.peers["p"]); r < most/2 || r > 1.5*most {
+		t.Fatalf("measured %.0f bytes a second, delivering about %.0f", r, most)
 	}
 }
 
@@ -749,7 +758,8 @@ func TestSlowStartNotGamed(t *testing.T) {
 		deliver(time.Second)
 		peak = max(peak, f.depth(f.peers["p"]))
 	}
-	if peak > 4 {
+	// Its one real speed-up (10s a piece to 1s) earns one doubling more.
+	if peak > 8 {
 		t.Fatalf("a piece-a-second peer's pipeline reached %d", peak)
 	}
 }

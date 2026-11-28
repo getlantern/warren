@@ -106,14 +106,21 @@ type peer struct {
 	bytes     float64
 	busy      time.Duration
 	busySince time.Time
+	// allBytes and allBusy are the same, never halved, for measuring
+	// slow start's phases.
+	allBytes float64
+	allBusy  time.Duration
 	// Slow start: a measured rate only shows what the pipeline allowed,
 	// so while doubling it keeps raising the rate (slowStart), the
 	// pipeline doubles (ssDepth) each time it delivers a full pipeline's
-	// worth (ssCount), against the rate at the last doubling (ssRate).
+	// worth (ssCount). Each phase's rate is measured from where it began
+	// (ssBytes, ssBusy) against the last phase's (ssRate).
 	slowStart bool
 	ssDepth   int
 	ssCount   int
 	ssRate    float64
+	ssBytes   float64
+	ssBusy    time.Duration
 }
 
 // ask records piece i outstanding at pr; drop removes it. Every request
@@ -135,7 +142,9 @@ func (f *Fetch[P]) drop(pr *peer, i uint32) {
 	delete(pr.out, i)
 	f.asked[i]--
 	if len(pr.out) == 0 {
-		pr.busy += f.cfg.Now().Sub(pr.busySince)
+		d := f.cfg.Now().Sub(pr.busySince)
+		pr.busy += d
+		pr.allBusy += d
 	}
 }
 
@@ -361,13 +370,16 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 		if _, ok := pr.out[i]; ok {
 			if verified {
 				pr.bytes += float64(size)
+				pr.allBytes += float64(size)
 			}
 			f.drop(pr, i)
 			// The running spell too, or a pipeline kept full would never
 			// decay.
 			if len(pr.out) > 0 {
 				now := f.cfg.Now()
-				pr.busy += now.Sub(pr.busySince)
+				d := now.Sub(pr.busySince)
+				pr.busy += d
+				pr.allBusy += d
 				pr.busySince = now
 			}
 			if pr.busy > maxBusy {
@@ -397,22 +409,27 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 }
 
 // slowStart doubles pr's pipeline each time it delivers a full one, while
-// that keeps raising its rate by slowStartGain and its rate fills the
-// pipeline within TargetRTT (as a pipeline-limited peer's does: a slow
-// one's doesn't, however its rate climbs); once either fails, the
-// pipeline follows its measured rate alone.
+// each doubling raises its rate by slowStartGain: each phase's rate is
+// measured from where the phase began, so a slow start to a peer's
+// deliveries doesn't make later ones look like gains. A pipeline-limited
+// peer gains with each doubling, whatever its round trip; a slow one
+// stops gaining, and then the pipeline follows its measured rate alone.
 func (f *Fetch[P]) slowStart(pr *peer) {
 	if pr.ssCount++; pr.ssCount < pr.ssDepth {
 		return
 	}
 	pr.ssCount = 0
-	r := f.rate(pr)
-	fills := f.cfg.PieceSize == 0 || r*f.cfg.TargetRTT.Seconds()/float64(f.cfg.PieceSize) >= float64(pr.ssDepth)
-	if r > 0 && !fills || pr.ssRate > 0 && r < pr.ssRate*slowStartGain || pr.ssDepth >= f.cfg.MaxDepth {
+	busy := pr.allBusy - pr.ssBusy
+	if busy <= 0 {
+		return
+	}
+	r := (pr.allBytes - pr.ssBytes) / busy.Seconds()
+	if pr.ssRate > 0 && r < pr.ssRate*slowStartGain || pr.ssDepth >= f.cfg.MaxDepth {
 		pr.slowStart = false
 		return
 	}
 	pr.ssDepth, pr.ssRate = min(2*pr.ssDepth, f.cfg.MaxDepth), r
+	pr.ssBytes, pr.ssBusy = pr.allBytes, pr.allBusy
 }
 
 // slowStartGain is the rise in rate a doubling must bring to keep doubling.
