@@ -156,9 +156,8 @@ func Seal(r io.Reader, pieceSize uint32, put func(i uint32, piece []byte) error)
 	buf := make([]byte, pieceSize)
 	var leaves []Hash
 	for i := uint32(0); ; i++ {
-		n, err := io.ReadFull(r, buf)
-		last := err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF)
-		if err != nil && !last {
+		n, last, err := fill(r, buf)
+		if err != nil {
 			return nil, err
 		}
 		if n == 0 && i > 0 {
@@ -180,6 +179,24 @@ func Seal(r io.Reader, pieceSize uint32, put func(i uint32, piece []byte) error)
 	s.Tree = NewTree(leaves)
 	s.ID = BlobID(s.Tree.Root(), s.Size, s.PieceSize)
 	return s, nil
+}
+
+// fill reads into buf until it's full or r ends: last reports an io.EOF
+// from r, and any other error is returned. Unlike io.ReadFull, a reader's
+// own io.ErrUnexpectedEOF (a truncated gzip stream, say) is an error, not
+// the blob's end.
+func fill(r io.Reader, buf []byte) (n int, last bool, err error) {
+	for n < len(buf) {
+		m, err := r.Read(buf[n:])
+		n += m
+		if err == io.EOF {
+			return n, true, nil
+		}
+		if err != nil {
+			return n, false, err
+		}
+	}
+	return n, false, nil
 }
 
 // Open decrypts piece i of a blob sealed under key (ErrOpen). Verify the

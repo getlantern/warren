@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"io"
 	"math"
 	"testing"
 
@@ -198,6 +199,26 @@ func TestSealErrors(t *testing.T) {
 		t.Fatalf("the reader's error: %v", err)
 	}
 }
+
+// TestSealTruncatedReader: a reader reporting its own truncation
+// (io.ErrUnexpectedEOF, as a cut gzip stream does) fails the seal, rather
+// than sealing what came before as the whole blob.
+func TestSealTruncatedReader(t *testing.T) {
+	r := io.MultiReader(bytes.NewReader(random(t, 100)), errReader{io.ErrUnexpectedEOF})
+	if _, err := Seal(r, MinPieceSize, func(uint32, []byte) error { return nil }); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("a truncated reader: %v", err)
+	}
+	// A reader returning data with io.EOF in the same call ends cleanly.
+	got, err := Seal(dataEOF{[]byte("abc")}, MinPieceSize, func(uint32, []byte) error { return nil })
+	if err != nil || got.Size != 3 {
+		t.Fatalf("data with io.EOF: %v", err)
+	}
+}
+
+// dataEOF returns its data and io.EOF in one call.
+type dataEOF struct{ b []byte }
+
+func (d dataEOF) Read(p []byte) (int, error) { return copy(p, d.b), io.EOF }
 
 type errReader struct{ err error }
 
