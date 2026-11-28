@@ -36,7 +36,11 @@ func newFetch(t testing.TB, n uint32, c *clock, cfg Config) *Fetch[string] {
 	cfg.PieceSize = pieceSize
 	cfg.Now = c.now
 	cfg.Rand = rand.New(rand.NewPCG(1, 2))
-	return NewFetch[string](n, nil, cfg)
+	f, err := NewFetch[string](n, nil, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
 }
 
 func setPeer(t testing.TB, f *Fetch[string], p string, has *Bitfield) {
@@ -150,7 +154,10 @@ func TestRarestTiesRandom(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	first := map[uint32]bool{}
 	for seed := range uint64(8) {
-		f := NewFetch[string](64, nil, Config{PieceSize: pieceSize, Now: c.now, Rand: rand.New(rand.NewPCG(seed, seed))})
+		f, err := NewFetch[string](64, nil, Config{PieceSize: pieceSize, Now: c.now, Rand: rand.New(rand.NewPCG(seed, seed))})
+		if err != nil {
+			t.Fatal(err)
+		}
 		setPeer(t, f, "p", full(64))
 		first[f.Next("p")[0]] = true
 	}
@@ -179,6 +186,8 @@ func TestPlayhead(t *testing.T) {
 	f2 := newFetch(t, n, c, Config{MinDepth: 4, Window: 4})
 	setPeer(t, f2, "all", full(n))
 	setPeer(t, f2, "some", set(n, 10, 11, 12, 13))
+	f2.SetPlayhead(10)
+	f2.StopStreaming()
 	for _, i := range f2.Next("all") {
 		if i >= 10 && i <= 13 {
 			t.Fatalf("not streaming, asked for %d, which two peers hold", i)
@@ -351,7 +360,10 @@ func TestResume(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	const n = 8
 	have := set(n, 0, 1, 2, 3, 4, 5)
-	f := NewFetch[string](n, have, Config{PieceSize: pieceSize, Now: c.now, MinDepth: 8})
+	f, err := NewFetch[string](n, have, Config{PieceSize: pieceSize, Now: c.now, MinDepth: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
 	setPeer(t, f, "p", full(n))
 	got := f.Next("p")
 	slices.Sort(got)
@@ -384,5 +396,91 @@ func TestPeerHas(t *testing.T) {
 	}
 	if err := f.SetPeer("q", NewBitfield(5)); !errors.Is(err, ErrBitfield) {
 		t.Fatalf("a bitfield for another piece count: %v", err)
+	}
+}
+
+// TestResumeMismatch: a resume bitfield for another piece count is refused.
+func TestResumeMismatch(t *testing.T) {
+	for _, m := range []uint32{3, 5} {
+		if _, err := NewFetch[string](4, NewBitfield(m), Config{}); !errors.Is(err, ErrBitfield) {
+			t.Fatalf("a %d-piece resume for a 4-piece blob: %v", m, err)
+		}
+	}
+}
+
+// TestThroughputThroughLatency: a peer serving 100 pieces a second behind
+// a 500ms round trip gets a pipeline deep enough to use it: back-to-back
+// arrivals measure its rate, not each piece's round trip.
+func TestThroughputThroughLatency(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 300
+	f := newFetch(t, n, c, Config{})
+	setPeer(t, f, "p", full(n))
+	const service, rtt = 10 * time.Millisecond, 500 * time.Millisecond
+	type arrival struct {
+		at time.Time
+		i  uint32
+	}
+	var arrivals []arrival
+	var free time.Time // when the peer finishes what it's serving
+	for steps := 0; !f.Done(); steps++ {
+		if steps > 10*n {
+			t.Fatal("runaway")
+		}
+		for _, i := range f.Next("p") {
+			start := c.t.Add(rtt / 2)
+			if free.After(start) {
+				start = free
+			}
+			free = start.Add(service)
+			arrivals = append(arrivals, arrival{free.Add(rtt / 2), i})
+		}
+		if len(arrivals) == 0 {
+			t.Fatal("stuck")
+		}
+		a := arrivals[0]
+		arrivals = arrivals[1:]
+		c.t = a.at
+		f.Received("p", a.i, pieceSize, true)
+	}
+	// 300 pieces at 100 a second is 3s plus the round trip; measuring each
+	// piece's round trip kept the pipeline at 2, about 4 pieces a second.
+	if took := c.t.Sub(time.Unix(0, 0)); took > 10*time.Second {
+		t.Fatalf("300 pieces took %v", took)
+	}
+}
+
+// TestEndgameIgnoresUnavailable: a piece nobody holds doesn't keep a
+// stalled peer's piece from being stolen.
+func TestEndgameIgnoresUnavailable(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 3
+	f := newFetch(t, n, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "stuck", set(n, 0))
+	if got := f.Next("stuck"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("stuck asked for %v", got)
+	}
+	setPeer(t, f, "good", set(n, 0, 1))
+	got := f.Next("good")
+	if !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("good asked for %v", got)
+	}
+	f.Received("good", 1, pieceSize, true)
+	if got := f.Next("good"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("with piece 2 held by no one, good stole %v, want 0", got)
+	}
+}
+
+// TestStrikesSurviveRemoval: a peer that leaves and comes back keeps its
+// strikes.
+func TestStrikesSurviveRemoval(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MaxStrikes: 1, MinDepth: 1})
+	setPeer(t, f, "bad", full(4))
+	f.Received("bad", f.Next("bad")[0], pieceSize, false)
+	f.RemovePeer("bad")
+	setPeer(t, f, "bad", full(4))
+	if got := f.Next("bad"); got != nil || f.Strikes("bad") != 1 {
+		t.Fatalf("back after its strike, asked for %v with %d strikes", got, f.Strikes("bad"))
 	}
 }

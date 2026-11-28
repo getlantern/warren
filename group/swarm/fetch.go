@@ -59,11 +59,16 @@ func (c Config) withDefaults() Config {
 // average.
 const rateWeight = 0.3
 
-// Fetch is one blob's fetch from a set of peers, identified by P.
+// Fetch is one blob's fetch from a set of peers, identified by P. It isn't
+// safe for concurrent use: one owner drives it, or callers serialize every
+// call, reads included.
 type Fetch[P comparable] struct {
 	cfg   Config
 	have  *Bitfield
 	peers map[P]*peer
+	// strikes outlive a peer's removal, so leaving and coming back doesn't
+	// clear them.
+	strikes map[P]int
 	// avail counts, per piece, the peers holding it; asked how many peers
 	// have a piece outstanding.
 	avail, asked []int
@@ -73,20 +78,24 @@ type Fetch[P comparable] struct {
 }
 
 type peer struct {
-	has     *Bitfield
-	out     map[uint32]time.Time // pieces requested, and when
-	rate    float64              // bytes per second, a moving average; 0 unmeasured
-	strikes int
+	has  *Bitfield
+	out  map[uint32]time.Time // pieces requested, and when
+	rate float64              // bytes per second, a moving average; 0 unmeasured
+	last time.Time            // when its last piece arrived
 }
 
 // NewFetch starts fetching a blob of n pieces, holding have already (nil
-// for none; a partial download resumes from it).
-func NewFetch[P comparable](n uint32, have *Bitfield, cfg Config) *Fetch[P] {
+// for none; a partial download resumes from it). A have for another piece
+// count is refused (ErrBitfield).
+func NewFetch[P comparable](n uint32, have *Bitfield, cfg Config) (*Fetch[P], error) {
 	if have == nil {
 		have = NewBitfield(n)
 	}
-	return &Fetch[P]{cfg: cfg.withDefaults(), have: have.Clone(), peers: map[P]*peer{},
-		avail: make([]int, n), asked: make([]int, n)}
+	if have.Len() != n {
+		return nil, ErrBitfield
+	}
+	return &Fetch[P]{cfg: cfg.withDefaults(), have: have.Clone(), peers: map[P]*peer{}, strikes: map[P]int{},
+		avail: make([]int, n), asked: make([]int, n)}, nil
 }
 
 // Have is a copy of the pieces held.
@@ -172,11 +181,12 @@ func (f *Fetch[P]) wanted(pr *peer, i uint32) bool {
 // Next returns the pieces to request from peer p now, filling its
 // pipeline, and records them outstanding. Unrequested pieces come first:
 // those within Window of the playhead in order when streaming, then the
-// rarest. Once every missing piece is asked of someone (the endgame), it
-// steals: duplicates of the longest outstanding requests to others.
+// rarest. Once every missing piece some peer holds is asked of someone
+// (the endgame; pieces nobody holds don't hold it off), it steals:
+// duplicates of the longest outstanding requests to others.
 func (f *Fetch[P]) Next(p P) []uint32 {
 	pr := f.peers[p]
-	if pr == nil || pr.strikes >= f.cfg.MaxStrikes {
+	if pr == nil || f.strikes[p] >= f.cfg.MaxStrikes {
 		return nil
 	}
 	slots := f.depth(pr) - len(pr.out)
@@ -204,7 +214,7 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 		if f.have.Has(i) {
 			continue
 		}
-		if f.asked[i] == 0 {
+		if f.asked[i] == 0 && f.avail[i] > 0 {
 			endgame = false
 			if f.wanted(pr, i) {
 				fresh = append(fresh, i)
@@ -269,10 +279,18 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 		return nil
 	}
 	if pr := f.peers[p]; pr != nil {
+		now := f.cfg.Now()
 		if at, ok := pr.out[i]; ok {
 			delete(pr.out, i)
 			f.asked[i]--
-			if el := f.cfg.Now().Sub(at).Seconds(); verified && el > 0 {
+			// From the later of the request and the peer's last delivery:
+			// back to back, pieces measure its rate, not the round trip or
+			// the wait behind the others in its pipeline.
+			start := at
+			if pr.last.After(start) {
+				start = pr.last
+			}
+			if el := now.Sub(start).Seconds(); verified && el > 0 {
 				sample := float64(size) / el
 				if pr.rate == 0 {
 					pr.rate = sample
@@ -281,8 +299,10 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 				}
 			}
 		}
-		if !verified {
-			pr.strikes++
+		if verified {
+			pr.last = now
+		} else {
+			f.strikes[p]++
 		}
 	}
 	if !verified || f.have.Has(i) {
@@ -307,10 +327,6 @@ func (f *Fetch[P]) Outstanding(p P) int {
 	return 0
 }
 
-// Strikes is how many pieces from peer p failed verification.
-func (f *Fetch[P]) Strikes(p P) int {
-	if pr := f.peers[p]; pr != nil {
-		return pr.strikes
-	}
-	return 0
-}
+// Strikes is how many pieces from peer p failed verification in this
+// fetch, kept across its removal.
+func (f *Fetch[P]) Strikes(p P) int { return f.strikes[p] }
