@@ -930,3 +930,31 @@ func TestNegativeDepths(t *testing.T) {
 		t.Fatalf("with negative depths, asked for %v", got)
 	}
 }
+
+// TestOneStallPolledOften: requests asked a second apart that all go
+// unanswered are one stall, however often expiry looks; requests asked
+// after the strike can earn another.
+func TestOneStallPolledOften(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 10, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "p", full(10))
+	setPeer(t, f, "idle", NewBitfield(10))
+	pr := f.peers["p"]
+	for k := range uint32(3) {
+		f.ask(pr, k)
+		c.t = c.t.Add(time.Second)
+	}
+	for _, at := range []time.Duration{15500, 16500, 17500} { // ms
+		c.t = time.Unix(0, 0).Add(at * time.Millisecond)
+		f.Next("idle") // expiry polls
+	}
+	if f.Strikes("p") != 1 {
+		t.Fatalf("one continuous stall polled three times: %d strikes", f.Strikes("p"))
+	}
+	f.ask(f.peers["p"], 5) // asked after the strike
+	c.t = c.t.Add(16 * time.Second)
+	f.Next("idle")
+	if f.Strikes("p") != 2 {
+		t.Fatalf("a later request timing out: %d strikes, want 2", f.Strikes("p"))
+	}
+}

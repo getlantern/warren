@@ -125,6 +125,10 @@ type peer struct {
 	busy      time.Duration
 	busySince time.Time
 	lastAt    time.Time // its last delivery
+	// chargedAt is when it was last struck for a stall: requests asked
+	// before then that time out later are part of that stall; those asked
+	// since are a new one.
+	chargedAt time.Time
 }
 
 // ask records piece i outstanding at pr; drop removes it. Every request
@@ -379,20 +383,25 @@ func (f *Fetch[P]) expire() {
 }
 
 // overdue drops pr's requests past RequestTimeout, and strikes p once if
-// any were (one stall is one strike, however deep its pipeline), wherever
-// that's noticed: Next, a delivery, a cancellation or removal. It reports
-// whether p has struck out, for the caller to remove it.
+// any were asked since its last stall was charged (one stall is one
+// strike, however deep its pipeline or however often it's polled),
+// wherever that's noticed: Next, a delivery, a cancellation or removal.
+// It reports whether p has struck out, for the caller to remove it.
 func (f *Fetch[P]) overdue(p P, pr *peer) bool {
-	cutoff := f.cfg.Now().Add(-f.cfg.RequestTimeout)
-	late := false
+	now := f.cfg.Now()
+	cutoff := now.Add(-f.cfg.RequestTimeout)
+	fresh := false // a request asked after the last stall was charged
 	for i, at := range pr.out {
 		if at.Before(cutoff) {
 			f.drop(pr, i)
-			late = true
+			if !at.Before(pr.chargedAt) { // asked at or after the last charge
+				fresh = true
+			}
 		}
 	}
-	if late {
+	if fresh {
 		f.strikes[p]++
+		pr.chargedAt = now
 	}
 	return f.strikes[p] >= f.cfg.MaxStrikes
 }
