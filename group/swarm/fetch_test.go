@@ -754,6 +754,37 @@ func TestWithholdingPeer(t *testing.T) {
 	if !f.Have().Has(0) || !f.Have().Has(1) {
 		t.Fatalf("the honest peer's pieces never came: have %v, honest asked %v", f.Have().Encode(), got)
 	}
+	// Reconnecting doesn't clear it: polled first again, w doesn't get
+	// back pieces the honest peer holds.
+	h := newFetch(t, n, c, Config{})
+	setPeer(t, h, "w", full(n))
+	setPeer(t, h, "honest", set(n, 0, 1))
+	h.SetPlayhead(0)
+	h.Next("w")
+	c.t = c.t.Add(16 * time.Second)
+	h.Next("honest") // expires w's requests
+	h.RemovePeer("w")
+	setPeer(t, h, "w", full(n))
+	for _, i := range h.Next("w") {
+		if i == 0 || i == 1 {
+			t.Fatalf("w, reconnected, asked again for piece %d the honest peer holds", i)
+		}
+	}
+	// When every holder has timed out on a piece, any may be asked again.
+	k := newFetch(t, 1, c, Config{})
+	setPeer(t, k, "a", full(1))
+	setPeer(t, k, "b", full(1))
+	k.Next("a")
+	c.t = c.t.Add(16 * time.Second)
+	if got := k.Next("b"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("after a timed out, b asked for %v", got)
+	}
+	c.t = c.t.Add(16 * time.Second)
+	got0 := k.Next("a") // b's timed out too
+	got1 := k.Next("b")
+	if len(got0)+len(got1) == 0 {
+		t.Fatal("with every holder timed out on it, the piece is never asked again")
+	}
 	// The only holder of a piece it timed out on is still asked for it.
 	g := newFetch(t, 1, c, Config{})
 	setPeer(t, g, "slow", full(1))

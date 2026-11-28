@@ -18,8 +18,9 @@ type Config struct {
 	QueueTime time.Duration
 	// RequestTimeout is how long a request may stay outstanding before
 	// it goes back to the other peers (15s), and isn't asked of that peer
-	// again while another holds it: a peer holding its pieces back keeps
-	// them no longer. It may still deliver one late.
+	// again while a holder that hasn't timed out on it remains: a peer
+	// holding its pieces back keeps them no longer. It may still deliver
+	// one late.
 	RequestTimeout time.Duration
 	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
 	// peer not yet measured gets MinDepth; a pipeline-limited one measures
@@ -98,9 +99,10 @@ type Fetch[P comparable] struct {
 	cfg   Config
 	have  *Bitfield
 	peers map[P]*peer
-	// strikes outlive a peer's removal, so leaving and coming back doesn't
-	// clear them.
-	strikes map[P]int
+	// strikes, and the pieces each peer held past RequestTimeout, outlive
+	// its removal, so leaving and coming back doesn't clear them.
+	strikes  map[P]int
+	timedOut map[P]map[uint32]bool
 	// avail counts, per piece, the peers holding it; asked how many peers
 	// have a piece outstanding.
 	avail, asked []int32
@@ -112,9 +114,6 @@ type Fetch[P comparable] struct {
 type peer struct {
 	has *Bitfield
 	out map[uint32]time.Time // pieces requested, and when
-	// timedOut is the pieces it held past RequestTimeout: it isn't asked
-	// for one again while another peer holds it.
-	timedOut map[uint32]bool
 	// Throughput: bytes delivered over busy time, plus the busy spell
 	// running since busySince while out isn't empty.
 	bytes     float64
@@ -171,7 +170,7 @@ func NewFetch[P comparable](n uint32, have *Bitfield, cfg Config) (*Fetch[P], er
 	if have.Len() != n {
 		return nil, ErrBitfield
 	}
-	return &Fetch[P]{cfg: cfg.withDefaults(), have: have.Clone(), peers: map[P]*peer{}, strikes: map[P]int{},
+	return &Fetch[P]{cfg: cfg.withDefaults(), have: have.Clone(), peers: map[P]*peer{}, strikes: map[P]int{}, timedOut: map[P]map[uint32]bool{},
 		avail: make([]int32, n), asked: make([]int32, n)}, nil
 }
 
@@ -193,7 +192,7 @@ func (f *Fetch[P]) SetPeer(p P, has *Bitfield) error {
 	}
 	pr := f.peers[p]
 	if pr == nil {
-		pr = &peer{out: map[uint32]time.Time{}, timedOut: map[uint32]bool{}}
+		pr = &peer{out: map[uint32]time.Time{}}
 		f.peers[p] = pr
 	} else {
 		f.count(pr.has, -1)
@@ -252,11 +251,21 @@ func (f *Fetch[P]) depth(pr *peer) int {
 }
 
 // wanted reports whether p could be asked for piece i: missing here, held
-// by p, not already asked of it, and not one it timed out on while another
-// peer holds it.
-func (f *Fetch[P]) wanted(pr *peer, i uint32) bool {
-	_, out := pr.out[i]
-	return !f.have.Has(i) && pr.has.Has(i) && !out && (!pr.timedOut[i] || f.avail[i] <= 1)
+// by p, not already asked of it, and, if p timed out on it before, with no
+// other holder that hasn't (once every holder has, any may be asked again).
+func (f *Fetch[P]) wanted(p P, pr *peer, i uint32) bool {
+	if _, out := pr.out[i]; out || f.have.Has(i) || !pr.has.Has(i) {
+		return false
+	}
+	if !f.timedOut[p][i] {
+		return true
+	}
+	for q, qr := range f.peers {
+		if q != p && qr.has.Has(i) && !f.timedOut[q][i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Next returns the pieces to request from peer p now, filling its
@@ -285,7 +294,7 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 	n := f.have.Len()
 	if f.streaming {
 		for i := f.playhead; i < n && i-f.playhead < f.cfg.Window && slots > 0; i++ {
-			if f.asked[i] == 0 && f.wanted(pr, i) {
+			if f.asked[i] == 0 && f.wanted(p, pr, i) {
 				ask(i)
 			}
 		}
@@ -300,7 +309,7 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 		}
 		if f.asked[i] == 0 && f.avail[i] > 0 {
 			unasked++
-			if f.wanted(pr, i) {
+			if f.wanted(p, pr, i) {
 				fresh = append(fresh, i)
 			}
 		}
@@ -324,11 +333,14 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 // expire gives requests outstanding past RequestTimeout back to the rest.
 func (f *Fetch[P]) expire() {
 	cutoff := f.cfg.Now().Add(-f.cfg.RequestTimeout)
-	for _, pr := range f.peers {
+	for p, pr := range f.peers {
 		for i, at := range pr.out {
 			if at.Before(cutoff) {
 				f.drop(pr, i)
-				pr.timedOut[i] = true
+				if f.timedOut[p] == nil {
+					f.timedOut[p] = map[uint32]bool{}
+				}
+				f.timedOut[p][i] = true
 			}
 		}
 	}
@@ -347,7 +359,7 @@ func (f *Fetch[P]) steal(p P, pr *peer, ask func(uint32), slots int) {
 			continue
 		}
 		for i, at := range qr.out {
-			if t, ok := oldest[i]; (!ok || at.Before(t)) && f.wanted(pr, i) {
+			if t, ok := oldest[i]; (!ok || at.Before(t)) && f.wanted(p, pr, i) {
 				oldest[i] = at
 			}
 		}
