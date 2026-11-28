@@ -3,6 +3,7 @@ package swarm
 import (
 	"errors"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -859,5 +860,23 @@ func TestFailuresAlwaysStrike(t *testing.T) {
 	f.Received("bad", 1, pieceSize, false) // its verification finished after it left
 	if err := f.SetPeer("bad", full(4)); !errors.Is(err, ErrStruckOut) {
 		t.Fatalf("back after two failures: %v", err)
+	}
+}
+
+// TestNextAllocatesLittle: choosing a few pieces from a large blob doesn't
+// build a list the size of the blob.
+func TestNextAllocatesLittle(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 1 << 20
+	f := newFetch(t, n, c, Config{MinDepth: 4, MaxDepth: 4})
+	setPeer(t, f, "p", full(n))
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if got := f.Next("p"); len(got) != 4 {
+		t.Fatalf("asked for %d", len(got))
+	}
+	runtime.ReadMemStats(&after)
+	if d := after.TotalAlloc - before.TotalAlloc; d > 64<<10 {
+		t.Fatalf("one Next on a %d-piece blob allocated %d bytes", n, d)
 	}
 }

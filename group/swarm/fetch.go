@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"container/heap"
 	"errors"
 	"math/rand/v2"
 	"slices"
@@ -291,35 +292,70 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 			}
 		}
 	}
-	// unasked counts the missing pieces some peer holds that no one is
-	// asked for: the endgame is when none are left.
-	var fresh []uint32
+	if slots == 0 {
+		return picks
+	}
+	// One pass: unasked counts the missing pieces some peer holds that no
+	// one is asked for (the endgame is when none are left), and rarest
+	// keeps the slots rarest p can be asked for, ties falling randomly,
+	// in a bounded heap rather than a list the size of the blob.
+	rarest := &candidates{}
 	unasked := 0
 	for i := range n {
-		if f.have.Has(i) {
+		if f.have.Has(i) || f.asked[i] != 0 || f.avail[i] == 0 {
 			continue
 		}
-		if f.asked[i] == 0 && f.avail[i] > 0 {
-			unasked++
-			if f.wanted(pr, i) {
-				fresh = append(fresh, i)
-			}
+		unasked++
+		if !f.wanted(pr, i) {
+			continue
+		}
+		c := candidate{i: i, avail: f.avail[i], tie: f.cfg.Rand.Uint64()}
+		if rarest.Len() < slots {
+			heap.Push(rarest, c)
+		} else if c.less((*rarest)[0]) {
+			(*rarest)[0] = c
+			heap.Fix(rarest, 0)
 		}
 	}
-	// Rarest first; shuffled first so ties fall randomly.
-	f.cfg.Rand.Shuffle(len(fresh), func(a, b int) { fresh[a], fresh[b] = fresh[b], fresh[a] })
-	slices.SortStableFunc(fresh, func(a, b uint32) int { return int(f.avail[a]) - int(f.avail[b]) })
-	for _, i := range fresh {
-		if slots == 0 {
-			break
-		}
-		ask(i)
+	picked := make([]candidate, rarest.Len())
+	for k := len(picked) - 1; k >= 0; k-- {
+		picked[k] = heap.Pop(rarest).(candidate)
+	}
+	for _, c := range picked {
+		ask(c.i)
 		unasked--
 	}
 	if slots > 0 && unasked == 0 {
 		f.steal(p, pr, ask, slots)
 	}
 	return picks
+}
+
+// candidate is a piece to ask for, ordered rarest first, then by a random
+// tie-breaker.
+type candidate struct {
+	i     uint32
+	avail int32
+	tie   uint64
+}
+
+func (c candidate) less(d candidate) bool {
+	return c.avail < d.avail || c.avail == d.avail && c.tie < d.tie
+}
+
+// candidates is a max-heap of candidates: its top is the least rare kept,
+// the one to drop for a rarer.
+type candidates []candidate
+
+func (h candidates) Len() int           { return len(h) }
+func (h candidates) Less(a, b int) bool { return h[b].less(h[a]) }
+func (h candidates) Swap(a, b int)      { h[a], h[b] = h[b], h[a] }
+func (h *candidates) Push(x any)        { *h = append(*h, x.(candidate)) }
+func (h *candidates) Pop() any {
+	old := *h
+	c := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return c
 }
 
 // expire gives requests outstanding past RequestTimeout back to the rest,
