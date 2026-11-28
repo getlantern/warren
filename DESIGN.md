@@ -1016,26 +1016,25 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       with a canonical encoding (BitTorrent's bit order; decoding refuses
       a wrong length or bits past the last piece). A `Fetch` per blob
       tracks pieces held, each peer's bitfield and updates, and requests
-      outstanding; `Next(peer)` fills the peer's pipeline (its measured
-      throughput times a target round trip, or twice the peer's shortest
-      round trip if longer, so a distant peer's pipeline doesn't shrink
-      with its own throughput, within bounds; throughput is
-      bytes delivered over the time the peer had requests out, measured
-      once that's 250 ms and halved past 2 s so it follows the recent
-      rate; a new peer's pipeline doubles each time it delivers a full
-      one, while each doubling raises its rate, measured afresh per
-      phase, as in TCP's slow start)
-      with pieces
-      within a window of the playhead in order when streaming, then the
+      outstanding. `Next(peer)` fills the peer's pipeline with pieces
+      within a window of the playhead, in order, when streaming; then the
       rarest (availability kept as peers come, go and update; ties fall
-      randomly), and in the endgame steals the longest outstanding
-      requests from others (pieces no peer holds don't hold the endgame
-      off). `Received` keeps only verified pieces and names the peers to
-      cancel duplicates at; a failed piece is a strike, and a peer that
-      strikes out leaves the fetch for good, its requests and holdings
-      released. A fetch resumes from a bitfield, keeps about 8 bytes a
-      piece (at most `swarm.MaxPieces`), and expects its caller to
-      serialize calls, with peers authenticated members;
+      randomly); and in the endgame steals the longest outstanding
+      requests from others (pieces no peer holds don't hold it off). A
+      pipeline holds 3 s of the peer's measured throughput, as
+      libtorrent's request queue time, within bounds. Throughput is bytes
+      delivered over the time the peer had requests out, measured once
+      that's 250 ms and halved past 2 s so it follows the recent rate; a
+      pipeline-limited peer measures its depth over its round trip, so
+      its pipeline grows until throughput is the limit, for any round trip
+      under 3 s. A request outstanding 15 s goes back to the others, so a
+      peer holding pieces back keeps them no longer. `Received` keeps only
+      verified pieces and names the peers to cancel duplicates at; a
+      failed piece is a strike, and a peer that strikes out leaves the
+      fetch for good, its requests and holdings released. A fetch resumes
+      from a bitfield, keeps about 8 bytes a piece (at most
+      `swarm.MaxPieces`), and expects its caller to serialize calls, with
+      peers authenticated members;
    2. the wire protocol: content on its own stream beside the sync
       session (inventories, bitfields, have, request, piece with its
       proof, cancel), the serving side caching each blob's tree;

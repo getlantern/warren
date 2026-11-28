@@ -11,13 +11,19 @@ import (
 type Config struct {
 	// PieceSize is the blob's piece size, for sizing pipelines.
 	PieceSize uint32
-	// TargetRTT is how much of a peer's measured throughput to keep in
-	// flight: its pipeline holds TargetRTT's worth of pieces (1s), or
-	// twice its shortest round trip's worth if that's longer.
-	TargetRTT time.Duration
+	// QueueTime is how much of a peer's measured throughput to keep
+	// requested: its pipeline holds QueueTime's worth of pieces (3s, as
+	// libtorrent's request queue time). Any round trip shorter than it
+	// is covered.
+	QueueTime time.Duration
+	// RequestTimeout is how long a request may stay outstanding before
+	// it goes back to the other peers (15s): a peer holding its pieces
+	// back keeps them no longer. It may still deliver one late.
+	RequestTimeout time.Duration
 	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
-	// peer starts at MinDepth, doubling as it shows it can fill more (slow
-	// start).
+	// peer not yet measured gets MinDepth; a pipeline-limited one measures
+	// its depth over its round trip, so QueueTime of that grows its
+	// pipeline until its throughput, not the pipeline, is the limit.
 	MinDepth, MaxDepth int
 	// Window is how many pieces from the playhead are fetched in order
 	// when streaming (8).
@@ -32,8 +38,11 @@ type Config struct {
 }
 
 func (c Config) withDefaults() Config {
-	if c.TargetRTT == 0 {
-		c.TargetRTT = time.Second
+	if c.QueueTime == 0 {
+		c.QueueTime = 3 * time.Second
+	}
+	if c.RequestTimeout == 0 {
+		c.RequestTimeout = 15 * time.Second
 	}
 	if c.MinDepth == 0 {
 		c.MinDepth = 2
@@ -107,24 +116,6 @@ type peer struct {
 	bytes     float64
 	busy      time.Duration
 	busySince time.Time
-	// minLat is the shortest a piece took from request to delivery: the
-	// round trip with the least queueing.
-	minLat time.Duration
-	// allBytes and allBusy are the same, never halved, for measuring
-	// slow start's phases.
-	allBytes float64
-	allBusy  time.Duration
-	// Slow start: a measured rate only shows what the pipeline allowed,
-	// so while doubling it keeps raising the rate (slowStart), the
-	// pipeline doubles (ssDepth) each time it delivers a full pipeline's
-	// worth (ssCount). Each phase's rate is measured from where it began
-	// (ssBytes, ssBusy) against the last phase's (ssRate).
-	slowStart bool
-	ssDepth   int
-	ssCount   int
-	ssRate    float64
-	ssBytes   float64
-	ssBusy    time.Duration
 }
 
 // ask records piece i outstanding at pr; drop removes it. Every request
@@ -146,9 +137,7 @@ func (f *Fetch[P]) drop(pr *peer, i uint32) {
 	delete(pr.out, i)
 	f.asked[i]--
 	if len(pr.out) == 0 {
-		d := f.cfg.Now().Sub(pr.busySince)
-		pr.busy += d
-		pr.allBusy += d
+		pr.busy += f.cfg.Now().Sub(pr.busySince)
 	}
 }
 
@@ -200,7 +189,7 @@ func (f *Fetch[P]) SetPeer(p P, has *Bitfield) error {
 	}
 	pr := f.peers[p]
 	if pr == nil {
-		pr = &peer{out: map[uint32]time.Time{}, slowStart: true, ssDepth: f.cfg.MinDepth}
+		pr = &peer{out: map[uint32]time.Time{}}
 		f.peers[p] = pr
 	} else {
 		f.count(pr.has, -1)
@@ -249,18 +238,11 @@ func (f *Fetch[P]) SetPlayhead(i uint32) { f.streaming, f.playhead = true, i }
 // StopStreaming goes back to rarest first throughout.
 func (f *Fetch[P]) StopStreaming() { f.streaming = false }
 
-// depth is peer pr's pipeline: its measured throughput over TargetRTT, or
-// over twice its shortest round trip if longer, so a peer farther away
-// than TargetRTT keeps the pipeline its throughput needs rather than
-// shrinking with it (in flight is throughput times round trip).
+// depth is peer pr's pipeline: QueueTime of its measured throughput.
 func (f *Fetch[P]) depth(pr *peer) int {
 	d := f.cfg.MinDepth
 	if r := f.rate(pr); r > 0 && f.cfg.PieceSize > 0 {
-		horizon := max(f.cfg.TargetRTT, 2*pr.minLat)
-		d = int(r * horizon.Seconds() / float64(f.cfg.PieceSize))
-	}
-	if pr.slowStart {
-		d = max(d, pr.ssDepth)
+		d = int(r * f.cfg.QueueTime.Seconds() / float64(f.cfg.PieceSize))
 	}
 	return min(max(d, f.cfg.MinDepth), f.cfg.MaxDepth)
 }
@@ -277,12 +259,14 @@ func (f *Fetch[P]) wanted(pr *peer, i uint32) bool {
 // those within Window of the playhead in order when streaming, then the
 // rarest. Once every missing piece some peer holds is asked of someone
 // (the endgame; pieces nobody holds don't hold it off), it steals:
-// duplicates of the longest outstanding requests to others.
+// duplicates of the longest outstanding requests to others. First, every
+// peer's requests past RequestTimeout go back to the rest.
 func (f *Fetch[P]) Next(p P) []uint32 {
 	pr := f.peers[p]
 	if pr == nil {
 		return nil
 	}
+	f.expire()
 	slots := f.depth(pr) - len(pr.out)
 	if slots <= 0 {
 		return nil
@@ -332,6 +316,18 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 	return picks
 }
 
+// expire gives requests outstanding past RequestTimeout back to the rest.
+func (f *Fetch[P]) expire() {
+	cutoff := f.cfg.Now().Add(-f.cfg.RequestTimeout)
+	for _, pr := range f.peers {
+		for i, at := range pr.out {
+			if at.Before(cutoff) {
+				f.drop(pr, i)
+			}
+		}
+	}
+}
+
 // steal asks p for pieces outstanding at other peers, longest outstanding
 // first.
 func (f *Fetch[P]) steal(p P, pr *peer, ask func(uint32), slots int) {
@@ -375,29 +371,20 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 		return nil
 	}
 	if pr := f.peers[p]; pr != nil {
-		if at, ok := pr.out[i]; ok {
+		if _, ok := pr.out[i]; ok {
 			if verified {
 				pr.bytes += float64(size)
-				pr.allBytes += float64(size)
-				if lat := f.cfg.Now().Sub(at); lat > 0 && (pr.minLat == 0 || lat < pr.minLat) {
-					pr.minLat = lat
-				}
 			}
 			f.drop(pr, i)
 			// The running spell too, or a pipeline kept full would never
 			// decay.
 			if len(pr.out) > 0 {
 				now := f.cfg.Now()
-				d := now.Sub(pr.busySince)
-				pr.busy += d
-				pr.allBusy += d
+				pr.busy += now.Sub(pr.busySince)
 				pr.busySince = now
 			}
 			if pr.busy > maxBusy {
 				pr.bytes, pr.busy = pr.bytes/2, pr.busy/2
-			}
-			if verified && pr.slowStart {
-				f.slowStart(pr)
 			}
 		}
 		if !verified {
@@ -418,33 +405,6 @@ func (f *Fetch[P]) Received(p P, i uint32, size int, verified bool) (cancel []P)
 	}
 	return cancel
 }
-
-// slowStart doubles pr's pipeline each time it delivers a full one, while
-// each doubling raises its rate by slowStartGain: each phase's rate is
-// measured from where the phase began, so a slow start to a peer's
-// deliveries doesn't make later ones look like gains. A pipeline-limited
-// peer gains with each doubling, whatever its round trip; a slow one
-// stops gaining, and then the pipeline follows its measured rate alone.
-func (f *Fetch[P]) slowStart(pr *peer) {
-	if pr.ssCount++; pr.ssCount < pr.ssDepth {
-		return
-	}
-	pr.ssCount = 0
-	busy := pr.allBusy - pr.ssBusy
-	if busy <= 0 {
-		return
-	}
-	r := (pr.allBytes - pr.ssBytes) / busy.Seconds()
-	if pr.ssRate > 0 && r < pr.ssRate*slowStartGain || pr.ssDepth >= f.cfg.MaxDepth {
-		pr.slowStart = false
-		return
-	}
-	pr.ssDepth, pr.ssRate = min(2*pr.ssDepth, f.cfg.MaxDepth), r
-	pr.ssBytes, pr.ssBusy = pr.allBytes, pr.allBusy
-}
-
-// slowStartGain is the rise in rate a doubling must bring to keep doubling.
-const slowStartGain = 1.1
 
 // Outstanding is how many requests peer p has in flight.
 func (f *Fetch[P]) Outstanding(p P) int {

@@ -271,14 +271,14 @@ func TestCancelDuplicates(t *testing.T) {
 func TestPipelineDepth(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	const n = 200
-	f := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 16})
+	f := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 16, QueueTime: time.Second})
 	setPeer(t, f, "p", full(n))
 	first := f.Next("p")
 	if len(first) != 2 {
 		t.Fatalf("an unmeasured peer got %d requests", len(first))
 	}
 	// One quick piece isn't a measurement.
-	q := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 16})
+	q := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 16, QueueTime: time.Second})
 	setPeer(t, q, "p", full(n))
 	qi := q.Next("p")
 	c.t = c.t.Add(10 * time.Millisecond)
@@ -434,8 +434,8 @@ func TestResumeMismatch(t *testing.T) {
 }
 
 // TestThroughputThroughLatency: a peer serving 100 pieces a second behind
-// a long round trip (half TargetRTT, or as long as it) gets a pipeline
-// deep enough to use it.
+// a long round trip (up to QueueTime) gets a pipeline deep enough to use
+// it.
 func TestThroughputThroughLatency(t *testing.T) {
 	for _, rtt := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
 		t.Run(rtt.String(), func(t *testing.T) { throughLatency(t, rtt) })
@@ -656,44 +656,6 @@ func (pr *peer) firstOut() uint32 {
 	panic("nothing outstanding")
 }
 
-// TestSlowStartStops: a peer whose rate stops rising as its pipeline
-// doubles leaves slow start, and its pipeline follows its rate.
-func TestSlowStartStops(t *testing.T) {
-	c := &clock{t: time.Unix(0, 0)}
-	const n = 400
-	f := newFetch(t, n, c, Config{})
-	setPeer(t, f, "p", full(n))
-	// 10 pieces a second however many are outstanding, little latency:
-	// doubling past 2 brings nothing.
-	var free time.Time
-	type arrival struct {
-		at time.Time
-		i  uint32
-	}
-	var arrivals []arrival
-	for range 120 {
-		for _, i := range f.Next("p") {
-			start := c.t
-			if free.After(start) {
-				start = free
-			}
-			free = start.Add(100 * time.Millisecond)
-			arrivals = append(arrivals, arrival{free, i})
-		}
-		a := arrivals[0]
-		arrivals = arrivals[1:]
-		c.t = a.at
-		f.Received("p", a.i, pieceSize, true)
-	}
-	pr := f.peers["p"]
-	if pr.slowStart || pr.ssDepth >= 16 {
-		t.Fatalf("slow start: still on %v, doubled to %d", pr.slowStart, pr.ssDepth)
-	}
-	if d := f.depth(pr); d > 12 {
-		t.Fatalf("a 10-piece-a-second peer's pipeline of %d", d)
-	}
-}
-
 // TestRateFollowsRecent: a peer fast for a long while, then slow, is soon
 // measured slow: old busy time is halved away.
 func TestRateFollowsRecent(t *testing.T) {
@@ -739,9 +701,67 @@ func TestRateDecaysWhileBusy(t *testing.T) {
 	}
 }
 
-// TestSlowStartNotGamed: a peer opening slowly and then trickling a piece
-// a second sees its rate climb, but can't double its way to MaxDepth.
-func TestSlowStartNotGamed(t *testing.T) {
+// TestRequestTimeout: a request outstanding past RequestTimeout goes back
+// to the others; a late delivery is still taken.
+func TestRequestTimeout(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 1, c, Config{RequestTimeout: 10 * time.Second})
+	setPeer(t, f, "slow", full(1))
+	setPeer(t, f, "good", NewBitfield(1))
+	if got := f.Next("slow"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("slow asked for %v", got)
+	}
+	f.PeerHas("good", 0)
+	c.t = c.t.Add(9 * time.Second)
+	if got := f.Next("good"); !slices.Equal(got, []uint32{0}) { // the endgame
+		t.Fatalf("good asked for %v", got)
+	}
+	g := newFetch(t, 2, c, Config{RequestTimeout: 10 * time.Second, MinDepth: 1, MaxDepth: 1})
+	setPeer(t, g, "slow", full(2))
+	i := g.Next("slow")[0]
+	setPeer(t, g, "good", set(2, i))
+	c.t = c.t.Add(11 * time.Second)
+	if got := g.Next("good"); !slices.Equal(got, []uint32{i}) || g.Outstanding("slow") != 0 {
+		t.Fatalf("past the timeout, good asked for %v; slow has %d outstanding", got, g.Outstanding("slow"))
+	}
+	if cancel := g.Received("slow", i, pieceSize, true); !slices.Equal(cancel, []string{"good"}) || !g.Have().Has(i) {
+		t.Fatalf("a late delivery: kept %v, cancel %v", g.Have().Has(i), cancel)
+	}
+}
+
+// TestWithholdingPeer: a peer answering every request 30s late, at a
+// piece a second, keeps a small pipeline, and its requests time out to
+// the others.
+func TestWithholdingPeer(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 400
+	f := newFetch(t, n, c, Config{})
+	setPeer(t, f, "w", full(n))
+	f.Next("w")
+	peak := 0
+	for range 120 {
+		c.t = c.t.Add(time.Second)
+		var oldest uint32
+		var at time.Time
+		for i, a := range f.peers["w"].out {
+			if at.IsZero() || a.Before(at) {
+				oldest, at = i, a
+			}
+		}
+		if !at.IsZero() && c.t.Sub(at) >= 30*time.Second {
+			f.Received("w", oldest, pieceSize, true)
+		}
+		f.Next("w")
+		peak = max(peak, f.Outstanding("w"))
+	}
+	if peak > 16 {
+		t.Fatalf("a peer answering 30s late held %d requests", peak)
+	}
+}
+
+// TestTricklingPeerStaysSmall: a peer opening slowly and then trickling a
+// piece a second keeps a pipeline about QueueTime of that.
+func TestTricklingPeerStaysSmall(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	f := newFetch(t, 200, c, Config{})
 	setPeer(t, f, "p", full(200))
@@ -758,8 +778,7 @@ func TestSlowStartNotGamed(t *testing.T) {
 		deliver(time.Second)
 		peak = max(peak, f.depth(f.peers["p"]))
 	}
-	// Its one real speed-up (10s a piece to 1s) earns one doubling more.
-	if peak > 8 {
+	if peak > 4 {
 		t.Fatalf("a piece-a-second peer's pipeline reached %d", peak)
 	}
 }
