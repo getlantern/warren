@@ -1,0 +1,960 @@
+package swarm
+
+import (
+	"errors"
+	"math/rand/v2"
+	"runtime"
+	"slices"
+	"testing"
+	"time"
+)
+
+const pieceSize = 1000
+
+// clock is a fake clock.
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time { return c.t }
+
+func full(n uint32) *Bitfield {
+	f := NewBitfield(n)
+	for i := range n {
+		f.Set(i)
+	}
+	return f
+}
+
+func set(n uint32, pieces ...uint32) *Bitfield {
+	f := NewBitfield(n)
+	for _, i := range pieces {
+		f.Set(i)
+	}
+	return f
+}
+
+func newFetch(t testing.TB, n uint32, c *clock, cfg Config) *Fetch[string] {
+	t.Helper()
+	cfg.PieceSize = pieceSize
+	cfg.Now = c.now
+	cfg.Rand = rand.New(rand.NewPCG(1, 2))
+	f, err := NewFetch[string](n, nil, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func setPeer(t testing.TB, f *Fetch[string], p string, has *Bitfield) {
+	t.Helper()
+	if err := f.SetPeer(p, has); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sim runs f against peers serving at rate bytes a second (0: never
+// answers), one piece at a time each, until done or stuck. It returns the
+// simulated time taken and whether it finished.
+type simPeer struct {
+	rate  float64
+	queue []uint32
+	busy  time.Time // when the piece being served completes
+}
+
+func sim(t testing.TB, f *Fetch[string], c *clock, peers map[string]*simPeer) (time.Duration, bool) {
+	t.Helper()
+	start := c.t
+	names := slices.Sorted(func(yield func(string) bool) {
+		for p := range peers {
+			if !yield(p) {
+				return
+			}
+		}
+	})
+	for steps := 0; !f.Done(); steps++ {
+		if steps > 100000 {
+			t.Fatal("simulation runaway")
+		}
+		for _, p := range names {
+			sp := peers[p]
+			for _, i := range f.Next(p) {
+				if len(sp.queue) == 0 && sp.rate > 0 {
+					sp.busy = c.t.Add(time.Duration(pieceSize / sp.rate * float64(time.Second)))
+				}
+				sp.queue = append(sp.queue, i)
+			}
+		}
+		// The next piece to land.
+		var next string
+		for _, p := range names {
+			sp := peers[p]
+			if sp.rate > 0 && len(sp.queue) > 0 && (next == "" || sp.busy.Before(peers[next].busy)) {
+				next = p
+			}
+		}
+		if next == "" {
+			return c.t.Sub(start), false
+		}
+		sp := peers[next]
+		c.t = sp.busy
+		i := sp.queue[0]
+		sp.queue = sp.queue[1:]
+		if len(sp.queue) > 0 {
+			sp.busy = c.t.Add(time.Duration(pieceSize / sp.rate * float64(time.Second)))
+		}
+		for _, q := range f.Received(next, i, pieceSize, true) {
+			qp := peers[q]
+			if k := slices.Index(qp.queue, i); k >= 0 {
+				qp.queue = slices.Delete(qp.queue, k, k+1)
+				if k == 0 && len(qp.queue) > 0 && qp.rate > 0 { // its piece in service: start the next afresh
+					qp.busy = c.t.Add(time.Duration(pieceSize / qp.rate * float64(time.Second)))
+				}
+			}
+		}
+	}
+	return c.t.Sub(start), true
+}
+
+// TestFetchCompletes: peers with uneven holdings and speeds, whose union
+// is the blob, fetch all of it.
+func TestFetchCompletes(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 60
+	f := newFetch(t, n, c, Config{})
+	a, b := NewBitfield(n), NewBitfield(n)
+	for i := range uint32(n) {
+		if i%3 != 0 {
+			a.Set(i)
+		}
+		if i%2 == 0 {
+			b.Set(i)
+		}
+	}
+	setPeer(t, f, "a", a)
+	setPeer(t, f, "b", b)
+	setPeer(t, f, "c", set(n, 3, 9, 15, 21, 27, 33, 39, 45, 51, 57))
+	if _, ok := sim(t, f, c, map[string]*simPeer{"a": {rate: 20000}, "b": {rate: 5000}, "c": {rate: 1000}}); !ok {
+		t.Fatalf("stuck with %d of %d pieces", f.Have().Count(), n)
+	}
+}
+
+// TestRarestFirst: a peer holding everything is asked first for the
+// pieces only it holds.
+func TestRarestFirst(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 20
+	f := newFetch(t, n, c, Config{MinDepth: 4})
+	setPeer(t, f, "all", full(n))
+	setPeer(t, f, "half", set(n, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9))
+	got := f.Next("all")
+	if len(got) != 4 {
+		t.Fatalf("asked the full peer for %v, want 4 pieces", got)
+	}
+	for _, i := range got {
+		if i < 10 {
+			t.Fatalf("asked the full peer for piece %d, which two peers hold, before the rare ones", i)
+		}
+	}
+}
+
+// TestRarestTiesRandom: among equally rare pieces, two fetchers seeded
+// differently start on different pieces.
+func TestRarestTiesRandom(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	first := map[uint32]bool{}
+	for seed := range uint64(8) {
+		f, err := NewFetch[string](64, nil, Config{PieceSize: pieceSize, Now: c.now, Rand: rand.New(rand.NewPCG(seed, seed))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		setPeer(t, f, "p", full(64))
+		first[f.Next("p")[0]] = true
+	}
+	if len(first) < 3 {
+		t.Fatalf("ties fell on only %d distinct first pieces over 8 fetchers", len(first))
+	}
+}
+
+// TestPlayhead: streaming asks for the window from the playhead in order,
+// before rarer pieces elsewhere.
+func TestPlayhead(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 40
+	f := newFetch(t, n, c, Config{MinDepth: 5, Window: 4})
+	setPeer(t, f, "all", full(n))
+	setPeer(t, f, "some", set(n, 10, 11, 12, 13)) // the playhead's pieces aren't rare
+	f.SetPlayhead(10)
+	got := f.Next("all")
+	if len(got) != 5 || !slices.Equal(got[:4], []uint32{10, 11, 12, 13}) {
+		t.Fatalf("streaming from 10 asked for %v", got)
+	}
+	if got[4] >= 10 && got[4] <= 13 {
+		t.Fatalf("past the window, asked for %d", got[4])
+	}
+	f.StopStreaming()
+	f2 := newFetch(t, n, c, Config{MinDepth: 4, Window: 4})
+	setPeer(t, f2, "all", full(n))
+	setPeer(t, f2, "some", set(n, 10, 11, 12, 13))
+	f2.SetPlayhead(10)
+	f2.StopStreaming()
+	got2 := f2.Next("all")
+	if len(got2) != 4 {
+		t.Fatalf("after streaming stopped, asked for %v, want 4 pieces", got2)
+	}
+	for _, i := range got2 {
+		if i >= 10 && i <= 13 {
+			t.Fatalf("not streaming, asked for %d, which two peers hold", i)
+		}
+	}
+}
+
+// TestWorkStealing: a peer that never answers holds requests for the last
+// pieces; once everything is asked of someone, the others steal them, and
+// the fetch completes.
+func TestWorkStealing(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 30
+	f := newFetch(t, n, c, Config{})
+	setPeer(t, f, "fast", full(n))
+	setPeer(t, f, "stuck", full(n))
+	if _, ok := sim(t, f, c, map[string]*simPeer{"fast": {rate: 10000}, "stuck": {rate: 0}}); !ok {
+		t.Fatalf("stuck with %d of %d pieces: nothing stolen from the stalled peer", f.Have().Count(), n)
+	}
+}
+
+// TestNoStealingBeforeEndgame: while unrequested pieces remain anywhere,
+// a peer holding only pieces already asked of others gets no duplicates.
+func TestNoStealingBeforeEndgame(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 10
+	f := newFetch(t, n, c, Config{MinDepth: 2})
+	setPeer(t, f, "a", full(n))
+	a := f.Next("a")
+	setPeer(t, f, "b", set(n, a...)) // b holds just what a was asked for
+	if got := f.Next("b"); got != nil {
+		t.Fatalf("before the endgame, b was given duplicates %v (a has %v)", got, a)
+	}
+}
+
+// TestStealsOldestFirst: in the endgame, the longest outstanding request
+// is stolen first.
+func TestStealsOldestFirst(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 2
+	f := newFetch(t, n, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "x", set(n, 1))
+	setPeer(t, f, "y", set(n, 0))
+	if got := f.Next("x"); !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("x asked for %v", got)
+	}
+	c.t = c.t.Add(time.Second)
+	if got := f.Next("y"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("y asked for %v", got)
+	}
+	setPeer(t, f, "z", full(n))
+	if got := f.Next("z"); !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("z stole %v, want the older request, piece 1", got)
+	}
+}
+
+// TestCancelDuplicates: a piece that lands from one peer is cancelled at
+// the others it was stolen to.
+func TestCancelDuplicates(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 1, c, Config{})
+	setPeer(t, f, "a", full(1))
+	setPeer(t, f, "b", full(1))
+	if got := f.Next("a"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("a asked for %v", got)
+	}
+	c.t = c.t.Add(time.Second)
+	if got := f.Next("b"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("in the endgame, b asked for %v", got)
+	}
+	if cancel := f.Received("a", 0, pieceSize, true); !slices.Equal(cancel, []string{"b"}) {
+		t.Fatalf("cancel %v", cancel)
+	}
+	if !f.Done() || f.Outstanding("b") != 0 {
+		t.Fatal("not done, or b still has the piece outstanding")
+	}
+}
+
+// TestPipelineDepth: a peer's pipeline follows its measured throughput
+// (bytes over busy time), within bounds.
+func TestPipelineDepth(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 200
+	f := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 16, QueueTime: time.Second})
+	setPeer(t, f, "p", full(n))
+	first := f.Next("p")
+	if len(first) != 2 {
+		t.Fatalf("an unmeasured peer got %d requests", len(first))
+	}
+	// One quick piece isn't a measurement.
+	q := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 16, QueueTime: time.Second})
+	setPeer(t, q, "p", full(n))
+	qi := q.Next("p")
+	c.t = c.t.Add(10 * time.Millisecond)
+	q.Received("p", qi[0], pieceSize, true)
+	if r, d := q.rate(q.peers["p"]), q.depth(q.peers["p"]); r != 0 || d != 2 {
+		t.Fatalf("after one piece in 10ms: rate %.0f, pipeline %d", r, d)
+	}
+	c.t = time.Unix(0, 0)
+	// 10 pieces a second, busy throughout, past the least sample span (a
+	// sample closes at the delivery after it).
+	for range 4 {
+		c.t = c.t.Add(100 * time.Millisecond)
+		for i := range f.peers["p"].out {
+			f.Received("p", i, pieceSize, true)
+			break
+		}
+		f.Next("p")
+	}
+	if got := f.Outstanding("p") + len(f.Next("p")); got != 10 {
+		t.Fatalf("at 10 pieces a second, a 1s pipeline of %d", got)
+	}
+	// A slower piece lowers it, as an average over busy time: not straight
+	// down to the slow piece's rate.
+	c.t = c.t.Add(time.Second)
+	f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
+	if d := f.depth(f.peers["p"]); d <= 2 || d >= 10 {
+		t.Fatalf("after a slow piece, a pipeline of %d", d)
+	}
+	for range 10 { // everything outstanding lands together, 300ms on: capped
+		f.Next("p")
+		c.t = c.t.Add(300 * time.Millisecond)
+		for i := range f.peers["p"].out {
+			f.Received("p", i, pieceSize, true)
+		}
+	}
+	if got := f.Outstanding("p") + len(f.Next("p")); got != 16 {
+		t.Fatalf("a fast peer's pipeline of %d, want MaxDepth 16", got)
+	}
+}
+
+// TestFailedPiece: a piece that fails verification goes back to the
+// others, strikes its sender, and enough strikes stop requests to it.
+func TestFailedPiece(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 10
+	f := newFetch(t, n, c, Config{MaxStrikes: 2, MinDepth: 1})
+	setPeer(t, f, "bad", full(n))
+	setPeer(t, f, "good", full(n))
+	i := f.Next("bad")[0]
+	if cancel := f.Received("bad", i, pieceSize, false); cancel != nil || f.Have().Has(i) {
+		t.Fatal("a failed piece was kept")
+	}
+	if f.Strikes("bad") != 1 {
+		t.Fatal("no strike")
+	}
+	if got := f.Next("good"); !slices.Contains(got, i) {
+		// i is unrequested again, and as rare as the rest: it must be
+		// askable; drain good until it is asked.
+		found := slices.Contains(got, i)
+		for !found && len(got) > 0 {
+			for _, j := range got {
+				f.Received("good", j, pieceSize, true)
+			}
+			got = f.Next("good")
+			found = slices.Contains(got, i)
+		}
+		if !found {
+			t.Fatalf("piece %d never asked again", i)
+		}
+	}
+	j := f.Next("bad")
+	if len(j) == 0 {
+		t.Fatal("one strike stopped requests")
+	}
+	f.Received("bad", j[0], pieceSize, false)
+	if got := f.Next("bad"); got != nil {
+		t.Fatalf("after MaxStrikes, asked for %v", got)
+	}
+}
+
+// TestRemovePeer: a removed peer's outstanding pieces are asked of others,
+// and it holds nothing toward rarity.
+func TestRemovePeer(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 4
+	f := newFetch(t, n, c, Config{MinDepth: 4})
+	setPeer(t, f, "a", full(n))
+	setPeer(t, f, "b", full(n))
+	if got := f.Next("a"); len(got) != 4 {
+		t.Fatalf("a asked for %v", got)
+	}
+	f.RemovePeer("a")
+	got := f.Next("b")
+	if len(got) != 4 {
+		t.Fatalf("after a left, b asked for %v", got)
+	}
+	if f.avail[0] != 1 {
+		t.Fatalf("availability %d after a left", f.avail[0])
+	}
+}
+
+// TestResume: a fetch started from pieces on disk asks only for the rest.
+func TestResume(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 8
+	have := set(n, 0, 1, 2, 3, 4, 5)
+	f, err := NewFetch[string](n, have, Config{PieceSize: pieceSize, Now: c.now, MinDepth: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setPeer(t, f, "p", full(n))
+	got := f.Next("p")
+	slices.Sort(got)
+	if !slices.Equal(got, []uint32{6, 7}) {
+		t.Fatalf("resuming asked for %v", got)
+	}
+	have.Set(6) // the caller's bitfield isn't shared
+	if f.Have().Has(6) {
+		t.Fatal("the fetch shares the caller's bitfield")
+	}
+}
+
+// TestPeerHas: an update adds a piece to a peer's holdings and rarity.
+func TestPeerHas(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MinDepth: 4})
+	setPeer(t, f, "p", NewBitfield(4))
+	if got := f.Next("p"); got != nil {
+		t.Fatalf("asked a peer holding nothing for %v", got)
+	}
+	f.PeerHas("p", 2)
+	f.PeerHas("p", 2)
+	f.PeerHas("p", 9)
+	if got := f.Next("p"); !slices.Equal(got, []uint32{2}) || f.avail[2] != 1 {
+		t.Fatalf("after an update, asked for %v, availability %d", got, f.avail[2])
+	}
+	setPeer(t, f, "p", set(4, 3)) // a new bitfield replaces the old
+	if f.avail[2] != 0 || f.avail[3] != 1 {
+		t.Fatalf("after replacing p's bitfield, availability %v", f.avail)
+	}
+	if err := f.SetPeer("q", NewBitfield(5)); !errors.Is(err, ErrBitfield) {
+		t.Fatalf("a bitfield for another piece count: %v", err)
+	}
+}
+
+// TestResumeMismatch: a resume bitfield for another piece count is refused.
+func TestResumeMismatch(t *testing.T) {
+	for _, m := range []uint32{3, 5} {
+		if _, err := NewFetch[string](4, NewBitfield(m), Config{}); !errors.Is(err, ErrBitfield) {
+			t.Fatalf("a %d-piece resume for a 4-piece blob: %v", m, err)
+		}
+	}
+}
+
+// TestThroughputThroughLatency: a peer serving 100 pieces a second behind
+// a long round trip (up to QueueTime) gets a pipeline deep enough to use
+// it.
+func TestThroughputThroughLatency(t *testing.T) {
+	for _, rtt := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
+		t.Run(rtt.String(), func(t *testing.T) { throughLatency(t, rtt) })
+	}
+}
+
+func throughLatency(t *testing.T, rtt time.Duration) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 1000 // long enough to settle after slow start
+	f := newFetch(t, n, c, Config{})
+	setPeer(t, f, "p", full(n))
+	const service = 10 * time.Millisecond
+	type arrival struct {
+		at time.Time
+		i  uint32
+	}
+	var arrivals []arrival
+	var free time.Time // when the peer finishes what it's serving
+	for steps := 0; !f.Done(); steps++ {
+		if steps > 10*n {
+			t.Fatal("runaway")
+		}
+		for _, i := range f.Next("p") {
+			start := c.t.Add(rtt / 2)
+			if free.After(start) {
+				start = free
+			}
+			free = start.Add(service)
+			arrivals = append(arrivals, arrival{free.Add(rtt / 2), i})
+		}
+		if len(arrivals) == 0 {
+			t.Fatal("stuck")
+		}
+		a := arrivals[0]
+		arrivals = arrivals[1:]
+		c.t = a.at
+		f.Received("p", a.i, pieceSize, true)
+	}
+	// MaxDepth 32 delivers at most 32 pieces a round trip: 1000 take about
+	// 1000/32 round trips once ramped, plus the ramp (doubling from 2 is 4
+	// round trips more); a pipeline stuck at 2 takes 500.
+	limit := time.Duration(float64(rtt) * (1000.0/32 + 8))
+	if took := c.t.Sub(time.Unix(0, 0)); took > limit {
+		t.Fatalf("1000 pieces took %v, over %v", took, limit)
+	}
+	// About 32 pieces a round trip: the blob's tail lands back to back, so
+	// the recent rate can run a little over.
+	most := 32 * pieceSize / rtt.Seconds()
+	if r := f.rate(f.peers["p"]); r < most/2 || r > 1.5*most {
+		t.Fatalf("measured %.0f bytes a second, delivering about %.0f", r, most)
+	}
+}
+
+// TestEndgameIgnoresUnavailable: a piece nobody holds doesn't keep a
+// stalled peer's piece from being stolen.
+func TestEndgameIgnoresUnavailable(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 3
+	f := newFetch(t, n, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "stuck", set(n, 0))
+	if got := f.Next("stuck"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("stuck asked for %v", got)
+	}
+	setPeer(t, f, "good", set(n, 0, 1))
+	got := f.Next("good")
+	if !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("good asked for %v", got)
+	}
+	f.Received("good", 1, pieceSize, true)
+	if got := f.Next("good"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("with piece 2 held by no one, good stole %v, want 0", got)
+	}
+}
+
+// TestStrikesSurviveRemoval: a peer that leaves and comes back keeps its
+// strikes.
+func TestStrikesSurviveRemoval(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MaxStrikes: 1, MinDepth: 1})
+	setPeer(t, f, "bad", full(4))
+	f.Received("bad", f.Next("bad")[0], pieceSize, false)
+	f.RemovePeer("bad")
+	if err := f.SetPeer("bad", full(4)); !errors.Is(err, ErrStruckOut) || f.Strikes("bad") != 1 {
+		t.Fatalf("back after striking out: %v, %d strikes", err, f.Strikes("bad"))
+	}
+	if got := f.Next("bad"); got != nil {
+		t.Fatalf("a struck-out peer asked for %v", got)
+	}
+}
+
+// TestStruckOutRetired: a peer striking out releases its requests and its
+// holdings, so a piece only it advertised doesn't hold off the endgame.
+func TestStruckOutRetired(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 3
+	f := newFetch(t, n, c, Config{MaxStrikes: 1, MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "stuck", set(n, 0))
+	if got := f.Next("stuck"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("stuck asked for %v", got)
+	}
+	setPeer(t, f, "bad", set(n, 2))
+	if got := f.Next("bad"); !slices.Equal(got, []uint32{2}) {
+		t.Fatalf("bad asked for %v", got)
+	}
+	f.Received("bad", 2, pieceSize, false)
+	if f.avail[2] != 0 || f.asked[2] != 0 {
+		t.Fatalf("after bad struck out, piece 2: availability %d, asked %d", f.avail[2], f.asked[2])
+	}
+	setPeer(t, f, "good", set(n, 0, 1))
+	f.Received("good", f.Next("good")[0], pieceSize, true)
+	if got := f.Next("good"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("good stole %v, want the stuck peer's piece 0", got)
+	}
+}
+
+// TestEndgameSameCall: a peer taking the last fresh piece with a slot to
+// spare steals in the same call.
+func TestEndgameSameCall(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 3
+	f := newFetch(t, n, c, Config{MinDepth: 2, MaxDepth: 2})
+	setPeer(t, f, "a", set(n, 0, 1))
+	if got := f.Next("a"); len(got) != 2 {
+		t.Fatalf("a asked for %v", got)
+	}
+	setPeer(t, f, "b", full(n))
+	got := f.Next("b")
+	if len(got) != 2 || got[0] != 2 {
+		t.Fatalf("b asked for %v, want piece 2 then a stolen one", got)
+	}
+}
+
+// TestBurstThroughput: pieces landing together count over the time the
+// peer was busy, not as one piece over its round trip each; nor does a
+// burst's tail make a tiny sample.
+func TestBurstThroughput(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 100
+	f := newFetch(t, n, c, Config{MinDepth: 11, MaxDepth: 32})
+	setPeer(t, f, "p", full(n))
+	got := f.Next("p")
+	c.t = c.t.Add(time.Second)
+	for _, i := range got[:10] {
+		f.Received("p", i, pieceSize, true)
+	}
+	if r := f.rate(f.peers["p"]); r < 9500 || r > 10500 {
+		t.Fatalf("ten pieces in a busy second measured %.0f bytes a second", r)
+	}
+	// Two pieces a microsecond apart after a second: about 2 KB/s, not a
+	// microsecond's worth.
+	g := newFetch(t, n, c, Config{MinDepth: 2})
+	setPeer(t, g, "q", full(n))
+	two := g.Next("q")
+	c.t = c.t.Add(time.Second)
+	g.Received("q", two[0], pieceSize, true)
+	c.t = c.t.Add(time.Microsecond)
+	g.Received("q", two[1], pieceSize, true)
+	if r := g.rate(g.peers["q"]); r < 1900 || r > 2100 {
+		t.Fatalf("a burst's tail measured %.0f bytes a second", r)
+	}
+	// A burst after more than maxBusy weighs its pieces alike: two pieces
+	// at 7s are 286 bytes a second, not inflated by halving between them.
+	b := newFetch(t, n, c, Config{MinDepth: 2})
+	setPeer(t, b, "r", full(n))
+	pair := b.Next("r")
+	c.t = c.t.Add(7 * time.Second)
+	b.Received("r", pair[0], pieceSize, true)
+	b.Received("r", pair[1], pieceSize, true)
+	if r := b.rate(b.peers["r"]); r < 260 || r > 315 {
+		t.Fatalf("two pieces in a busy 7s measured %.0f bytes a second", r)
+	}
+}
+
+// TestIdleNotBusy: time with nothing outstanding, however the pipeline
+// emptied (a cancelled duplicate, a failed piece), doesn't count as busy.
+func TestIdleNotBusy(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "a", full(4))
+	setPeer(t, f, "b", set(4, 0))
+	// b's only request is cancelled when a delivers it.
+	if got := f.Next("b"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("b asked for %v", got)
+	}
+	c.t = c.t.Add(500 * time.Millisecond)
+	f.Next("a")
+	c.t = c.t.Add(100 * time.Millisecond)
+	f.Received("a", f.peers["a"].oldestOut(), pieceSize, true)
+	f.Received("a", 0, pieceSize, true) // unsolicited, but cancels b's
+	if f.Outstanding("b") != 0 {
+		t.Fatal("b's request wasn't cancelled")
+	}
+	busy := f.peers["b"].busy
+	if busy != 600*time.Millisecond {
+		t.Fatalf("b was busy 600ms until its request was cancelled; counted %v", busy)
+	}
+	c.t = c.t.Add(time.Minute)
+	if f.peers["b"].busy != busy {
+		t.Fatal("idle time counted as busy")
+	}
+	// A failed last piece ends a spell too.
+	g := newFetch(t, 4, c, Config{MinDepth: 1, MaxDepth: 1, MaxStrikes: 5})
+	setPeer(t, g, "p", full(4))
+	i := g.Next("p")[0]
+	c.t = c.t.Add(300 * time.Millisecond)
+	g.Received("p", i, pieceSize, false)
+	b2 := g.peers["p"].busy
+	c.t = c.t.Add(time.Minute)
+	if g.peers["p"].busy != b2 || b2 != 300*time.Millisecond {
+		t.Fatalf("busy %v after a failed last piece and a minute idle", g.peers["p"].busy)
+	}
+	if g.peers["p"].bytes != 0 {
+		t.Fatal("a failed piece counted toward throughput")
+	}
+}
+
+// TestTooLarge: a blob past MaxPieces is refused before any allocation.
+func TestTooLarge(t *testing.T) {
+	if _, err := NewFetch[string](MaxPieces+1, nil, Config{}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("past MaxPieces: %v", err)
+	}
+}
+
+// TestRateFollowsRecent: a peer fast for a long while, then slow, is soon
+// measured slow: old busy time is halved away.
+func TestRateFollowsRecent(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 200, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "p", full(200))
+	step := func(d time.Duration) {
+		i := f.Next("p")[0]
+		c.t = c.t.Add(d)
+		f.Received("p", i, pieceSize, true)
+	}
+	for range 100 {
+		step(100 * time.Millisecond) // 10s at 10000 bytes a second
+	}
+	for range 4 {
+		step(time.Second) // then 4s at 1000
+	}
+	if r := f.rate(f.peers["p"]); r > 5000 {
+		t.Fatalf("4s after slowing to 1000 bytes a second, measured %.0f", r)
+	}
+}
+
+// TestRateDecaysWhileBusy: a peer whose pipeline is never empty still has
+// its old throughput halved away once it slows.
+func TestRateDecaysWhileBusy(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 2000, c, Config{MinDepth: 4, MaxDepth: 4})
+	setPeer(t, f, "p", full(2000))
+	f.Next("p")
+	deliver := func(gap time.Duration) {
+		c.t = c.t.Add(gap)
+		f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
+		f.Next("p") // refilled: never empty
+	}
+	for range 1000 {
+		deliver(10 * time.Millisecond) // 10s at 100 pieces a second
+	}
+	for range 4 {
+		deliver(time.Second) // then 4s at 1
+	}
+	if r := f.rate(f.peers["p"]); r > 50000 {
+		t.Fatalf("4s after slowing to 1000 bytes a second, measured %.0f", r)
+	}
+}
+
+// TestRequestTimeout: a request outstanding past RequestTimeout goes back
+// to the others; a late delivery is still taken.
+func TestRequestTimeout(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 1, c, Config{RequestTimeout: 10 * time.Second})
+	setPeer(t, f, "slow", full(1))
+	setPeer(t, f, "good", NewBitfield(1))
+	if got := f.Next("slow"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("slow asked for %v", got)
+	}
+	f.PeerHas("good", 0)
+	c.t = c.t.Add(9 * time.Second)
+	if got := f.Next("good"); !slices.Equal(got, []uint32{0}) { // the endgame
+		t.Fatalf("good asked for %v", got)
+	}
+	g := newFetch(t, 2, c, Config{RequestTimeout: 10 * time.Second, MinDepth: 1, MaxDepth: 1})
+	setPeer(t, g, "slow", full(2))
+	i := g.Next("slow")[0]
+	setPeer(t, g, "good", set(2, i))
+	c.t = c.t.Add(11 * time.Second)
+	if got := g.Next("good"); !slices.Equal(got, []uint32{i}) || g.Outstanding("slow") != 0 {
+		t.Fatalf("past the timeout, good asked for %v; slow has %d outstanding", got, g.Outstanding("slow"))
+	}
+	if cancel := g.Received("slow", i, pieceSize, true); !slices.Equal(cancel, []string{"good"}) || !g.Have().Has(i) {
+		t.Fatalf("a late delivery: kept %v, cancel %v", g.Have().Has(i), cancel)
+	}
+}
+
+// TestWithholdingPeer: a peer that never answers, asked first every time,
+// can't keep pieces an honest peer holds: each request that times out is a
+// strike, and once it strikes out its pieces go to the honest peer.
+func TestWithholdingPeer(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 4
+	f := newFetch(t, n, c, Config{})
+	setPeer(t, f, "w", full(n))
+	setPeer(t, f, "honest", set(n, 0, 1))
+	f.SetPlayhead(0)
+	if got := f.Next("w"); !slices.Contains(got, 0) {
+		t.Fatalf("w asked for %v", got)
+	}
+	for range 4 {
+		c.t = c.t.Add(16 * time.Second)
+		f.Next("w") // polled first, every time
+		for _, i := range f.Next("honest") {
+			f.Received("honest", i, pieceSize, true)
+		}
+	}
+	if !f.Have().Has(0) || !f.Have().Has(1) {
+		t.Fatalf("the honest peer's pieces never came: have %x, w has %d strikes", f.Have().Encode(), f.Strikes("w"))
+	}
+	if err := f.SetPeer("w", full(n)); !errors.Is(err, ErrStruckOut) {
+		t.Fatalf("w, struck out for timeouts, back: %v", err)
+	}
+	// Reconnecting before anything noticed its overdue requests doesn't
+	// escape them: removal counts them.
+	h := newFetch(t, n, c, Config{MaxStrikes: 1})
+	setPeer(t, h, "w", full(n))
+	if got := h.Next("w"); len(got) != 2 {
+		t.Fatalf("w asked for %v", got)
+	}
+	c.t = c.t.Add(16 * time.Second)
+	h.RemovePeer("w")
+	if err := h.SetPeer("w", full(n)); !errors.Is(err, ErrStruckOut) || h.Strikes("w") != 1 {
+		t.Fatalf("after removal with overdue requests: %v, %d strikes", err, h.Strikes("w"))
+	}
+	// A slow peer, the only holder, is still asked again after one timeout.
+	g := newFetch(t, 1, c, Config{})
+	setPeer(t, g, "slow", full(1))
+	g.Next("slow")
+	c.t = c.t.Add(16 * time.Second)
+	if again := g.Next("slow"); !slices.Equal(again, []uint32{0}) {
+		t.Fatalf("the only holder, after one timeout, asked for %v", again)
+	}
+}
+
+// TestTricklingPeerStaysSmall: a peer opening slowly and then trickling a
+// piece a second keeps a pipeline about QueueTime of that.
+func TestTricklingPeerStaysSmall(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 200, c, Config{})
+	setPeer(t, f, "p", full(200))
+	f.Next("p")
+	deliver := func(gap time.Duration) {
+		c.t = c.t.Add(gap)
+		f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
+		f.Next("p")
+	}
+	deliver(7 * time.Second) // slow, but inside RequestTimeout
+	deliver(7 * time.Second)
+	peak := 0
+	for range 60 {
+		deliver(time.Second)
+		peak = max(peak, f.depth(f.peers["p"]))
+	}
+	if peak > 4 {
+		t.Fatalf("a piece-a-second peer's pipeline reached %d", peak)
+	}
+}
+
+// oldestOut is pr's longest outstanding piece, for tests.
+func (pr *peer) oldestOut() uint32 {
+	var oldest uint32
+	var at time.Time
+	for i, a := range pr.out {
+		if at.IsZero() || a.Before(at) || a.Equal(at) && i < oldest {
+			oldest, at = i, a
+		}
+	}
+	return oldest
+}
+
+// TestOneStallOneStrike: a deep pipeline timing out at once is one stall,
+// one strike, not one per request; the peer stays.
+func TestOneStallOneStrike(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 64, c, Config{MinDepth: 32, MaxDepth: 32})
+	setPeer(t, f, "p", full(64))
+	if got := f.Next("p"); len(got) != 32 {
+		t.Fatalf("asked for %d", len(got))
+	}
+	c.t = c.t.Add(16 * time.Second)
+	if got := f.Next("p"); f.Strikes("p") != 1 || len(got) == 0 {
+		t.Fatalf("after one stall of 32 requests: %d strikes, asked for %v", f.Strikes("p"), got)
+	}
+}
+
+// TestLateTimeoutsCounted: a stall noticed by a late delivery, or by a
+// duplicate's cancellation, rather than by Next, still strikes.
+func TestLateTimeoutsCounted(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "p", full(4))
+	i := f.Next("p")[0]
+	c.t = c.t.Add(16 * time.Second)
+	f.Received("p", i, pieceSize, true) // late, before any Next
+	if f.Strikes("p") != 1 || !f.Have().Has(i) {
+		t.Fatalf("a late delivery: %d strikes, kept %v", f.Strikes("p"), f.Have().Has(i))
+	}
+	g := newFetch(t, 1, c, Config{})
+	setPeer(t, g, "slow", full(1))
+	setPeer(t, g, "fast", full(1))
+	g.Next("slow")
+	c.t = c.t.Add(16 * time.Second)
+	g.peers["fast"].out[0] = c.t // asked of fast too, just now
+	g.asked[0]++
+	g.peers["fast"].busySince = c.t
+	if cancel := g.Received("fast", 0, pieceSize, true); g.Strikes("slow") != 1 || len(cancel) != 0 {
+		t.Fatalf("an overdue duplicate cancelled: slow has %d strikes, cancel %v", g.Strikes("slow"), cancel)
+	}
+}
+
+// TestFailuresAlwaysStrike: a failed piece strikes its sender whatever its
+// index, and after it left the fetch.
+func TestFailuresAlwaysStrike(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MaxStrikes: 2})
+	setPeer(t, f, "bad", full(4))
+	f.Received("bad", 99, pieceSize, false)
+	if f.Strikes("bad") != 1 {
+		t.Fatalf("an out-of-range failed piece: %d strikes", f.Strikes("bad"))
+	}
+	f.RemovePeer("bad")
+	f.Received("bad", 1, pieceSize, false) // its verification finished after it left
+	if err := f.SetPeer("bad", full(4)); !errors.Is(err, ErrStruckOut) {
+		t.Fatalf("back after two failures: %v", err)
+	}
+}
+
+// TestNextAllocatesLittle: choosing a few pieces from a large blob doesn't
+// build a list the size of the blob.
+func TestNextAllocatesLittle(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	const n = 1 << 20
+	f := newFetch(t, n, c, Config{MinDepth: 4, MaxDepth: 4})
+	setPeer(t, f, "p", full(n))
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if got := f.Next("p"); len(got) != 4 {
+		t.Fatalf("asked for %d", len(got))
+	}
+	runtime.ReadMemStats(&after)
+	if d := after.TotalAlloc - before.TotalAlloc; d > 64<<10 {
+		t.Fatalf("one Next on a %d-piece blob allocated %d bytes", n, d)
+	}
+}
+
+// TestDepthRoundsUp: a pipeline-limited peer at MinDepth 1, a piece every
+// 2s, can grow: 0.5 pieces a second over QueueTime 3s is 1.5, rounded up.
+func TestDepthRoundsUp(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 20, c, Config{MinDepth: 1})
+	setPeer(t, f, "p", full(20))
+	f.Next("p")
+	for range 3 {
+		c.t = c.t.Add(2 * time.Second)
+		f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
+		f.Next("p")
+	}
+	if d := f.depth(f.peers["p"]); d < 2 {
+		t.Fatalf("a pipeline-limited peer stuck at depth %d", d)
+	}
+}
+
+// TestNegativeDepths: negative bounds take the defaults, not a pipeline
+// that never asks.
+func TestNegativeDepths(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 4, c, Config{MinDepth: -1, MaxDepth: -1})
+	setPeer(t, f, "p", full(4))
+	if got := f.Next("p"); len(got) != 2 {
+		t.Fatalf("with negative depths, asked for %v", got)
+	}
+}
+
+// TestOneStallPolledOften: requests asked a second apart that all go
+// unanswered are one stall, however often expiry looks; requests asked
+// after the strike can earn another.
+func TestOneStallPolledOften(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	f := newFetch(t, 10, c, Config{MinDepth: 1, MaxDepth: 1})
+	setPeer(t, f, "p", full(10))
+	setPeer(t, f, "idle", NewBitfield(10))
+	pr := f.peers["p"]
+	for k := range uint32(3) {
+		f.ask(pr, k)
+		c.t = c.t.Add(time.Second)
+	}
+	for _, at := range []time.Duration{15500, 16500, 17500} { // ms
+		c.t = time.Unix(0, 0).Add(at * time.Millisecond)
+		f.Next("idle") // expiry polls
+	}
+	if f.Strikes("p") != 1 {
+		t.Fatalf("one continuous stall polled three times: %d strikes", f.Strikes("p"))
+	}
+	f.ask(f.peers["p"], 5) // asked after the strike
+	c.t = c.t.Add(16 * time.Second)
+	f.Next("idle")
+	if f.Strikes("p") != 2 {
+		t.Fatalf("a later request timing out: %d strikes, want 2", f.Strikes("p"))
+	}
+}

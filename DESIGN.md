@@ -1011,9 +1011,45 @@ line, B runs alongside it, C waits on device time, D is maintenance.
       against its ID (each piece's length and the tree) before writing
       any plaintext; checking pieces as they stream in, by proof, comes
       with swarming.
-7. **Swarming**: bitfields, rarest-first, playhead order, work stealing,
-   resume, storage budget; inventories for mirrors. The scheduler is pure
-   and can also start alongside 4 and 5; wiring it needs 5.
+7. **Swarming**, in parts:
+   1. the scheduler, `group/swarm` (built): pure, no I/O. A `Bitfield`
+      with a canonical encoding (BitTorrent's bit order; decoding refuses
+      a wrong length or bits past the last piece). A `Fetch` per blob
+      tracks pieces held, each peer's bitfield and updates, and requests
+      outstanding. `Next(peer)` fills the peer's pipeline with pieces
+      within a window of the playhead, in order, when streaming; then the
+      rarest (availability kept as peers come, go and update; ties fall
+      randomly); and in the endgame steals the longest outstanding
+      requests from others (pieces no peer holds don't hold it off). A
+      pipeline holds 3 s of the peer's measured throughput, as
+      libtorrent's request queue time, within bounds. Throughput is bytes
+      delivered over the time the peer had requests out, measured once
+      that's 250 ms and halved past 6 s so it follows the recent rate; a
+      pipeline-limited peer measures its depth over its round trip, so
+      its pipeline grows until throughput is the limit, for any round trip
+      under 3 s. `Received` keeps only verified pieces and names the peers
+      to cancel duplicates at. A failed piece is a strike (whatever its
+      index, even after the peer left), and so is a stall: requests
+      outstanding 15 s go back to the others, with one strike however
+      many there were, wherever that's noticed (`Next`, a late delivery,
+      a cancellation, removal). A peer that strikes out (three) leaves
+      the fetch for good, its requests and holdings released, so a peer
+      holding pieces back keeps them no longer, and reconnecting
+      (strikes are kept per identity) doesn't escape it. A fetch resumes
+      from a bitfield, keeps about 8 bytes a piece of accounting plus a
+      bit a piece for each peer's holdings (at most `swarm.MaxPieces`
+      pieces), and expects its caller to serialize calls, with peers
+      authenticated members;
+   2. the wire protocol: content on its own stream beside the sync
+      session (inventories, bitfields, have, request, piece with its
+      proof, cancel), the serving side caching each blob's tree. A
+      request the scheduler expires must be cancelled at its peer (the
+      scheduler reporting which), and responses paired with the request
+      they answer, so a late reply to an expired request isn't taken for
+      its retry's;
+   3. the node: `Node.Fetch` and a streaming reader moving the playhead,
+      serving on or off with a rate cap, the storage budget (least
+      recently used evicted), and resuming from what's stored.
 8. **Removal's runtime parts** (removal and rekey themselves are in the
    roster), in parts:
    1. following `G` (built): a running node moves to the roster's current
