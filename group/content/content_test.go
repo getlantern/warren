@@ -204,9 +204,12 @@ func TestSealErrors(t *testing.T) {
 // (io.ErrUnexpectedEOF, as a cut gzip stream does) fails the seal, rather
 // than sealing what came before as the whole blob.
 func TestSealTruncatedReader(t *testing.T) {
-	r := io.MultiReader(bytes.NewReader(random(t, 100)), errReader{io.ErrUnexpectedEOF})
-	if _, err := Seal(r, MinPieceSize, func(uint32, []byte) error { return nil }); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("a truncated reader: %v", err)
+	// Within the first piece, and after a full piece has been handed over.
+	for _, before := range []int{100, MinPieceSize, MinPieceSize + 100} {
+		r := io.MultiReader(bytes.NewReader(random(t, before)), errReader{io.ErrUnexpectedEOF})
+		if _, err := Seal(r, MinPieceSize, func(uint32, []byte) error { return nil }); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("a reader truncated after %d bytes: %v", before, err)
+		}
 	}
 	// A reader returning data with io.EOF in the same call ends cleanly.
 	got, err := Seal(dataEOF{[]byte("abc")}, MinPieceSize, func(uint32, []byte) error { return nil })
@@ -290,24 +293,37 @@ func TestAnnouncement(t *testing.T) {
 	}
 }
 
+// FuzzVerify uses fixed pieces, not Seal's (fresh keys): fuzz workers run
+// in their own processes, and each must check against the same blob.
 func FuzzVerify(f *testing.F) {
-	s, pieces := seal(f, random(f, 3*MinPieceSize+5), MinPieceSize)
-	p, err := s.Tree.Proof(1)
-	if err != nil {
-		f.Fatal(err)
+	const size = 3*MinPieceSize + 5
+	var pieces [][]byte
+	var leaves []Hash
+	for i := range uint32(4) {
+		p := bytes.Repeat([]byte{byte(i + 1)}, PieceLen(size, MinPieceSize, i))
+		pieces = append(pieces, p)
+		leaves = append(leaves, LeafHash(p))
 	}
-	var flat []byte
-	for _, h := range p {
-		flat = append(flat, h[:]...)
+	tr := NewTree(leaves)
+	id := BlobID(tr.Root(), size, MinPieceSize)
+	for i := range uint32(4) {
+		p, err := tr.Proof(i)
+		if err != nil {
+			f.Fatal(err)
+		}
+		var flat []byte
+		for _, h := range p {
+			flat = append(flat, h[:]...)
+		}
+		f.Add(uint64(size), i, pieces[i], flat)
 	}
-	f.Add(uint64(s.Size), uint32(1), pieces[1], flat)
-	f.Fuzz(func(t *testing.T, size uint64, i uint32, piece, proofBytes []byte) {
+	f.Fuzz(func(t *testing.T, sz uint64, i uint32, piece, proofBytes []byte) {
 		var proof []Hash
 		for len(proofBytes) >= 32 {
 			proof = append(proof, Hash(proofBytes[:32]))
 			proofBytes = proofBytes[32:]
 		}
-		if Verify(s.ID, size, MinPieceSize, i, piece, proof) == nil && (size != s.Size || i >= 4 || !bytes.Equal(piece, pieces[i])) {
+		if Verify(id, sz, MinPieceSize, i, piece, proof) == nil && (sz != size || i >= 4 || !bytes.Equal(piece, pieces[i])) {
 			t.Fatal("a piece verified as something it isn't")
 		}
 	})
