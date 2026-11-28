@@ -17,7 +17,8 @@ import (
 // sealed pieces are deleted, so a refused blob leaves nothing behind (if
 // the store can't delete them, the error says so and id names the blob). The
 // pieces are sealed first, without holding the group: a large blob takes
-// a while. Without a store, PublishBlob refuses (ErrNoStore).
+// a while, and cancelling ctx stops it, leaving nothing. Without a store,
+// PublishBlob refuses (ErrNoStore).
 func (n *Node) PublishBlob(ctx context.Context, r io.Reader, meta []byte) (id content.ID, queued bool, err error) {
 	store := n.cfg.Store
 	if store == nil {
@@ -26,7 +27,11 @@ func (n *Node) PublishBlob(ctx context.Context, r io.Reader, meta []byte) (id co
 	if len(meta) > content.MaxMeta {
 		return id, false, fmt.Errorf("node: meta of %d bytes is over content.MaxMeta", len(meta))
 	}
-	s, err := content.SealTo(store, r, 0)
+	if err := ctx.Err(); err != nil {
+		return id, false, err
+	}
+	// Cancelling ctx stops the seal at its next read, aborting the blob.
+	s, err := content.SealTo(store, ctxReader{ctx, r}, 0)
 	if err != nil {
 		return id, false, err
 	}
@@ -43,4 +48,17 @@ func (n *Node) PublishBlob(ctx context.Context, r io.Reader, meta []byte) (id co
 		return id, false, err
 	}
 	return s.ID, queued, nil
+}
+
+// ctxReader reads from r until ctx ends.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
