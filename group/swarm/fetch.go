@@ -17,10 +17,9 @@ type Config struct {
 	// is covered.
 	QueueTime time.Duration
 	// RequestTimeout is how long a request may stay outstanding before
-	// it goes back to the other peers (15s), and isn't asked of that peer
-	// again while a holder that hasn't timed out on it remains: a peer
-	// holding its pieces back keeps them no longer. It may still deliver
-	// one late.
+	// it goes back to the other peers (15s), and counts as a strike
+	// against its peer: a peer holding pieces back keeps them no longer,
+	// and is out after MaxStrikes. It may still deliver one late.
 	RequestTimeout time.Duration
 	// MinDepth and MaxDepth bound a peer's pipeline (2 and 32 pieces). A
 	// peer not yet measured gets MinDepth; a pipeline-limited one measures
@@ -30,9 +29,10 @@ type Config struct {
 	// Window is how many pieces from the playhead are fetched in order
 	// when streaming (8).
 	Window uint32
-	// MaxStrikes is how many pieces failing verification a peer may send
-	// before it's out of the fetch (3): its requests and holdings go to
-	// the rest, and SetPeer refuses it.
+	// MaxStrikes is how many strikes a peer may earn, by sending a piece
+	// that fails verification or letting a request time out, before it's
+	// out of the fetch (3): its requests and holdings go to the rest, and
+	// SetPeer refuses it.
 	MaxStrikes int
 	// Now is the clock (time.Now); Rand breaks ties (seeded randomly).
 	Now  func() time.Time
@@ -99,10 +99,9 @@ type Fetch[P comparable] struct {
 	cfg   Config
 	have  *Bitfield
 	peers map[P]*peer
-	// strikes, and the pieces each peer held past RequestTimeout, outlive
-	// its removal, so leaving and coming back doesn't clear them.
-	strikes  map[P]int
-	timedOut map[P]map[uint32]bool
+	// strikes outlive a peer's removal, so leaving and coming back doesn't
+	// clear them.
+	strikes map[P]int
 	// avail counts, per piece, the peers holding it; asked how many peers
 	// have a piece outstanding.
 	avail, asked []int32
@@ -170,7 +169,7 @@ func NewFetch[P comparable](n uint32, have *Bitfield, cfg Config) (*Fetch[P], er
 	if have.Len() != n {
 		return nil, ErrBitfield
 	}
-	return &Fetch[P]{cfg: cfg.withDefaults(), have: have.Clone(), peers: map[P]*peer{}, strikes: map[P]int{}, timedOut: map[P]map[uint32]bool{},
+	return &Fetch[P]{cfg: cfg.withDefaults(), have: have.Clone(), peers: map[P]*peer{}, strikes: map[P]int{},
 		avail: make([]int32, n), asked: make([]int32, n)}, nil
 }
 
@@ -221,12 +220,15 @@ func (f *Fetch[P]) PeerHas(p P, i uint32) {
 	f.avail[i]++
 }
 
-// RemovePeer drops peer p; its outstanding requests go back to the rest.
+// RemovePeer drops peer p; its outstanding requests go back to the rest,
+// those already past RequestTimeout as strikes, so leaving doesn't escape
+// them.
 func (f *Fetch[P]) RemovePeer(p P) {
 	pr := f.peers[p]
 	if pr == nil {
 		return
 	}
+	f.overdue(p, pr)
 	f.count(pr.has, -1)
 	for i := range pr.out {
 		f.drop(pr, i)
@@ -251,21 +253,10 @@ func (f *Fetch[P]) depth(pr *peer) int {
 }
 
 // wanted reports whether p could be asked for piece i: missing here, held
-// by p, not already asked of it, and, if p timed out on it before, with no
-// other holder that hasn't (once every holder has, any may be asked again).
-func (f *Fetch[P]) wanted(p P, pr *peer, i uint32) bool {
-	if _, out := pr.out[i]; out || f.have.Has(i) || !pr.has.Has(i) {
-		return false
-	}
-	if !f.timedOut[p][i] {
-		return true
-	}
-	for q, qr := range f.peers {
-		if q != p && qr.has.Has(i) && !f.timedOut[q][i] {
-			return false
-		}
-	}
-	return true
+// by p, and not already asked of it.
+func (f *Fetch[P]) wanted(pr *peer, i uint32) bool {
+	_, out := pr.out[i]
+	return !f.have.Has(i) && pr.has.Has(i) && !out
 }
 
 // Next returns the pieces to request from peer p now, filling its
@@ -276,11 +267,11 @@ func (f *Fetch[P]) wanted(p P, pr *peer, i uint32) bool {
 // duplicates of the longest outstanding requests to others. First, every
 // peer's requests past RequestTimeout go back to the rest.
 func (f *Fetch[P]) Next(p P) []uint32 {
+	f.expire() // first: it may strike p out
 	pr := f.peers[p]
 	if pr == nil {
 		return nil
 	}
-	f.expire()
 	slots := f.depth(pr) - len(pr.out)
 	if slots <= 0 {
 		return nil
@@ -294,7 +285,7 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 	n := f.have.Len()
 	if f.streaming {
 		for i := f.playhead; i < n && i-f.playhead < f.cfg.Window && slots > 0; i++ {
-			if f.asked[i] == 0 && f.wanted(p, pr, i) {
+			if f.asked[i] == 0 && f.wanted(pr, i) {
 				ask(i)
 			}
 		}
@@ -309,7 +300,7 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 		}
 		if f.asked[i] == 0 && f.avail[i] > 0 {
 			unasked++
-			if f.wanted(p, pr, i) {
+			if f.wanted(pr, i) {
 				fresh = append(fresh, i)
 			}
 		}
@@ -330,20 +321,31 @@ func (f *Fetch[P]) Next(p P) []uint32 {
 	return picks
 }
 
-// expire gives requests outstanding past RequestTimeout back to the rest.
+// expire gives requests outstanding past RequestTimeout back to the rest,
+// each a strike against its peer.
 func (f *Fetch[P]) expire() {
-	cutoff := f.cfg.Now().Add(-f.cfg.RequestTimeout)
+	var out []P
 	for p, pr := range f.peers {
-		for i, at := range pr.out {
-			if at.Before(cutoff) {
-				f.drop(pr, i)
-				if f.timedOut[p] == nil {
-					f.timedOut[p] = map[uint32]bool{}
-				}
-				f.timedOut[p][i] = true
-			}
+		if f.overdue(p, pr) {
+			out = append(out, p)
 		}
 	}
+	for _, p := range out {
+		f.RemovePeer(p) // struck out
+	}
+}
+
+// overdue drops pr's requests past RequestTimeout, striking p for each,
+// and reports whether p struck out.
+func (f *Fetch[P]) overdue(p P, pr *peer) bool {
+	cutoff := f.cfg.Now().Add(-f.cfg.RequestTimeout)
+	for i, at := range pr.out {
+		if at.Before(cutoff) {
+			f.drop(pr, i)
+			f.strikes[p]++
+		}
+	}
+	return f.strikes[p] >= f.cfg.MaxStrikes
 }
 
 // steal asks p for pieces outstanding at other peers, longest outstanding
@@ -359,7 +361,7 @@ func (f *Fetch[P]) steal(p P, pr *peer, ask func(uint32), slots int) {
 			continue
 		}
 		for i, at := range qr.out {
-			if t, ok := oldest[i]; (!ok || at.Before(t)) && f.wanted(p, pr, i) {
+			if t, ok := oldest[i]; (!ok || at.Before(t)) && f.wanted(pr, i) {
 				oldest[i] = at
 			}
 		}

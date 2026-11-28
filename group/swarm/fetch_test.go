@@ -303,7 +303,7 @@ func TestPipelineDepth(t *testing.T) {
 	// A slower piece lowers it, as an average over busy time: not straight
 	// down to the slow piece's rate.
 	c.t = c.t.Add(time.Second)
-	f.Received("p", f.peers["p"].firstOut(), pieceSize, true)
+	f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
 	if d := f.depth(f.peers["p"]); d <= 2 || d >= 10 {
 		t.Fatalf("after a slow piece, a pipeline of %d", d)
 	}
@@ -612,7 +612,7 @@ func TestIdleNotBusy(t *testing.T) {
 	c.t = c.t.Add(500 * time.Millisecond)
 	f.Next("a")
 	c.t = c.t.Add(100 * time.Millisecond)
-	f.Received("a", f.peers["a"].firstOut(), pieceSize, true)
+	f.Received("a", f.peers["a"].oldestOut(), pieceSize, true)
 	f.Received("a", 0, pieceSize, true) // unsolicited, but cancels b's
 	if f.Outstanding("b") != 0 {
 		t.Fatal("b's request wasn't cancelled")
@@ -648,14 +648,6 @@ func TestTooLarge(t *testing.T) {
 	}
 }
 
-// firstOut is one of pr's outstanding pieces, for tests.
-func (pr *peer) firstOut() uint32 {
-	for i := range pr.out {
-		return i
-	}
-	panic("nothing outstanding")
-}
-
 // TestRateFollowsRecent: a peer fast for a long while, then slow, is soon
 // measured slow: old busy time is halved away.
 func TestRateFollowsRecent(t *testing.T) {
@@ -687,7 +679,7 @@ func TestRateDecaysWhileBusy(t *testing.T) {
 	f.Next("p")
 	deliver := func(gap time.Duration) {
 		c.t = c.t.Add(gap)
-		f.Received("p", f.peers["p"].firstOut(), pieceSize, true)
+		f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
 		f.Next("p") // refilled: never empty
 	}
 	for range 1000 {
@@ -730,8 +722,8 @@ func TestRequestTimeout(t *testing.T) {
 }
 
 // TestWithholdingPeer: a peer that never answers, asked first every time,
-// can't keep pieces an honest peer holds: once its requests time out,
-// they go to the honest peer, not back to it.
+// can't keep pieces an honest peer holds: each request that times out is a
+// strike, and once it strikes out its pieces go to the honest peer.
 func TestWithholdingPeer(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	const n = 4
@@ -742,57 +734,38 @@ func TestWithholdingPeer(t *testing.T) {
 	if got := f.Next("w"); !slices.Contains(got, 0) {
 		t.Fatalf("w asked for %v", got)
 	}
-	got := map[uint32]bool{}
 	for range 4 {
 		c.t = c.t.Add(16 * time.Second)
 		f.Next("w") // polled first, every time
 		for _, i := range f.Next("honest") {
-			got[i] = true
 			f.Received("honest", i, pieceSize, true)
 		}
 	}
 	if !f.Have().Has(0) || !f.Have().Has(1) {
-		t.Fatalf("the honest peer's pieces never came: have %v, honest asked %v", f.Have().Encode(), got)
+		t.Fatalf("the honest peer's pieces never came: have %x, w has %d strikes", f.Have().Encode(), f.Strikes("w"))
 	}
-	// Reconnecting doesn't clear it: polled first again, w doesn't get
-	// back pieces the honest peer holds.
-	h := newFetch(t, n, c, Config{})
+	if err := f.SetPeer("w", full(n)); !errors.Is(err, ErrStruckOut) {
+		t.Fatalf("w, struck out for timeouts, back: %v", err)
+	}
+	// Reconnecting before anything noticed its overdue requests doesn't
+	// escape them: removal counts them.
+	h := newFetch(t, n, c, Config{MaxStrikes: 2})
 	setPeer(t, h, "w", full(n))
-	setPeer(t, h, "honest", set(n, 0, 1))
-	h.SetPlayhead(0)
-	setPeer(t, h, "idle", NewBitfield(n))
-	h.Next("w")
+	if got := h.Next("w"); len(got) != 2 {
+		t.Fatalf("w asked for %v", got)
+	}
 	c.t = c.t.Add(16 * time.Second)
-	h.Next("idle") // expires w's requests, asking nothing
 	h.RemovePeer("w")
-	setPeer(t, h, "w", full(n))
-	for _, i := range h.Next("w") {
-		if i == 0 || i == 1 {
-			t.Fatalf("w, reconnected, asked again for piece %d the honest peer holds", i)
-		}
+	if err := h.SetPeer("w", full(n)); !errors.Is(err, ErrStruckOut) || h.Strikes("w") != 2 {
+		t.Fatalf("after removal with two overdue requests: %v, %d strikes", err, h.Strikes("w"))
 	}
-	// When every holder has timed out on a piece, any may be asked again.
-	k := newFetch(t, 1, c, Config{})
-	setPeer(t, k, "a", full(1))
-	setPeer(t, k, "b", full(1))
-	k.Next("a")
-	c.t = c.t.Add(16 * time.Second)
-	if got := k.Next("b"); !slices.Equal(got, []uint32{0}) {
-		t.Fatalf("after a timed out, b asked for %v", got)
-	}
-	c.t = c.t.Add(16 * time.Second)
-	got0 := k.Next("a") // b's timed out too
-	got1 := k.Next("b")
-	if len(got0)+len(got1) == 0 {
-		t.Fatal("with every holder timed out on it, the piece is never asked again")
-	}
-	// The only holder of a piece it timed out on is still asked for it.
+	// A slow peer, the only holder, is still asked again after one timeout.
 	g := newFetch(t, 1, c, Config{})
 	setPeer(t, g, "slow", full(1))
 	g.Next("slow")
 	c.t = c.t.Add(16 * time.Second)
 	if again := g.Next("slow"); !slices.Equal(again, []uint32{0}) {
-		t.Fatalf("the only holder, after timing out, asked for %v", again)
+		t.Fatalf("the only holder, after one timeout, asked for %v", again)
 	}
 }
 
@@ -805,11 +778,11 @@ func TestTricklingPeerStaysSmall(t *testing.T) {
 	f.Next("p")
 	deliver := func(gap time.Duration) {
 		c.t = c.t.Add(gap)
-		f.Received("p", f.peers["p"].firstOut(), pieceSize, true)
+		f.Received("p", f.peers["p"].oldestOut(), pieceSize, true)
 		f.Next("p")
 	}
-	deliver(10 * time.Second)
-	deliver(10 * time.Second)
+	deliver(7 * time.Second) // slow, but inside RequestTimeout
+	deliver(7 * time.Second)
 	peak := 0
 	for range 60 {
 		deliver(time.Second)
@@ -818,4 +791,16 @@ func TestTricklingPeerStaysSmall(t *testing.T) {
 	if peak > 4 {
 		t.Fatalf("a piece-a-second peer's pipeline reached %d", peak)
 	}
+}
+
+// oldestOut is pr's longest outstanding piece, for tests.
+func (pr *peer) oldestOut() uint32 {
+	var oldest uint32
+	var at time.Time
+	for i, a := range pr.out {
+		if at.IsZero() || a.Before(at) || a.Equal(at) && i < oldest {
+			oldest, at = i, a
+		}
+	}
+	return oldest
 }
